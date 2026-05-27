@@ -25,6 +25,7 @@ How to build and install:
 * Copy the compiled `USM.exe` from `build` directory to the game's folder.
 * use this command for install zlib1g: `sudo apt-get -y install libz-mingw-w64-dev`
 * clone assimp on openusm folder with git clone https://github.com/assimp/assimp.git
+* Extract USM.c.zip USMITA.c.zip in actual folder
 
 
 License
