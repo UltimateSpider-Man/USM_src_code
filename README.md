@@ -1,4 +1,4 @@
-Ultimate Spider-Man Src Code
+Ultimate Spider-Man 2005 Src Code
 ======
 
 is a almost completed src code game engine that supports playing Ultimate Spider-Man by Treyarch. You need to own the game for src code to play Ultimate Spider-Man.
@@ -23,6 +23,8 @@ How to build and install:
 * `cd build`
 * `make -jN`, where N - how many threads you want to allot for compiling.
 * Copy the compiled `USM.exe` from `build` directory to the game's folder.
+* use this command for install zlib1g: `sudo apt-get -y install libz-mingw-w64-dev`
+* clone assimp on openusm folder with git clone https://github.com/assimp/assimp.git
 
 
 License
