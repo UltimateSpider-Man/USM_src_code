@@ -4,8 +4,10 @@
 #include "common.h"
 #include "custom_math.h"
 #include "dolly_and_strafe_mcs.h"
+#include "entity_handle_manager.h"
 #include "func_wrapper.h"
 #include "game.h"
+#include "gamepad_menu.h"
 #include "input_mgr.h"
 #include "oldmath_po.h"
 #include "spiderman_camera.h"
@@ -313,6 +315,87 @@ void mouselook_controller::_frame_advance(Float time_inc)
     else
     {
         THISCALL(0x00528BB0, this, time_inc);
+
+        // -------------------------------------------------------------
+        //   Debug user-camera extras: L3 zoom / R3 move
+        // -------------------------------------------------------------
+        //   Uses the DualShock 4 / DirectInput hook in main.cpp which
+        //   populates controllerKeys[] every poll. Active only when the
+        //   debug menu has set "Camera: User".
+        //
+        //   Hold L3  + L3_UP   -> dolly zoom IN  (camera forward)
+        //   Hold L3  + L3_DOWN -> dolly zoom OUT (camera backward)
+        //
+        //   Hold R3  + R3_LEFT  -> strafe camera left
+        //   Hold R3  + R3_RIGHT -> strafe camera right
+        //   Hold R3  + R3_UP    -> lift camera up
+        //   Hold R3  + R3_DOWN  -> lift camera down
+        // -------------------------------------------------------------
+        if (g_game_ptr != nullptr && g_game_ptr->is_user_camera_enabled())
+        {
+            const bool l3_held = (controllerKeys[MENU_L3] != 0);
+            const bool r3_held = (controllerKeys[MENU_R3] != 0);
+
+            if (l3_held || r3_held)
+            {
+                auto *user_cam = entity_handle_manager::find_entity(
+                    entity_id_USER_CAM, entity_flavor_t::CAMERA, false);
+
+                if (user_cam != nullptr)
+                {
+                    // Speed modifiers from the existing user-cam buttons:
+                    //   axis 26 = USERCAM_FAST, axis 27 = USERCAM_SLOW
+                    auto *im = input_mgr::instance;
+                    float speed = 10.0f;
+                    if (AXIS_MAX == im->get_control_state(26, (device_id_t)-1)) speed *= 4.0f;
+                    if (AXIS_MAX == im->get_control_state(27, (device_id_t)-1)) speed *= 0.25f;
+
+                    const float dt   = float(time_inc);
+                    const float step = speed * dt;
+
+                    auto pos = user_cam->get_abs_position();
+                    auto &po = user_cam->get_abs_po();
+
+                    // ---- L3: dolly zoom along camera forward (z facing) ----
+                    if (l3_held)
+                    {
+                        float dolly = 10.0f;
+                        if (controllerKeys[MENU_L3_UP]   != 0) dolly += step;
+                        if (controllerKeys[MENU_L3_DOWN] != 0) dolly -= step;
+
+                        if (dolly != 0.0f)
+                        {
+                            const auto &fwd = po.get_z_facing();
+                            pos = pos + fwd * dolly;
+                        }
+                    }
+
+                    // ---- R3: pan/translate (strafe X + lift Y) ----
+                    if (r3_held)
+                    {
+                        float strafe = 10.0f;
+                        float lift   = 10.0f;
+                        if (controllerKeys[MENU_R3_RIGHT] != 0) strafe += step;
+                        if (controllerKeys[MENU_R3_LEFT]  != 0) strafe -= step;
+                        if (controllerKeys[MENU_R3_UP]    != 0) lift   += step;
+                        if (controllerKeys[MENU_R3_DOWN]  != 0) lift   -= step;
+
+                        if (strafe != 0.0f)
+                        {
+                            const auto &right = po.get_x_facing();
+                            pos = pos + right * strafe;
+                        }
+                        if (lift != 0.0f)
+                        {
+                            const auto &up = po.get_y_facing();
+                            pos = pos + up * lift;
+                        }
+                    }
+
+                    user_cam->set_abs_position(pos);
+                }
+            }
+        }
     }
 }
 

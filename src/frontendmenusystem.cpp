@@ -21,8 +21,18 @@
 #include "utility.h"
 #include "variables.h"
 #include "vtbl.h"
+#include "memoryunitmanager.h"
+
+#include "sound_manager.h"
+
+#include "game.h"
+
+#include "fetext.h"
+
 
 VALIDATE_SIZE(FrontEndMenuSystem, 0x80);
+
+bool & already_drew_this_frame = var<bool>(0x0096B44A);
 
 FrontEndMenuSystem::FrontEndMenuSystem() : FEMenuSystem(7, static_cast<font_index>(1)) {
     if constexpr (1) {
@@ -145,6 +155,24 @@ void FrontEndMenuSystem::MakeActive(int a2) {
     this->UpdateButtonDown();
 }
 
+void FrontEndMenuSystem::sub_612F40(float a2)
+{
+	THISCALL(0x00612F40, this, a2);
+}
+
+
+void FrontEndMenuSystem::Update(float a2)
+{
+        // Sleep(20000);
+	
+	      movie_manager::load_and_play_movie("attract", nullptr, false);
+
+}
+
+static Var<bool> sounds_paused2{0x00960044};
+
+
+
 void FrontEndMenuSystem::RenderLoadMeter(bool a1) {
     if constexpr (1) {
         if (!os_developer_options::instance->get_flag(mString{"NO_LOAD_SCREEN"})) {
@@ -184,7 +212,7 @@ void FrontEndMenuSystem::GoNextState() {
         case 6: {
             switch (this->field_4[this->m_index][5].field_28) {
             case 0: {
-                g_game_ptr->gamefile->load_most_recent_game();
+                g_game_ptr->gamefile->load_most_recent_game();													
                 this->BringUpDialogBox(10, fe_state{10}, fe_state{10});
                 goto LABEL_27;
             }
@@ -237,8 +265,9 @@ void FrontEndMenuSystem::GoNextState() {
 
             break;
         case 3:
-            this->field_30 = 5;
-            v3 = 5;
+            this->field_30 = 4;
+            v3 = 4;
+						
             goto LABEL_28;
         default:
             this->field_30 = v2 + 1;
@@ -269,11 +298,8 @@ void FrontEndMenuSystem::GoNextState() {
                 --this->field_30;
             } else {
 
-										movie_manager::load_and_play_movie("insomniac_intro", nullptr, false);
-															        static string_hash sfx_id_hash{"FE_MUSIC_MAINMENU"};
+										movie_manager::load_and_play_movie("company", nullptr, false);
 
-        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
-                
 
                 if (this->field_30 != 10) {
                     continue;
@@ -292,13 +318,19 @@ void FrontEndMenuSystem::GoNextState() {
         case 4:
             if (this->m_index != 1) {
                 this->MakeActive(true);
+				     static string_hash sfx_id_hash{"FE_MM_THROB"};
+				        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
             }
+															   
 
+                
             this->field_52 = true;
             break;
-        case 5: {
+        case 5: {						
         LABEL_42:
             this->MakeActive(2);
+			                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
+                sounds_paused2() = true;
             break;
         }
         case 6:
@@ -354,5 +386,10 @@ void FrontEndMenuSystem_patch() {
     {
         FUNC_ADDRESS(address, &FrontEndMenuSystem::GoNextState);
         SET_JUMP(0x00635BC0, address);
+    }
+	
+    {
+        FUNC_ADDRESS(address, &FrontEndMenuSystem::Update);
+       // set_vfunc(0x0089A284, address);
     }
 }

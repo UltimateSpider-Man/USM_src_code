@@ -687,3 +687,11 @@ void debug_render_line_info() {
     debug_render_line_info(debug_line_info[0], 's', num_debug_line_info[0]);
 }
 
+
+
+
+void debug_render_patch() {
+  
+
+    REDIRECT(0x0055CB44, debug_render_init);
+}

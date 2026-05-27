@@ -16,6 +16,10 @@ struct mission_stack_manager {
 
     //0x005BB5D0
     mission_stack_manager();
+	
+	//0x005D8430
+	void sub_5D8430(const mString &a1, const mString &a2);
+
 
     //0x005D2250
     resource_pack_group *get_pack_group_for_pack(const mString &a1);

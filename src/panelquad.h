@@ -9,6 +9,7 @@
 #include "vector2d.h"
 #include "color32.h"
 
+
 #include <cstdint>
 
 struct from_mash_in_place_constructor;
@@ -29,6 +30,9 @@ struct PanelQuad : PanelAnimObject {
 
     //0x00637F00
     PanelQuad(from_mash_in_place_constructor *a2);
+	
+	void SetPos(float a2, float a3);
+
 
     //0x0043F7F0
     ~PanelQuad();
@@ -38,6 +42,8 @@ struct PanelQuad : PanelAnimObject {
 
     //0x006168C0
     vector2d GetMin();
+	
+
 
     void sub_616710(Float a2, Float a3);
 
@@ -83,6 +89,8 @@ struct PanelQuad : PanelAnimObject {
     //0x0062E130
     //virtual
     void CopyFrom(const PanelQuad *a2);
+	
+
 };
 
 extern void PanelQuad_patch();

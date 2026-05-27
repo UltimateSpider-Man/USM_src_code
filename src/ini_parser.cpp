@@ -4,7 +4,7 @@
 #include "log.h"
 #include "os_developer_options.h"
 #include "os_file.h"
-
+#include "utility.h"
 #include <cassert>
 
 int & ini_parser::scan_pos = var<int>(0x009684F8);
@@ -285,4 +285,14 @@ void ini_parser::parse(const char *ini_filename, os_developer_options *a2)
     {
         CDECL_CALL(0x005CA120, ini_filename, a2);
     }
+}
+
+
+
+void ini_parser_patch()
+{
+    {
+
+        REDIRECT(0x005AC375, ini_parser::parse);
+    }   
 }

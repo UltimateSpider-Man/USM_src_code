@@ -346,25 +346,28 @@ unsigned int nglColor2(int r, int g, int b, int a)
 static constexpr DWORD MAX_ELEMENTS_PAGE = 18;
 
 
-void debug_menu::render_current_debug_menu() {
-    auto UP_ARROW{ " ^ ^ ^ " };
-    auto DOWN_ARROW{ " v v v " };
+void debug_menu::render_current_debug_menu()
+{
+    auto UP_ARROW { " ^ ^ ^ " };
+    auto DOWN_ARROW { " v v v " };
 
     int num_elements = std::min((DWORD)MAX_ELEMENTS_PAGE, current_menu->used_slots - current_menu->window_start);
     int needs_down_arrow = ((current_menu->window_start + MAX_ELEMENTS_PAGE) < current_menu->used_slots) ? 1 : 0;
-    pause_menu_system_ptr->Deactivate();
-	
+
+
     int cur_width, cur_height;
     int debug_width = 0;
     int debug_height = 0;
+	pause_menu_system_ptr->Deactivate();
 
-    auto get_and_update = [&](auto* x) {\
-        getStringDimensions2(x, &cur_width, &cur_height); \
-        debug_height += cur_height; \
-        debug_width = std::max(debug_width, cur_width); \
-        };
 
-    //printf("new size: %s %d %d (%d %d)\n", x, debug_width, debug_height, cur_width, cur_height);
+    auto get_and_update = [&](auto* x) {
+        getStringDimensions2(x, &cur_width, &cur_height);
+        debug_height += cur_height;
+        debug_width = std::max(debug_width, cur_width);
+    };
+
+    // printf("new size: %s %d %d (%d %d)\n", x, debug_width, debug_height, cur_width, cur_height);
 
     get_and_update(current_menu->title);
     get_and_update(UP_ARROW);
@@ -389,9 +392,9 @@ void debug_menu::render_current_debug_menu() {
     nglInitQuad(&quad);
     nglSetQuadRect(&quad, menu_x_start, menu_y_start, menu_x_start + debug_width + menu_x_pad, menu_y_start + debug_height + menu_y_pad);
     nglSetQuadColor(&quad, debug_menu::has_focus ? 0xC8141414 : 0x64141414);
-    nglSetQuadZ(&quad, 0.5f);
+    nglSetQuadZ(&quad, 0.5);
     nglListAddQuad(&quad);
-    
+
     int white_color = nglColor2(255, 255, 255, 255);
     int yellow_color = nglColor2(255, 255, 0, 255);
     int green_color = nglColor2(0, 255, 0, 255);
@@ -401,7 +404,6 @@ void debug_menu::render_current_debug_menu() {
     render_height += 12;
     int render_x = menu_x_start;
     render_x += 8;
-    
     nglListAddString(nglSysFont(), render_x, render_height, 0.2f, green_color, 1.f, 1.f, current_menu->title);
     render_height += getStringHeight2(current_menu->title);
 
@@ -427,293 +429,8 @@ void debug_menu::render_current_debug_menu() {
     }
 }
 
-// ============================================================================
-// FONT & TEXT STYLE - Monospace/Terminal aesthetic (matching screenshot)
-// ============================================================================
+	
 
-namespace sm2_style {
-    // Colors (ARGB format: 0xAARRGGBB)
-    constexpr uint32_t COLOR_CYAN_HIGHLIGHT   = 0xFF00CED1;
-    constexpr uint32_t COLOR_WHITE            = 0xFFFFFFFF;
-    constexpr uint32_t COLOR_WHITE_DIM        = 0xFFCCCCCC;
-    constexpr uint32_t COLOR_YELLOW_GOLD      = 0xFFFFD700;
-    constexpr uint32_t COLOR_RED_INSTRUCTION  = 0xFFFF6B6B;
-    constexpr uint32_t COLOR_CYAN_TEXT        = 0xFF00FFFF;
-    constexpr uint32_t COLOR_GREEN_HEADER     = 0xFF00FF88;  // Header category text (e.g. "Health")
-
-    // Backgrounds
-    constexpr uint32_t BG_PANEL_FOCUSED       = 0x00000000;  // Fully transparent - no panel bg (matches screenshot)
-    constexpr uint32_t BG_PANEL_UNFOCUSED     = 0x00000000;
-    constexpr uint32_t BG_HIGHLIGHT_BAR       = 0xFF1A3A5C;  // Dark blue selection bar (matches screenshot)
-    constexpr uint32_t BG_INSTRUCTION_BAR     = 0x00000000;  // No bottom bar
-
-    // Layout - Menu Panel (centered, matching screenshot)
-    constexpr int MENU_PANEL_RIGHT_MARGIN     = 0;
-    constexpr int MENU_PANEL_TOP_MARGIN       = 50;
-    constexpr int MENU_PANEL_PADDING_X        = 0;   // No padding - flush text
-    constexpr int MENU_PANEL_PADDING_Y        = 0;
-    constexpr int MENU_ITEM_SPACING           = 2;   // Tight spacing like screenshot
-    constexpr int HIGHLIGHT_BAR_PADDING_X     = 0;
-    constexpr int HIGHLIGHT_BAR_PADDING_Y     = 1;
-
-    // Column layout for label/value split (screenshot shows right-aligned label, space, value)
-    constexpr int COLUMN_LABEL_WIDTH          = 340;  // Fixed label column width in pixels
-    constexpr int COLUMN_GAP                  = 12;   // Gap between label and value
-    constexpr int ITEM_HEIGHT                 = 18;   // Tight row height matching screenshot
-
-    // Layout - Build Info (left side)
-    constexpr int BUILD_INFO_LEFT_MARGIN      = 20;
-    constexpr int BUILD_INFO_TOP_MARGIN       = 340;
-    constexpr int BUILD_INFO_LINE_SPACING     = 2;
-
-    // Layout - Instruction Bar (bottom)
-    constexpr int INSTRUCTION_BAR_HEIGHT      = 32;
-    constexpr int INSTRUCTION_BAR_BOTTOM      = 10;
-
-    // Z-depths
-    constexpr float Z_BACKGROUND              = 0.9f;
-    constexpr float Z_HIGHLIGHT               = 0.5f;
-    constexpr float Z_TEXT                    = 0.2f;
-    constexpr float Z_INSTRUCTION             = 0.1f;
-
-    // Font scale - smaller to match the compact screenshot look
-    constexpr float FONT_SCALE                = 0.75f;  // Shrink to match screenshot density
-}
-
-static const char* g_instruction_text = "User-specified list, use R3 or Tab to add/remove menu items from this list";
-static int g_screen_width  = 1280;
-static int g_screen_height = 720;
-
-namespace {
-    inline uint32_t make_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
-        return (a << 24) | (r << 16) | (g << 8) | b;
-    }
-
-    void get_text_dimensions(const char* text, int* width, int* height) {
-        getStringDimensions2(text, width, height);
-    }
-
-    int get_text_height(const char* text) {
-        return getStringHeight2(text);
-    }
-
-    int get_text_width(const char* text) {
-        int w, h;
-        get_text_dimensions(text, &w, &h);
-        return w;
-    }
-
-    // Right-align text within a fixed column width
-    int right_align_x(const char* text, int column_right_x) {
-        int w = get_text_width(text);
-        return column_right_x - w;
-    }
-
-    // Split "Label   Value" entry into label and value parts
-    // Screenshot shows entries like: "Heroes do not take damage    Off"
-    // We split on the last run of spaces or a tab
-    void split_label_value(const std::string& full, std::string& label, std::string& value) {
-        // Find last double-space or tab as separator
-        auto pos = full.rfind("  ");
-        if (pos != std::string::npos) {
-            label = full.substr(0, pos);
-            // Trim leading spaces from value
-            size_t val_start = full.find_first_not_of(' ', pos);
-            value = (val_start != std::string::npos) ? full.substr(val_start) : "";
-        } else {
-            label = full;
-            value = "";
-        }
-    }
-}
-
-inline debug_build_info g_build_info = {
-    "0,7814186",
-    "DEV_LOCAL",
-    "msm2mod/debug/code, @000001",
-    "04,04,2026",
-    "msm2mod_assets, @000001",
-    "DEBUG BUILD"
-};
-
-void debug_menu::render_build_info_panel() {
-    using namespace sm2_style;
-
-    int render_x = BUILD_INFO_LEFT_MARGIN;
-    int render_y = BUILD_INFO_TOP_MARGIN;
-    int line_height = static_cast<int>(get_text_height("A") * FONT_SCALE) + BUILD_INFO_LINE_SPACING;
-
-    int yellow_color = nglColor2(255, 204, 0, 255);
-
-    auto render_info_line = [&](const char* label, const std::string& value) {
-        if (value.empty()) return;
-        std::string full_line = std::string(label) + value;
-        nglListAddString(*nglSysFont, render_x, render_y, Z_TEXT,
-                         yellow_color, FONT_SCALE, FONT_SCALE, full_line.c_str());
-        render_y += line_height;
-    };
-
-    render_info_line("VERSION: ",         g_build_info.version);
-    render_info_line("BUILD MACHINE: ",   g_build_info.build_machine);
-    render_info_line("CODE: ",            g_build_info.code_path);
-    render_info_line("CODE BUILD TIME: ", g_build_info.build_time);
-}
-void debug_menu::msm2_debug_menu() {
-    using namespace sm2_style;
-
-    int total_elements_page = std::min((DWORD)MAX_ELEMENTS_PAGE,
-                                        current_menu->used_slots - current_menu->window_start);
-    int needs_down_arrow    = ((current_menu->window_start + MAX_ELEMENTS_PAGE)
-                                < current_menu->used_slots) ? 1 : 0;
-    if (needs_down_arrow) total_elements_page = MAX_ELEMENTS_PAGE;
-pause_menu_system_ptr->Deactivate();
-    // ── Split and measure all entries ────────────────────────────────────────
-    struct SplitEntry { std::string label, value; };
-    std::vector<SplitEntry> entries(total_elements_page);
-
-    int max_label_w = 0;
-    int max_value_w = 0;
-
-    for (int i = 0; i < total_elements_page; ++i) {
-        debug_menu_entry* entry = &current_menu->entries[current_menu->window_start + i];
-        auto full = getRealText2(entry);
-        split_label_value(full, entries[i].label, entries[i].value);
-
-        int lw = static_cast<int>(get_text_width(entries[i].label.c_str()) * FONT_SCALE);
-        int vw = static_cast<int>(get_text_width(entries[i].value.c_str()) * FONT_SCALE);
-        max_label_w = std::max(max_label_w, lw);
-        max_value_w = std::max(max_value_w, vw);
-    }
-
-    // ── Total block size ─────────────────────────────────────────────────────
-    int total_w = max_label_w + COLUMN_GAP + max_value_w;
-    int total_h = total_elements_page * (ITEM_HEIGHT + MENU_ITEM_SPACING);
-
-    // ── TRUE center of screen ────────────────────────────────────────────────
-    // Query actual screen dimensions instead of relying on stale globals
-    int screen_w = nglGetScreenWidth();   // replace with your actual getter
-    int screen_h = nglGetScreenHeight();  // replace with your actual getter
-
-    int block_x = (screen_w - total_w) / 2;
-    int block_y = (screen_h - total_h) / 2;
-
-    // Guard against negative x (menu wider than screen)
-    if (block_x < 8) block_x = 8;
-
-    // Column split
-    int label_right_x = block_x + max_label_w;
-    int value_left_x  = label_right_x + COLUMN_GAP;
-
-    // ── Colors ───────────────────────────────────────────────────────────────
-    int white_color = nglColor2(255, 255, 255, 255);
-    int cyan_color  = nglColor2(0,   255, 255, 255);
-    int green_color = nglColor2(0,   255, 136, 255);
-    int red_color   = nglColor2(255,  80,  80, 255);
-
-    // ── Optional: subtle dark backdrop so text is readable over 3D scene ─────
-    // (screenshot shows menu floating over gameplay — a faint bg helps legibility)
-    {
-        nglQuad bg;
-        nglInitQuad(&bg);
-nglSetQuadRect(&bg,
-    0,
-    0,
-    screen_w,
-    screen_h);
-        nglSetQuadColor(&bg, 0x88000000);        // 53% transparent black
-        nglSetQuadZ(&bg, Z_BACKGROUND);
-        nglListAddQuad(&bg);
-    }
-
-    // ── Category header centered above list ──────────────────────────────────
-    if (current_menu->title) {
-        int hw       = static_cast<int>(get_text_width(current_menu->title) * FONT_SCALE);
-        int header_x = (screen_w - hw) / 2;
-        int header_y = block_y - ITEM_HEIGHT - 4;
-        nglListAddString(*nglSysFont, header_x, header_y, Z_TEXT,
-                         green_color, FONT_SCALE, FONT_SCALE, current_menu->title);
-    }
-
-    // ── Render items ─────────────────────────────────────────────────────────
-    int render_y = block_y;
-
-    for (int i = 0; i < total_elements_page; ++i) {
-        bool is_selected = (current_menu->cur_index == i);
-
-        if (is_selected) {
-            nglQuad sel_quad;
-            nglInitQuad(&sel_quad);
-            nglSetQuadRect(&sel_quad,
-                block_x      - HIGHLIGHT_BAR_PADDING_X,
-                render_y     - HIGHLIGHT_BAR_PADDING_Y,
-                block_x + total_w + HIGHLIGHT_BAR_PADDING_X,
-                render_y + ITEM_HEIGHT - HIGHLIGHT_BAR_PADDING_Y);
-            nglSetQuadColor(&sel_quad, BG_HIGHLIGHT_BAR);
-            nglSetQuadZ(&sel_quad, Z_HIGHLIGHT);
-            nglListAddQuad(&sel_quad);
-        }
-
-        int text_color = is_selected ? cyan_color : white_color;
-
-        int lx = right_align_x(entries[i].label.c_str(), label_right_x);
-        nglListAddString(*nglSysFont, lx, render_y, Z_TEXT,
-                         text_color, FONT_SCALE, FONT_SCALE, entries[i].label.c_str());
-
-        if (!entries[i].value.empty()) {
-            nglListAddString(*nglSysFont, value_left_x, render_y, Z_TEXT,
-                             text_color, FONT_SCALE, FONT_SCALE, entries[i].value.c_str());
-        }
-
-        render_y += ITEM_HEIGHT + MENU_ITEM_SPACING;
-    }
-
-    // ── Scroll hint below block ───────────────────────────────────────────────
-    if (current_menu->used_slots > MAX_ELEMENTS_PAGE) {
-        int iw     = static_cast<int>(get_text_width(g_instruction_text) * FONT_SCALE);
-        int hint_x = (screen_w - iw) / 2;
-        int hint_y = block_y + total_h + 10;
-        nglListAddString(*nglSysFont, hint_x, hint_y, Z_TEXT,
-                         red_color, FONT_SCALE, FONT_SCALE, g_instruction_text);
-    }
-}
-
-
-void debug_menu::render_instruction_bar() {
-    // Screenshot has no instruction bar - items scroll and hint text is inline
-    // Only render if there's overflow
-    if (!current_menu || current_menu->used_slots <= MAX_ELEMENTS_PAGE)
-        return;
-
-    using namespace sm2_style;
-
-    int text_width  = static_cast<int>(get_text_width(g_instruction_text)  * FONT_SCALE);
-    int text_height = static_cast<int>(get_text_height(g_instruction_text) * FONT_SCALE);
-    int text_x = (g_screen_width  - text_width)  / 2;
-    int text_y = (g_screen_height - text_height) - INSTRUCTION_BAR_BOTTOM;
-
-    int red_color = nglColor2(255, 80, 80, 255);
-    nglListAddString(*nglSysFont, text_x, text_y, Z_INSTRUCTION,
-                     red_color, FONT_SCALE, FONT_SCALE, g_instruction_text);
-}
-
-
-
-void debug_menu::init_sm2_style() {
-    g_build_info.set_defaults();
-}
-
-void debug_menu::set_instruction_text(const char* text) {
-    g_instruction_text = text;
-}
-
-void debug_menu::set_context_instruction() {
-    if (current_menu && current_menu->is_user_list)
-        g_instruction_text = "User-specified list, use R3 or Tab to add/remove menu items from this list";
-    else if (current_menu && current_menu->has_editable_values)
-        g_instruction_text = "Use L1/R1 to adjust values, X to confirm, O to cancel";
-    else
-        g_instruction_text = "X to select, O to go back, Triangle for options";
-}
 
 
 debug_menu *debug_menu_entry::remove_menu()

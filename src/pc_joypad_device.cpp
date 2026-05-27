@@ -13,6 +13,13 @@
 #include "utility.h"
 #include "variables.h"
 
+// Defined in main.cpp -- non-zero whenever the debug menu is on screen
+// (independent of focus). Used below to suppress the joypad pause flag
+// so pressing Start with the debug menu up no longer triggers
+// game::pause() and its sound fade.
+extern int debug_enabled;
+extern int debug_disabled;
+
 VALIDATE_SIZE(InputState, 0x20);
 
 VALIDATE_SIZE(pc_joypad_device, 0x9Cu);
@@ -230,7 +237,13 @@ int InputGetState(unsigned int dwUserIndex, InputState &pState)
         pState.field_C = v3.get_state(static_cast<InputAction>(10u)) * flt_871978;
         pState.field_D = v3.get_state(static_cast<InputAction>(11u)) * flt_871978;
 
-        if (0.0f != v3.get_state(InputAction::Pause)) {
+        // Pause flag (Start button -> 0x10 -> game::pause() + sound fade).
+        // While the debug menu is on screen we don't want Start to trigger
+        // the pause-menu sound effect, so drop the flag at the input layer.
+        // Keeping this gated on (debug_enabled || debug_disabled) means
+        // game::pause() itself stays usable from the console or scripts.
+        const bool debug_menu_on_screen = (debug_enabled != 0) || (debug_disabled != 0);
+        if (0.0f != v3.get_state(InputAction::Pause) && !debug_menu_on_screen) {
             v20 |= 0x10u;
         }
 
@@ -508,5 +521,3 @@ void pc_joypad_device_patch()
     }
 
 }
-
-

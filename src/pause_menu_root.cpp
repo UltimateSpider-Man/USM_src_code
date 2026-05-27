@@ -12,6 +12,8 @@
 #include "mstring.h"
 #include "panelquad.h"
 #include "pausemenusystem.h"
+#include "pause_menu_transition.h"
+#include "pause_menu_status.h"
 #include "panelfile.h"
 #include "utility.h"
 #include "trace.h"
@@ -36,14 +38,19 @@
 #include "sound_instance_id.h"
 
 #include "cursor.h"
-
+#include "game_settings.h"
 #include "script_object.h"
 
 #include "variables.h"
 
 #include "wds.h"
 
-
+#include <windows.h>
+#include <string>
+#include <iostream>
+#include <stdexcept>
+#include <filesystem>
+#include <vector>
 
 
 #include "string_hash.h"
@@ -67,6 +74,9 @@ pause_menu_root::pause_menu_root(FEMenuSystem *a2, int a3, int a4) : FEMenu(a2, 
 
 
 
+
+
+
 void pause_menu_root::_Load()
 {
     TRACE("pause_menu_root::Load");
@@ -84,14 +94,16 @@ void pause_menu_root::_Load()
         this->field_3C[6] = v2->GetPQ("pm_splash_back_stub_01");
         this->field_3C[7] = v2->GetPQ("pm_splash_back_stub_02");
         this->field_3C[8] = v2->GetPQ("pm_splash_icon");
-		this->field_3C[9] = v2->GetPQ("pm_splash_icon");
 
         this->field_68 = v2->GetPQ("pm_splash_dialog_box_01");
         this->field_6C = v2->GetPQ("pm_splash_dialog_box_02");
-        this->field_64 = v2->GetPQ("pm_splash_hilite_text");
+        this->field_60 = v2->GetPQ("pm_splash_hilite_text");
         this->field_64 = v2->GetPQ("pm_splash_hilite_text_01");
         this->field_70 = v2->GetPQ("pm_splash_back_04");
-		this->field_74 = v2->GetPQ("pm_splash_back_venom");
+        this->field_74 = v2->GetPQ("pm_splash_back_venom");
+		
+		
+		this->field_78[7] = v2->GetTextPointer("pm_splash_text_08");
         this->field_78[0] = v2->GetTextPointer("pm_splash_text_01");
         this->field_78[1] = v2->GetTextPointer("pm_splash_text_02");
         this->field_78[2] = v2->GetTextPointer("pm_splash_text_03");
@@ -99,16 +111,15 @@ void pause_menu_root::_Load()
         this->field_78[4] = v2->GetTextPointer("pm_splash_text_05");
         this->field_78[5] = v2->GetTextPointer("pm_splash_text_06");
         this->field_78[6] = v2->GetTextPointer("pm_splash_text_07");
-        this->field_78[7] = v2->GetTextPointer("pm_splash_text_08");
-        this->field_78[8] = v2->GetTextPointer("pm_splash_text_09");
-		this->field_78[9] = v2->GetTextPointer("pm_splash_text_10");
+		this->field_78[8] = v2->GetTextPointer("pm_splash_text_09");
+       
 
-        this->field_A0 = v2->GetTextPointer("pm_splash_text_GAMEPAUSED");
+        this->field_9C = v2->GetTextPointer("pm_splash_text_GAMEPAUSED");
         this->field_A0 = v2->GetTextPointer("pm_splash_dialog_box_text_BODY");
         this->field_A4 = v2->GetTextPointer("pm_splash_dialog_box_text_NOWAY");
 
         this->field_A8 = v2->GetTextPointer("pm_splash_dialog_box_text_OKAY");
-        for (auto i = 0u; i < 10u; ++i)
+        for (auto i = 0u; i < 9u; ++i)
         {
             this->field_3C[i]->TurnOn(true);
         }
@@ -116,10 +127,8 @@ void pause_menu_root::_Load()
         this->field_78[0]->SetShown(true);
         this->field_78[0]->SetNoFlash(color32 {0xFFE6D03F});
         this->field_78[0]->SetScale(1.2, 1.2);
-		
-		
 
-        for (auto i = 0u; i < 10u; ++i) 
+        for (auto i = 0u; i < 8u; ++i) 
         {
             auto *v6 = this->field_78[i + 1];
             v6->SetShown(true);
@@ -128,11 +137,11 @@ void pause_menu_root::_Load()
 
         this->field_68->TurnOn(1);
         this->field_6C->TurnOn(1);
+        this->field_60->TurnOn(1);
         this->field_64->TurnOn(1);
-        this->field_64->TurnOn(1);
-        this->field_A0->SetShown(true);
-        this->field_A0->SetText(static_cast<global_text_enum>(253));
-        this->field_A0->SetNoFlash(color32 {0xFFC8C8C8});
+        this->field_9C->SetShown(true);
+        this->field_9C->SetText(static_cast<global_text_enum>(253));
+        this->field_9C->SetNoFlash(color32 {0xFFC8C8C8});
         this->field_A0->SetShown(1);
         this->field_A0->SetText(static_cast<global_text_enum>(271));
         this->field_A0->SetNoFlash(color32 {0xFFC8C8C8});
@@ -143,20 +152,19 @@ void pause_menu_root::_Load()
         this->field_A8->SetText(static_cast<global_text_enum>(255));
         this->field_A8->SetNoFlash(color32 {0xFFC87238});
 
+		this->field_78[8]->SetText(static_cast<global_text_enum>(263));
         this->field_78[7]->SetText(static_cast<global_text_enum>(265));
-		this->field_78[8]->SetText(static_cast<global_text_enum>(261));
         this->field_78[0]->SetText(static_cast<global_text_enum>(275));
-        this->field_78[1]->SetText(static_cast<global_text_enum>(260));
-        this->field_78[2]->SetText(static_cast<global_text_enum>(258));
-        this->field_78[3]->SetText(static_cast<global_text_enum>(259));
-        this->field_78[4]->SetText(static_cast<global_text_enum>(273));
-        this->field_78[5]->SetText(static_cast<global_text_enum>(263));
-        this->field_78[9]->SetText(static_cast<global_text_enum>(92));
-        this->field_78[6]->SetText(static_cast<global_text_enum>(297));
+        this->field_78[1]->SetText(static_cast<global_text_enum>(91));
+        this->field_78[2]->SetText(static_cast<global_text_enum>(92));
+        this->field_78[3]->SetText(static_cast<global_text_enum>(260));
+        this->field_78[4]->SetText(static_cast<global_text_enum>(258));
+        this->field_78[5]->SetText(static_cast<global_text_enum>(259));
+        this->field_78[6]->SetText(static_cast<global_text_enum>(273));
 
         auto v8 = this->field_78[0]->GetX();
         auto v9 = this->field_78[0]->GetY();
-        this->field_64->GetPos(this->field_B8, this->field_C8);
+        this->field_60->GetPos(this->field_B8, this->field_C8);
         this->field_64->GetPos(this->field_D8, this->field_E8);
 
         for (auto i = 0u; i < 4u; ++i)
@@ -180,142 +188,108 @@ void pause_menu_root::_Load()
 void pause_menu_root2::Draw()
 {
 
-
-
-
-    // === Draw menu text items ===
     bool isStoryActive = mission_manager::s_inst->is_story_active();
-    for (int i = 0; i < 10; ++i)
+    for (int i = 0; i < 9; ++i)
     {
-        if (i != 10 || !isStoryActive)
+        if (i != 9 || !isStoryActive)
         {
             this->field_78[i]->Draw();
         }
     }
 
-    // === Draw selection indicators ===
-    if (this->field_B0 != 10)
+
+    if (this->field_B0 != 9)
     {
         this->field_60->Draw();
         this->field_64->Draw();
     }
 
-    // === Draw field_A0 text ===
+	THISCALL(0x0061BF80, this);
 
-	
-	
-			THISCALL(0x0061BF80, this);
-
-
-    // FIX: Removed THISCALL - would cause infinite recursion or duplicate drawing
 }
 
 
 void pause_menu_root2::update_selected()
 {
-    int prev_index = this->field_B4;
-    int curr_index = this->field_B0;
+    const int prev_index = this->field_B4;
+    const int curr_index = this->field_B0;
 
-    // Select current item
-    FEText *curr_text;
-    if (curr_index == 10) {
-        curr_text = this->field_AC->field_30->text_box;
-    } else {
-        curr_text = this->field_78[curr_index];
+    auto resolve = [this](int idx) -> FEText * {
+        if (idx == 10) {
+            if (!this->field_AC)            return nullptr;
+            if (!this->field_AC->field_30)  return nullptr;
+            return this->field_AC->field_30->text_box;
+        }
+
+        if (idx < 0 || idx >= 10) return nullptr;
+        return this->field_78[idx];
+    };
+
+    if (FEText *curr_text = resolve(curr_index)) {
+
+        if (curr_text) {
+            curr_text->SetNoFlash(color32{200, 200, 200, 255});
+        }
+        curr_text->SetScale(1.0f, 1.0f);
     }
-	//    curr_text->SetNoFlash(color32 {200, 200, 200, 255});
-	curr_text->SetScale(1.0f,1.0f);
+
+    if (prev_index != curr_index) {
+        if (FEText *prev_text = resolve(prev_index)) {
+            if (prev_text) {
+                prev_text->SetNoFlash(color32{63, 208, 230, 255});
+            }
+            prev_text->SetScale(1.0f, 1.0f);
+        }
+    }
 
     this->field_B4 = this->field_B0;
-
-    // Deselect previous item
-    FEText *prev_text;
-	menu_nav_bar *field_30;
-    if (prev_index == 10) {
-        prev_text = this->field_AC->field_30->text_box;
-    } else {
-        prev_text = this->field_78[prev_index];
-		
-    }
-	//prev_text->SetNoFlash(color32 {63, 208, 230, 255});
-
-    prev_text->SetScale(1.0f, 1.0f);
-	
-	
-	
 }
-
 
 
 void pause_menu_root2::OnDown(int a2)
 {
-    if (this->field_30 && this->field_2C && this->field_F8) {
+    if (byte_965C21() || this->field_30 || this->field_2C || this->field_F8) {
         return;
     }
-    if (this->field_B0 == 10) {
-    if (++this->field_B0 >= 10) {
+
+    if (++this->field_B0 > 9) {
         this->field_B0 = 0;
     }
 
-    if (this->field_B0 == 10) {
-        if (mission_manager::s_inst->is_story_active()) {
-            if (++this->field_B0 >= 10) {
-                this->field_B0 = 0;
-            }
+    if (this->field_B0 == 9 && mission_manager::s_inst->is_story_active()) {
+        if (++this->field_B0 > 9) {
+            this->field_B0 = 0;
         }
     }
-	    }
 
     this->update_selected();
 
-    static bool initialized = false;
-    if (!initialized) {
-        initialized = true;
-    }
-	
-
-	static string_hash sfx_id_hash{"fe_ps_udscroll"};
-
-        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
-		
-		    THISCALL(0x0061BE10, this, a2);
+    static string_hash sfx{"fe_ps_udscroll"};
+    [[maybe_unused]] sound_instance_id id = sub_60B960(sfx, 1.0f, 1.0f);
 }
 
 void pause_menu_root2::OnUp(int a2)
 {
-	    sp_log("pause_menu_root::OnUp(): %d", a2);
+    sp_log("pause_menu_root::OnUp(): %d", a2);
 
-    if (this->field_30 || this->field_2C || this->field_F8) {
+    if (byte_965C21() || this->field_30 || this->field_2C || this->field_F8) {
         return;
     }
-   if (this->field_B0 == 10) {
+
     if (--this->field_B0 < 0) {
-        this->field_B0 = 10;
+        this->field_B0 = 9;
     }
 
-    if (this->field_B0 == 10) {
-        if (mission_manager::s_inst->is_story_active()) {
-            if (--this->field_B0 < 0) {
-                this->field_B0 = 10;
-            }
+    if (this->field_B0 == 9 && mission_manager::s_inst->is_story_active()) {
+        if (--this->field_B0 < 0) {
+            this->field_B0 = 9;
         }
     }
-    }
+
     this->update_selected();
-	
 
-
-    static bool initialized = false;
-    if (!initialized) {
-        initialized = true;
-			
-    }
-
-	static string_hash sfx_id_hash{"fe_ps_udscroll"};
-
-        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
-	
-	    THISCALL(0x0061BD00, this, a2);
+    static string_hash sfx{"fe_ps_udscroll"};
+    [[maybe_unused]] sound_instance_id id = sub_60B960(sfx, 1.0f, 1.0f);
 }
 
 void pause_menu_root::sub_61C610()
@@ -330,6 +304,11 @@ void sub_648F40() {
 void pause_menu_root2::OnDeactivate(FEMenu *a2)
 {
     this->field_28 &= ~0x80;
+
+    Cursor *cur = g_cursor();
+    if (cur != nullptr) {
+        cur->field_120 = 0;
+    }
 }
 
 void pause_menu_root::Update(Float a2) {
@@ -388,26 +367,14 @@ void pause_menu_root2::sub_62A840()
 
 void pause_menu_root2::OnActivate()
 {
-	    if constexpr (0) {
-    sub_62A840();
+	    Cursor *cur = g_cursor();
+    if (cur != nullptr) {
+        cur->sub_5A6790();      // clear all registered hitboxes
+        cur->field_120 = 0;     // suppress per-frame visibility flip
+        cur->field_114 = 0;     // hide for current frame
+    }
 
-    this->field_28 |= 0x80;
-    this->field_30 = 0;
-    this->field_2C = false;
-    this->field_2A = -1;
-   this->field_FC = mission_manager::s_inst->is_story_active() ? 1 : 0;
-
-    color32 deselected_color{200, 200, 200, 255};
-    FEText *text_box = this->field_AC->field_30->text_box;
-    text_box->SetNoFlash(deselected_color);
-    text_box->SetScale(1.0f, 1.0f);
-
-    sub_582AD0();
-    g_cursor()->sub_5A6790();
-    g_cursor()->sub_5A67D0(305, 420, 385, 445);
-  
-  THISCALL(0x006302D0, this);
-}
+    THISCALL(0x006302D0, this);
 
 }
 
@@ -481,7 +448,8 @@ static string_hash sfx_id_hash{"FE_PS_ACCEPT"};
         if (selection == 8)
         {
             // Initiate hero switch
-          //  this->field_F8 = is_spidey;
+			bool is_spidey = false;
+            this->field_F8 = is_spidey;
 
             string_hash toggle_hash;
             toggle_hash.initialize(0, func_name, 0);
@@ -495,43 +463,20 @@ static string_hash sfx_id_hash{"FE_PS_ACCEPT"};
 			
 			    auto* v5 = this->field_AC;
     if (v5->m_index >= 0) {
-        v5->MakeActive(0);
+        v5->MakeActive(1);
         comic_panels::game_play_panel()->field_67 = v5->m_count;
     }
 			
-pause_menu_system_ptr->Deactivate();
+    pause_menu_system_ptr->Deactivate();
 	Sleep(500);
 
-        }
-		
-		
-
+    }
 static string_hash sfx_id_hash{"FE_PS_ACCEPT"};
 [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
+  
+     }
 }
-
-        }
-		
-
-     
-
-// Static string hashes for sounds (lazy initialized)
-static inline string_hash s_fe_ps_accept_0;  // 0x20 flag
-static inline string_hash s_fe_ps_accept_1;  // 0x40 flag
-static inline string_hash s_fe_ps_accept_2;  // 0x80 flag
-static inline string_hash s_fe_ps_accept_3;  // 0x100 flag
-static inline string_hash s_fe_ps_accept_4;  // 0x200 flag
-static inline string_hash s_fe_ps_accept_5;  // 0x400 flag
-static inline string_hash s_fe_ps_accept_6;  // 0x800 flag
-static inline string_hash s_fe_ps_accept_7;  // 0x1000 flag
-static inline string_hash s_fe_ps_accept_8;  // 0x2000 flag
-static inline string_hash s_fe_ps_accept_9;  // 0x10 flag
-static inline string_hash s_fe_ps_accept_10; // 0x8 flag
-static inline string_hash s_fe_wb_accept;    // 0x4 flag
-static inline string_hash s_toggle_hero;     // 0x2 flag
-static inline string_hash s_progression_mis; // 0x1 flag
-
-static inline int s_initialized_flags = 0;
+	
 
 struct menu_widget{
   int  field_32;
@@ -545,24 +490,29 @@ menu_widget * field_36;
 int count;  
 
 
-    };
+};
 
-// Helper to initialize sound hash if needed
-static string_hash get_sound_hash(int flag, string_hash &hash, const char *name) {
-    if ((s_initialized_flags & flag) == 0) {
-        s_initialized_flags |= flag;
-        hash = string_hash{name};
-    }
-    return hash;
-}
 
-// Helper to set menu state
 void pause_menu_root::set_menu_state(int state) {
-    auto *menu_data = this->field_AC->field_4[1];
-    menu_data[18];  // offset 72 / sizeof(int)
+
+    auto *transition = bit_cast<pause_menu_transition *>(this->field_AC->field_4[1]);
+    transition->field_48 = state;
 }
 
-// Helper to activate menu and update comic panel
+void pause_menu_root::transition_to_submenu(int target_state) {
+    this->set_menu_state(target_state);
+
+    auto *menu_sys = bit_cast<PauseMenuSystem *>(this->field_AC);
+    menu_sys->MakeActive(1);
+
+    if (!menu_sys->field_38) {
+        comic_panels::game_play_panel()->field_67 = 0;
+    }
+
+    static string_hash sfx_id_hash{"FE_PS_ACCEPT"};
+    [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0f, 1.0f);
+}
+
 void pause_menu_root::activate_menu(int mode) {
     auto *menu_system = this->field_AC;
     menu_system->MakeActive(mode);
@@ -572,13 +522,11 @@ void pause_menu_root::activate_menu(int mode) {
     }
 }
 
-// Helper to play accept sound
 void pause_menu_root::play_accept_sound(int flag, string_hash &hash) {
     static string_hash sfx_id_hash{"FE_PS_ACCEPT"};
     [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0f, 1.0f);
 }
 
-// Helper to reset menu widget state
 void pause_menu_root::reset_widget_state(int widget_ptr) {
     auto *widget = reinterpret_cast<menu_widget *>(widget_ptr);
     
@@ -595,12 +543,6 @@ void pause_menu_root::reset_widget_state(int widget_ptr) {
     widget->field_36 = 0;
 }
 
-// Colors as constants (converted from hex int representation)
-
-#include <windows.h>
-#include <string>
-#include <iostream>
-
 bool LaunchProcess(const std::wstring& exePath, const std::wstring& args = L"") {
     std::wstring cmdLine = L"\"" + exePath + L"\"";
     if (!args.empty()) {
@@ -612,18 +554,18 @@ bool LaunchProcess(const std::wstring& exePath, const std::wstring& args = L"") 
 
     PROCESS_INFORMATION pi{};
 
-    // CreateProcessW may modify the command line buffer
+
     std::wstring mutableCmd = cmdLine;
 
     BOOL ok = CreateProcessW(
-        nullptr,                    // application name
-        mutableCmd.data(),          // command line
-        nullptr,                    // process attributes
-        nullptr,                    // thread attributes
-        FALSE,                      // inherit handles
-        0,                          // creation flags
-        nullptr,                    // environment
-        nullptr,                    // current directory
+        nullptr,                   
+        mutableCmd.data(),          
+        nullptr,                    
+        nullptr,                    
+        FALSE,                      
+        0,                          
+        nullptr,                    
+        nullptr,                    
         &si,
         &pi
     );
@@ -644,17 +586,9 @@ void pause_menu_root::OnStart(int a2)
 
   THISCALL(0x0061BF40, this, a2);
 }
-#include <windows.h>
-#include <string>
-#include <stdexcept>
-#include <filesystem>
-#include <vector>
+
 
 namespace fs = std::filesystem;
-
-// ─────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────
 
 static fs::path GetSelfDir()
 {
@@ -663,13 +597,6 @@ static fs::path GetSelfDir()
         throw std::runtime_error("GetModuleFileNameW failed: " + std::to_string(GetLastError()));
     return fs::path(buf).parent_path();
 }
-
-// ─────────────────────────────────────────────
-//  Unlink all mods
-//  Removes every .asi / .dll (except the host
-//  exe itself) from the current exe's directory.
-//  Extend modExtensions for other mod types.
-// ─────────────────────────────────────────────
 
 static const std::vector<std::wstring> modExtensions = {
     L".asi", L".dll"
@@ -710,13 +637,6 @@ void UnlinkAllMods()
     }
 }
 
-// ─────────────────────────────────────────────
-//  Launch exe with a specific working directory
-//  so it resolves "data\" and "docs\" correctly
-// ─────────────────────────────────────────────
-
-
-
 void LaunchExeInDir(const std::wstring& exePath,const fs::path& workDir, bool waitForProcess = false)
 {
     STARTUPINFOW si{};
@@ -744,11 +664,6 @@ void LaunchExeInDir(const std::wstring& exePath,const fs::path& workDir, bool wa
     CloseHandle(pi.hThread);
 }
 
-// ─────────────────────────────────────────────
-//  Ensure expected sub-folders exist inside
-//  the USMPC directory
-// ─────────────────────────────────────────────
-
 static void EnsureFolders(const fs::path& baseDir, const std::vector<std::wstring>& subFolders)
 {
     for (auto& sub : subFolders)
@@ -759,82 +674,84 @@ static void EnsureFolders(const fs::path& baseDir, const std::vector<std::wstrin
     }
 }
 
-// ─────────────────────────────────────────────
-//  Exit USMPC, go back to MSM2 root folder,
-//  ensure data\, docs\, mods\, shaders\ exist,
-//  launch MSM2.exe with root as CWD, then exit.
-//
-//  Expected layout:
-//
-//  Marvel Spider-Man 2 PC Hack Rom (USM) Beta Build 02.04.03.40\
-//      MSM2.exe
-//      data\
-//      docs\
-//      mods\
-//      shaders\
-//      USMPC\
-//          USM.exe   <── this is the current running exe
-//          data\
-//          docs\
-// ─────────────────────────────────────────────
-
-void ExitUSMPCAndRebootToMSM2()
+void ExitHACKROMAndBootToUSMPC()
 {
-    // USM.exe lives in USMPC\ → parent is the MSM2 root
-    fs::path usmpcDir = GetSelfDir();                    // ..\USMPC
-    fs::path msm2Dir  = usmpcDir.parent_path();          // ..\Marvel Spider-Man 2 PC Hack Rom...
-    fs::path msm2Exe  = msm2Dir / L"MSM2.exe";
 
-    if (!fs::exists(msm2Exe))
-        throw std::runtime_error("MSM2.exe not found: " + msm2Exe.string());
+    fs::path hackromDir = GetSelfDir();
+    fs::path usmpcDir   = hackromDir.parent_path();
+    fs::path usmExe     = usmpcDir / L"USM.exe";
 
-    // Guarantee all required folders exist in MSM2 root
-    EnsureFolders(msm2Dir, { L"data", L"docs", L"mods", L"shaders" });
+    if (!fs::exists(usmExe))
+        throw std::runtime_error("USM.exe not found: " + usmExe.string());
 
-    // Launch MSM2.exe with the MSM2 root as CWD so all
-    // relative paths (data\, docs\, mods\, shaders\) resolve correctly
-    LaunchExeInDir(msm2Exe, msm2Dir, false);
+    EnsureFolders(usmpcDir, { L"data", L"docs" });
 
+    LaunchExeInDir(usmExe, usmpcDir, false);
     ExitProcess(0);
 }
 
-
 void pause_menu_root::OnCross(int a2)
 {
-    int type = this->field_B0;
-	  
-static string_hash sfx_id_hash{"FE_PS_ACCEPT"};
-	                if (type == 0)
-                THISCALL(0x00630460,this, a2);
-				    if (type == 1)
-		        THISCALL(0x00630460,this, a2);
-				    if (type == 2)
-		        THISCALL(0x00630460,this, a2);
-				    if (type == 3)
-		        THISCALL(0x00630460,this, a2);
-				    if (type == 4)
-		        THISCALL(0x00630460,this, a2);
-				    if (type == 5)
-			    THISCALL(0x00630460,this, a2);
-			        if (type == 6)
-                THISCALL(0x00630460,this, a2);
-					if (type == 7)
-			    THISCALL(0x00630460,this, a2);
-				    if (type == 7)
-			    THISCALL(0x00630460,this, a2);
-					if (type == 8)
-			    THISCALL(0x00630460,this, a2);
-					if (type == 9)
-                ExitUSMPCAndRebootToMSM2();
-						 
-						 
+    const int type = this->field_B0;
+ 
+    switch (type) {
+        case 0:  // EXIT MISSION
+            this->transition_to_submenu(3);
+            return;
+ 
+        case 1:  // CITY GOALS
 
+            this->transition_to_submenu(1);
+            return;
+ 
+        case 2:  // AWARDS  
+            this->transition_to_submenu(2);
+            return;
+ 
+        case 3:  // GAME STATS  
+            this->transition_to_submenu(4);
+            return;
+ 
+        case 4:  // SAVE GAME
+            this->transition_to_submenu(5);
+            return;
+ 
+        case 5:  // LOAD GAME
+            this->transition_to_submenu(6);
+            return;
+ 
+        case 6:  // OPTIONS
+            this->transition_to_submenu(7);
+            return;
+ 
+        case 7:  // MESSAGE LOG  -- engine fallback
 
+            THISCALL(0x00630460, this, a2);
+            return;
+ 
+        case 8:  // UNLOCKABLES
+            this->field_AC->MakeDeactive(5);
+            {
+                static string_hash sfx_id_hash{"FE_PS_ACCEPT"};
+                [[maybe_unused]] sound_instance_id id =
+                    sub_60B960(sfx_id_hash, 1.0f, 1.0f);
+            }
+            return;
+ 
+        case 9:  // debug-menu entry
+            run_script("start_to_level_s01(debug_menu_entry)");
+            return;
+ 
+        default:
+            return;
+    }
 }
+
+
 
 void pause_menu_root::handle_restart_mission(Float a2) {
     if (!mission_manager::s_inst->is_mission_active()) {
-        // No active mission - just close menu
+		
         this->field_AC->MakeActive(8);
         comic_panels::game_play_panel()->field_67 = 1;
         
@@ -856,7 +773,6 @@ void pause_menu_root::handle_restart_mission(Float a2) {
         sub_61C610();
         this->field_F9 = 0;
         
-        // Set up text elements for confirmation
         this->field_A8->SetNoFlash(color32 {0xFFC87238});
         this->field_A8->SetScale(1.0f, 1.0f);
         
@@ -1017,7 +933,6 @@ void pause_menu_root::finalize_confirmation() {
 
     auto *widget = get_current_widget();
     reset_widget_state(0);
-    //widget->field_36 = 1;
     
     this->field_F8 = 0;
     sub_62A840();
@@ -1043,15 +958,13 @@ int *pause_menu_root::get_current_widget() {
 
 
 void pause_menu_root::handle_objectives(float* a2) {
-    // Check if a mission is active and cannot be paused
+
     if (mission_manager::s_inst->is_story_active() && !mission_manager::s_inst->is_story_mission_active()) {
-        return; // Do nothing if mission cannot be paused
+        return; 
     }
 
-    // Set the pause menu state to options
     this->field_AC->MakeActive(1);
 
-    // Hide the game play panel if necessary
     if (!this->field_AC->m_count) {
         comic_panels::game_play_panel()->field_67 = 0;
     }
@@ -1065,9 +978,6 @@ void pause_menu_root::handle_objectives(float* a2) {
 
 void pause_menu_root::sub_61C520()
 {
-
-	
-	
 	 THISCALL(0x0061C520,this);
 }
 
@@ -1080,26 +990,35 @@ void pause_menu_root_patch() {
         FUNC_ADDRESS(address, &pause_menu_root::_Load);
         set_vfunc(0x00893F48, address);
     }
-	    {
-        FUNC_ADDRESS(address, &pause_menu_root2::Draw);
-        set_vfunc(0x00893F50, address);
-    }
+
     {
         FUNC_ADDRESS(address, &pause_menu_root::OnCross);
         set_vfunc(0x00893F84, address);
     }
-    {
+
+
+    return;
+
+	    {
+        FUNC_ADDRESS(address, &pause_menu_root2::Draw);
+        set_vfunc(0x00893F50, address);
+    }
+	    {
         FUNC_ADDRESS(address, &pause_menu_root::Update);
         set_vfunc(0x00893F58, address);
     }
 	{
-   //     FUNC_ADDRESS(address, &pause_menu_root2::OnUp);
-   //     set_vfunc(0x00893F74, address);
+        FUNC_ADDRESS(address, &pause_menu_root2::OnUp);
+        set_vfunc(0x00893F74, address);
     }
 
     {
-   //     FUNC_ADDRESS(address, &pause_menu_root2::OnDown);
-   //     set_vfunc(0x00893F78, address);
+        FUNC_ADDRESS(address, &pause_menu_root2::OnDown);
+       set_vfunc(0x00893F78, address);
+    }
+	    {
+        FUNC_ADDRESS(address, &pause_menu_root2::update_selected);
+        REDIRECT(0x0060E894, address);
     }
 	{
         FUNC_ADDRESS(address, &pause_menu_root2::OnActivate);
@@ -1113,11 +1032,6 @@ void pause_menu_root_patch() {
 	    FUNC_ADDRESS(address, &pause_menu_root::update_switching_heroes);
 	    REDIRECT(0x006490C4, address);
     }
-
-    return;
-
-
-	
 	
 
 }

@@ -32,6 +32,9 @@ struct FEMenuSystem {
     //0x0060B610
     //virtual
     void MakeActive(int idx);
+	
+	
+	void MakeDeactive(int idx);
 
     //virtual
     char GetDefaultColorScheme();

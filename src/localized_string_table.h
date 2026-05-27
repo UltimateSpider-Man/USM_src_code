@@ -2,6 +2,8 @@
 
 #include "global_text_enum.h"
 
+#include "variable.h"
+
 struct localized_string_table {
     struct internal {
         const char *field_0[479];
@@ -23,6 +25,20 @@ struct localized_string_table {
 
     //0x0062EF10
     static void load_localizer();
+	
+	const char *find(const char *key);
+
+
+const char *lookup(localized_string_table *inst, const char *key);
+
+    static inline localized_string_table *&instance =
+        var<localized_string_table *>(0x0096190C);
+
 };
 
 extern void localized_string_table_patch();
+
+
+    
+	
+

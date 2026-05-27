@@ -528,18 +528,7 @@ struct debug_menu {
 
     static void init();
 	
-    void render_build_info_panel();
-	
-	void msm2_debug_menu();
-	
-	void render_instruction_bar();
-	
-	void init_sm2_style();
-	
-	
-	void set_instruction_text(const char* text);
 
-    void set_context_instruction();
 
     static inline int menu_height = 0;
 

@@ -29,6 +29,8 @@
 #include "trace.h"
 #include "unlockables_menu.h"
 #include "utility.h"
+#include "debug_menu.h"
+#include "os_developer_options.h"
 
 #include "memoryunitmanager.h"
 
@@ -120,8 +122,6 @@ void PauseMenuSystem::LoadAll() {
     }
 }
 
-
-
 void PauseMenuSystem::Draw() {
     THISCALL(0x0060BF10, this);
 }
@@ -137,12 +137,18 @@ void PauseMenuSystem::Activate(int a2, bool a3)
         this->MakeActive(a2);
         
         if (a3)
-        g_game_ptr->pause();
+            g_game_ptr->pause();
         pause_menu_save_load_display* v4 = this->field_34;
         this->field_38 = static_cast<uint8_t>(comic_panels::game_play_panel()->field_67);
     
     MemoryUnitManager::RegisterInsertRemoveObserver(
       reinterpret_cast<MemoryUnitManager::InsertRemoveObserver*>(v4->field_2C));
+	  
+	  				    Cursor *cur = g_cursor();
+    if (cur != nullptr) {
+        cur->field_120 = 0;
+		        cur->field_114 = 0;     
+    }
 
 		THISCALL(0x0060BE90, this, a2 ,a3);
     }
@@ -155,6 +161,9 @@ void PauseMenuSystem::Deactivate()
         this->MakeActive(0);
         g_game_ptr->unpause();
         comic_panels::game_play_panel()->field_67 = this->field_38;
+							static string_hash sfx_id_hash{"fe_ps_udscroll"};
+
+        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
     }
 	THISCALL(0x0060BEE0, this);
 }
@@ -235,17 +244,20 @@ void PauseMenuSystem::UpdateButtonPresses() {
     FEMenuSystem::UpdateButtonPresses();
 }
 
-void PauseMenuSystem::OnButtonPress(int a2, int a3) {
-    sp_log("PauseMenuSystem::OnButtonPress(): %d %d", a2, a3);
-
-    if constexpr (1) {
-        if (this->m_index >= 0) {
-            FEMenuSystem::OnButtonPress(a2, a3);
-        }
-    } else {
-        THISCALL(0x00618FC0, this, a2, a3);
-    }
-}
+   void PauseMenuSystem::OnButtonPress(int a2, int a3) {
+       if (this->m_index < 0) return;
+       const int back_btn = 13;
+       if (a2 == 1
+           && (this->m_index == 1 || this->m_index == 2)
+           && a3 == back_btn
+           && os_developer_options::instance->get_flag("ENABLE_ZOOM_MAP"))
+       {
+           this->Deactivate();
+           debug_menu::show();
+           return;
+       }
+       FEMenuSystem::OnButtonPress(a2, a3);
+   }
 
 
 
@@ -264,11 +276,15 @@ void PauseMenuSystem_patch() {
         set_vfunc(0x00893E38, address);
 	
     }
-		{
-        FUNC_ADDRESS(address, &PauseMenuSystem::Draw);
-        set_vfunc(0x00893E20, address);
+
+	{
+	FUNC_ADDRESS(address, &PauseMenuSystem::Activate);
+	REDIRECT(0x00673136, address);
+		REDIRECT(0x00673338, address);
+			REDIRECT(0x006734D5, address);
+				REDIRECT(0x006737D5, address);
 	
-    }
+    }	
     return;
 
 

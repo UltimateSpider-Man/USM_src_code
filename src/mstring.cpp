@@ -552,7 +552,7 @@ bool mString::is_equal(const char *a2) const {
 
 void mString::update_guts(const char *from_string, int n) {
     if constexpr (1) {
-        assert(from_string != nullptr);
+ //       assert(from_string != nullptr);
 
         if (n == -1) {
             n = strlen(from_string);

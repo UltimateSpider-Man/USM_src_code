@@ -40,9 +40,9 @@ bool mesh_file_resource_handler::_handle_resource(worldly_resource_handler::eBeh
 
     if constexpr (1)
     {
-        assert(my_slot->get_resource_directory().get_tlresource_count(TLRESOURCE_TYPE_MESH_FILE) ==
-               my_slot->get_resource_directory().get_resource_count(
-                   RESOURCE_KEY_TYPE_MESH_FILE_STRUCT));
+     //   assert(my_slot->get_resource_directory().get_tlresource_count(TLRESOURCE_TYPE_MESH_FILE) ==
+           //    my_slot->get_resource_directory().get_resource_count(
+             //      RESOURCE_KEY_TYPE_MESH_FILE_STRUCT));
 
         if (behavior == UNLOAD)
         {

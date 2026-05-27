@@ -353,7 +353,7 @@ void FEMenu_patch() {
         SET_JUMP(0x00629850, address);
     }
 
-    if constexpr (0) {
+    if constexpr (1) {
         {
             FUNC_ADDRESS(address, &FEMenu::Update);
             SET_JUMP(0x0060B180, address);

@@ -7,6 +7,12 @@
 #define MOD_MESH_SUPPORT            1
 #define MOD_MESH_DBG_REPLACE_ALL    0
 
+// 60 FPS patch master switch.
+// Set to 0 to compile the patch out entirely (binary identical to stock).
+// Set to 1 to compile it in; runtime behaviour is then gated by
+// g_config.EnableHighFPS so it can still be toggled without a rebuild.
+#define FPS_UNLOCK_60       1
+
 #include "color32.h"
 #include "float.hpp"
 #include "game_button.h"
@@ -187,22 +193,22 @@ struct game {
     }
 
     game_settings *get_game_settings();
-	
 
-	
-	
+
+
+
     void go_next_state();
 
     game_state get_cur_state() const;
-	
+
 	    void handle_frame_locking(float *a1);
 
     float handle_frame_locking2(float time_inc);
-	
+
 	float handle_frame_locking_advanced(float time_inc);
-	
+
 	float handle_frame_locking_simple(float time_inc);
-	
+
 
     //0x00548C10
     void begin_hires_screenshot(int a2, int a3);
@@ -323,7 +329,7 @@ public:
     void push_lores();
 
     void push_process(game_process &process);
-	
+
 	void render_bar_of_shame();
 
     //0x00557B80
@@ -352,6 +358,11 @@ public:
     mString get_analyzer_info() const;
 
     void show_debug_info() const;
+
+    // Renders each loaded region's district name as a 3D billboard
+    // at its OBB centre. Active when SHOW_DISTRICTS is set via the
+    // "Show Districts" entry in the Game flags menu.
+    void render_district_labels();
 
     //0x00514D00
     void show_max_velocity();
@@ -392,6 +403,3 @@ extern void system_idle();
 extern void game_packs_modified_callback(_std::vector<resource_key> &a1);
 
 extern void game_patch();
-
-
-

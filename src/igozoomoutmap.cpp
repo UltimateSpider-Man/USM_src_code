@@ -10,6 +10,17 @@
 #include "wds.h"
 #include "vector3d.h"
 
+#include "debug_menu.h"
+#include "os_developer_options.h"
+
+#include "cut_scene_player.h"
+
+#include "pausemenusystem.h"
+
+#include "terrain.h"
+
+#include "region.h"
+
 #include <utility.h>
 
 VALIDATE_SIZE(IGOZoomOutMap, 0x82Cu);
@@ -83,20 +94,22 @@ void IGOZoomOutMap::SetZoomLevel(int a2) {
 
 void IGOZoomPOI::UpdateInScene()
 {
+	debug_menu::hide();
+	
     THISCALL(0x0062A160, this);
 }
 
 
 char zoom_map_ui::Draw()
 {
-
+   debug_menu::hide();
 	
     THISCALL(0x00632360, this);
 }
 
 void zoom_map_ui::Update(Float a2)
 {
-
+    debug_menu::hide();
 	
     THISCALL(0x00632020, this);
 }
@@ -104,21 +117,21 @@ void zoom_map_ui::Update(Float a2)
 
 PanelFile zoom_map_ui::Init()
 {
-
+    debug_menu::hide();
 	
     THISCALL(0x00644330, this);
 }
 
 void zoom_map_ui::OnSquare()
 {
-
+    debug_menu::hide();
 	
     THISCALL(0x00621DA0, this);
 }
 
 int zoom_map_ui::OnX()
 {
-
+    debug_menu::hide();
 	
     THISCALL(0x006125E0, this);
 }
@@ -140,9 +153,59 @@ int zoom_map_ui::sub_6222A0()
 }
 
 
+// ---------------------------------------------------------------------------
+// Port of Xbox IGOZoomOutMap::OnSelectPress (0x00CF1F70).
+//
+// The first thing the Xbox routine does is consult the ENABLE_ZOOM_MAP flag —
+// that is the gate the project asked about. The rest is what runs once the
+// gate is open: it walks the same "is anything blocking the toggle?" checks
+// the Xbox build does, then either kicks off a zoom-out (StartZoomingOut +
+// SetZoomLevel(0) on Xbox) or schedules a zoom-back (sets field_5C3 / field_5C7
+// so Update() lands on DoneZoomingBack the next time the camera arrives).
+//
+// A few of the Xbox-side defensive checks rely on helpers without recovered
+// PC addresses (sub_6850AD / sub_6707D9 / sub_683C03 / sub_6A822E / sub_6650CD)
+// and are intentionally omitted here — the pause-menu and cutscene-playing
+// gates below cover the bulk of those cases. Restore them later if needed
+// once the PC equivalents are mapped.
+//
+// On Xbox, OnSelectPress is reached from UpdateSelectButton (rising edge of
+// input id 115) and from UpdateOtherButtons (id 99 while already zoomed).
+// PC keeps its own UpdateSelectButton / UpdateOtherButtons; redirect them
+// at this entry point in IGOZoomOutMap_patch() once the PC address of
+// OnSelectPress is recovered in IDA.
+// ---------------------------------------------------------------------------
+void IGOZoomOutMap::OnSelectPress() {
+    // === ENABLE_ZOOM_MAP gate. ===
+    if (!os_developer_options::instance->get_flag("ENABLE_ZOOM_MAP")) {
+		
+        return;
+		    } else {
+
+		THISCALL(0x00638570, this);
+    }
+
+	debug_menu::hide();
+	
+}
+
+
 void IGOZoomOutMap_patch() {
     {
         FUNC_ADDRESS(address, &IGOZoomOutMap::SetZoomLevel);
         SET_JUMP(0x00619550, address);
     }
+	
+	{
+        FUNC_ADDRESS(address, &IGOZoomOutMap::OnSelectPress);
+       REDIRECT(0x00638714, address);
+		REDIRECT(0x00638A29, address);
+		REDIRECT(0x00638B39, address);
+    }
+    {
+        FUNC_ADDRESS(address, &zoom_map_ui::Init);
+       // REDIRECT(0x00648A81, address);
+    }
+	
+	
 }

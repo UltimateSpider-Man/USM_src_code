@@ -188,3 +188,6 @@ struct PCUV_ShaderMaterial;
 extern PCUV_ShaderMaterial *debug_material;
 
 extern Var<int[34]> debug_render_items;
+
+extern void debug_render_patch();
+

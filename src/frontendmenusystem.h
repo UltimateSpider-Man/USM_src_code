@@ -1,7 +1,6 @@
 #pragma once
 
 #include "femenusystem.h"
-
 #include "limited_timer.h"
 #include "mAvlTree.h"
 #include "mstring.h"
@@ -9,6 +8,7 @@
 #include "variable.h"
 
 struct PanelFile;
+struct fe_state;
 struct string_hash_entry;
 
 struct FrontEndMenuSystem : FEMenuSystem {
@@ -29,11 +29,14 @@ struct FrontEndMenuSystem : FEMenuSystem {
     int field_58;
     mAvlTree<string_hash_entry> field_5C;
     mAvlTree<string_hash_entry> field_6C;
-
     PanelFile *field_7C;
 
     //0x00648580
     FrontEndMenuSystem();
+
+
+
+
 
     bool sub_60C230();
 
@@ -41,6 +44,10 @@ struct FrontEndMenuSystem : FEMenuSystem {
 
     //0x00619210
     bool WaitForMemCheck();
+	
+	void Update(float a2);
+
+	void sub_612F40(float a2);
 
     //0x00619230
     void RenderLoadMeter(bool a1);
@@ -59,5 +66,9 @@ struct FrontEndMenuSystem : FEMenuSystem {
 
     void sub_619030(bool a2);
 };
+
+
+extern bool & already_drew_this_frame;
+
 
 extern void FrontEndMenuSystem_patch();

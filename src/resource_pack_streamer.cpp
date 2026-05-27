@@ -71,6 +71,8 @@ resource_pack_streamer::resource_pack_streamer()
 
 }
 
+
+
 resource_pack_streamer::~resource_pack_streamer()
 {
     if constexpr (0)
@@ -357,6 +359,7 @@ bool resource_pack_streamer::is_disk_idle() const
 void resource_pack_streamer::flush(void (*a2)(void)) {
     this->flush(a2, Float{0.02f});
 }
+
 
 void resource_pack_streamer::flush(void (*a2)(void), Float a3) {
     TRACE("resource_pack_streamer::flush");

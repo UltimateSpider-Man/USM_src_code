@@ -215,19 +215,19 @@ game::game()
             static Var<char *[2]> smoke_test_levels { 0x00921DB0 };
 
             if (os_developer_options::instance->get_flag(mString{"SMOKE_TEST_LEVEL"})) {
-                g_smoke_test() = new smoke_test(bit_cast<const char **>(&g_scene_name()), a3);
+                g_smoke_test() = new smoke_test(bit_cast<const char **>(&g_scene_name), a3);
             } else {
                 g_smoke_test() = new smoke_test(bit_cast<const char **>(&smoke_test_levels()[0]),
                                                 a3);
 
-                strcpy(g_scene_name(), smoke_test_levels()[0]);
+                strcpy(g_scene_name, smoke_test_levels()[0]);
             }
         } else if (!os_developer_options::instance->get_flag(mString{"SMOKE_TEST_LEVEL"})) {
             auto v23 = os_developer_options::instance->get_string(os_developer_options::strings_t::SCENE_NAME);
 
             if (v23)
             {
-                strcpy(g_scene_name(), v23->c_str());
+                strcpy(g_scene_name, v23->c_str());
             }
         }
 
@@ -573,6 +573,7 @@ void game::render_world()
                     fpf = std::tan(fov * 0.5f) / std::tan(fpf * 0.5f);
                     g_tan_half_fov_ratio() = fpf;
                 }
+				
 
                 g_indoors() = v3->is_indoors();
                 nglSetClearFlags(0);
@@ -916,7 +917,7 @@ bool game::is_marky_cam_enabled() const
 {
     return this->the_world->field_28.is_marky_cam_enabled();
 }
-
+#include "cursor.h"
 static Var<bool> sounds_paused{0x00960044};
 
 void game::pause() {
@@ -938,6 +939,7 @@ void game::pause() {
                         sound_manager::fade_sounds_by_type(15u, 0.5, 0.5, 0);
                     }
                 }
+
 
                 sounds_paused() = false;
             } else {
@@ -1819,35 +1821,9 @@ void glow_init() {
 
 void game::freeze_hero(bool a2)
 {
-    if constexpr (0)
-    {
-        if ( this->the_world != nullptr )
-        {
-            for ( int v3 = 0; v3 < g_world_ptr->num_players; ++v3 )
-            {
-                auto *v5 = g_world_ptr->get_hero_ptr(v3);
-                if ( v5 != nullptr )
-                {
-                    v5->set_ext_flag_recursive(static_cast<entity_ext_flag_t>(0x4000u), a2);
 
-                    if ( v5->get_ai_core() != nullptr )
-                    {
-                        if ( a2 ) {
-                            v5->suspend(true);
-                        } else {
-                            v5->unsuspend(true);
-                        }
-                    }
-                }
-            }
-        }
-
-        this->field_160 = a2;
-    }
-    else
-    {
         THISCALL(0x00514F00, this, a2);
-    }
+
 }
 
 
@@ -2367,7 +2343,7 @@ camera *game::get_current_view_camera(int a2)
 void game::_load_new_level(const mString &a2)
 {
     if (!a2.empty()) {
-        strcpy(g_scene_name(), a2.c_str());
+        strcpy(g_scene_name, a2.c_str());
     }
 
     this->field_15D = true;
@@ -2410,7 +2386,7 @@ void game::advance_state_load_level(Float a2)
     {
         static bool & loading_a_level = var<bool>(0x00960CB5);
 
-        this->level.name_mission_table = g_scene_name();
+        this->level.name_mission_table = g_scene_name;
         input_mgr::instance->field_26 = false;
         if (!loading_a_level)
         {
@@ -2512,12 +2488,18 @@ void game::render_interface()
         if (this->flag.level_is_loaded)
         {
             sub_5BC870();
+
             spider_monkey::render();
             this->mb->render();
 
             if (os_developer_options::instance->get_flag(mString{"SHOW_DEBUG_INFO"}))
             {
                 this->show_debug_info();
+            }
+
+            if (os_developer_options::instance->get_flag(mString{"SHOW_DISTRICTS"}))
+            {
+                this->render_district_labels();
             }
 
             if (os_developer_options::instance->get_flag(mString{"SHOW_WATERMARK_VELOCITY"}))
@@ -2621,15 +2603,83 @@ void game::show_debug_info() const {
     }
 }
 
+// Replacement for the original game's sub_66C242 (the "Show Districts"
+// renderer). Draws the Xbox debug-build HUD overlay: a white
+// "DISTRICTS" header with the hero's current district id rendered in
+// green directly underneath, anchored near the bottom-centre of the
+// screen. The flag is toggled by the "Show Districts" entry in the
+// Game flags menu.
+//
+// Reference: bandicam_2026-04-29_23-12-55-697.mp4 frames at t=5s,
+// t=60s, t=80s, t=100s show the layout — header line on top, single
+// id glyph (e.g. "0") in green just below, fixed screen-space and
+// independent of camera/hero motion. The Xbox shows "DISTRICT"; the
+// user's spec ("DISTRICTS 0") asks for the plural form, so that's
+// what we render here.
+void game::render_district_labels() {
+    TRACE("game::render_district_labels");
+
+    if ( g_world_ptr == nullptr ) {
+        return;
+    }
+
+    // render_text gates on SHOW_DEBUG_TEXT internally, so make sure
+    // the flag is on whenever we get this far. The Show Districts
+    // toggle in debug_menu_extra also forces it on, but flags can
+    // drift across saved-game loads.
+    auto *opts = os_developer_options::instance;
+    if ( opts != nullptr && !opts->get_flag(mString{"SHOW_DEBUG_TEXT"}) ) {
+        opts->set_flag(mString{"SHOW_DEBUG_TEXT"}, true);
+    }
+
+    // Resolve the hero's current district id. If we can't find it for
+    // any reason (hero not spawned yet, hero outside of any region)
+    // fall back to 0 so the user still sees the HUD and knows the
+    // toggle is taking effect.
+    int district_id = 0;
+    if ( auto *hero = g_world_ptr->get_hero_ptr(0) )
+    {
+        if ( auto *reg = hero->get_primary_region() )
+        {
+            district_id = reg->get_district_id();
+        }
+        else if ( auto *terrain = g_world_ptr->get_the_terrain() )
+        {
+            // Hero's primary region cache can be stale just after
+            // a warp; do a fresh point query as a backstop.
+            if ( auto *reg2 = terrain->find_region(
+                     hero->get_abs_position(), nullptr) )
+            {
+                district_id = reg2->get_district_id();
+            }
+        }
+    }
+
+    // Anchor at ~42% width / ~77% height — this matches the Xbox
+    // build's placement (verified visually against the reference
+    // video). Works for any backbuffer resolution because we scale
+    // off nglGetScreenWidth/Height.
+    const int sw = nglGetScreenWidth();
+    const int sh = nglGetScreenHeight();
+    const int header_x = static_cast<int>(sw * 0.42f);
+    const int header_y = static_cast<int>(sh * 0.77f);
+    const int id_x     = static_cast<int>(sw * 0.37f);
+    const int id_y     = header_y + 24;  // one line below the header
+
+    const color32 white {255, 255, 255, 255};
+    const color32 green { 32, 224,  64, 255};
+
+    mString header {"DISTRICTS"};
+    mString id_text {0, "%d", district_id};
+
+    render_text(header,  vector2di{header_x, header_y}, white, 0.0f, 1.0f);
+    render_text(id_text, vector2di{id_x,     id_y    }, green, 0.0f, 1.0f);
+}
+
 
 void game::show_max_velocity()
 {
-    if constexpr (0)
-    {}
-    else
-    {
-        THISCALL(0x00514D00, this);
-    }
+
 }
 
 float game::get_script_game_clock_timer() const
@@ -3002,16 +3052,41 @@ void game::render_empty_list()
 void game::frame_advance(Float a2)
 {
     TRACE("game::frame_advance");
-
+ 
     sp_log("%f", float(a2));
-
+ 
+#if FPS_UNLOCK_60
+    // ---------------------------------------------------------------
+    // Sim-speed compensation for the 60 FPS patch.
+    //
+    // When the engine is ticking at TargetFPS (e.g. 60) instead of the
+    // stock 30, frame-counter-based logic (animation frame counts,
+    // "field_140 = 3.0" style cooldowns, hard-coded ticks like
+    // frame_advance(0.06666667)) would otherwise advance at TargetFPS/30
+    // times its intended wall-clock speed. Scaling time_inc by 30/Target
+    // counter-acts that so those systems keep their original feel.
+    //
+    // dt-based subsystems (physics, audio fades, game_clock) will then
+    // run at (30/Target) wall-clock speed when this is enabled. Set
+    // g_config.CompensateSimDt = false to leave dt untouched if you'd
+    // rather have those at full speed and live with frame-counter logic
+    // running fast.
+    // ---------------------------------------------------------------
+    if (g_config.EnableHighFPS &&
+        g_config.CompensateSimDt &&
+        g_config.TargetFPS > 30)
+    {
+        const float scale = 30.0f / static_cast<float>(g_config.TargetFPS);
+        a2 = Float(float(a2) * scale);
+    }
+#endif
+ 
     if constexpr (0)
     {}
     else
     {
-
-										       void (__fastcall *func)(void *, void *, Float ) = bit_cast<decltype(func)>(0x0055D780);
-
+        void (__fastcall *func)(void *, void *, Float ) = bit_cast<decltype(func)>(0x0055D780);
+ 
          func(this, nullptr, a2);
     }
 }
@@ -3689,5 +3764,19 @@ void game_patch()
 		        FUNC_ADDRESS(address, &game::message_board_init);
         REDIRECT(0x00552E7C, address);
     }
+	        {
+			FUNC_ADDRESS(address, &game::game::pause);
+	        REDIRECT(0x0060BEB4, address);
+			REDIRECT(0x0061940A, address);
+			REDIRECT(0x00622867, address);
+			REDIRECT(0x00622AD5, address);
+	        REDIRECT(0x0062A0B1, address);
+			REDIRECT(0x00662F0D, address);
+			REDIRECT(0x006737C6, address);
+    }
     }
 }
+
+
+
+

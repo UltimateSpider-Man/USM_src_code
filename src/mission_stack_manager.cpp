@@ -1,5 +1,7 @@
 #include "mission_stack_manager.h"
 
+#include "game.h"
+#include "resource_pack_streamer.h"
 #include "func_wrapper.h"
 #include "game.h"
 #include "osassert.h"
@@ -32,6 +34,20 @@ resource_pack_group *mission_stack_manager::get_pack_group_for_pack(const mStrin
     TRACE("mission_stack_manager::get_pack_group_for_pack");
 
     return (resource_pack_group *) THISCALL(0x005D2250, this, &a1);
+}
+
+
+void mission_stack_manager::sub_5D8430(const mString &a1, const mString &a2)
+{
+	TRACE("mission_stack_manager::sub_5D8430");
+	
+    this->push_mission_pack(a1, a2, -1, false);
+
+    auto *v3 = resource_manager::get_partition_pointer(RESOURCE_PARTITION_MISSION);
+    auto *streamer = bit_cast<resource_pack_streamer *>(v3 + 24);
+    streamer->flush(game::render_empty_list);
+	
+	THISCALL(0x005D8430, this, &a1, &a2);
 }
 
 resource_pack_group *mission_stack_manager::get_pack_group(const mString &a1)

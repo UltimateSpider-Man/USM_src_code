@@ -41,7 +41,8 @@ struct pause_menu_root : FEMenu {
     PanelQuad *field_6C;
     PanelQuad *field_70;
     PanelQuad *field_74;
-    FEText *field_78[10];
+    FEText *field_78[9];
+	FEText *field_9C;
     FEText *field_A0;
     FEText *field_A4;
     FEText *field_A8;
@@ -57,6 +58,9 @@ struct pause_menu_root : FEMenu {
 
     //0x0060E590
     pause_menu_root(FEMenuSystem *a2, int a3, int a4);
+	
+
+
 
     //0x0063B2E0
     //virtual
@@ -82,69 +86,45 @@ struct pause_menu_root : FEMenu {
 	
 	void handle_objectives(float* a1);
 
-// Static string hashes for sounds (lazy initialized)
-static inline string_hash s_fe_ps_accept_0;  // 0x20 flag
-static inline string_hash s_fe_ps_accept_1;  // 0x40 flag
-static inline string_hash s_fe_ps_accept_2;  // 0x80 flag
-static inline string_hash s_fe_ps_accept_3;  // 0x100 flag
-static inline string_hash s_fe_ps_accept_4;  // 0x200 flag
-static inline string_hash s_fe_ps_accept_5;  // 0x400 flag
-static inline string_hash s_fe_ps_accept_6;  // 0x800 flag
-static inline string_hash s_fe_ps_accept_7;  // 0x1000 flag
-static inline string_hash s_fe_ps_accept_8;  // 0x2000 flag
-static inline string_hash s_fe_ps_accept_9;  // 0x10 flag
-static inline string_hash s_fe_ps_accept_10; // 0x8 flag
-static inline string_hash s_fe_wb_accept;    // 0x4 flag
-static inline string_hash s_toggle_hero;     // 0x2 flag
-static inline string_hash s_progression_mis; // 0x1 flag
+    static string_hash get_sound_hash(int flag, string_hash &hash, const char *name);
 
-static inline int s_initialized_flags = 0;
+    void set_menu_state(int state);
 
-// Helper to initialize sound hash if needed
-static string_hash get_sound_hash(int flag, string_hash &hash, const char *name) {
-    if ((s_initialized_flags & flag) == 0) {
-        s_initialized_flags |= flag;
-        hash = string_hash{name};
-    }
-    return hash;
-}
-
-// Helper to set menu state
-void set_menu_state(int state);
-
-// Helper to activate menu and update comic panel
-void activate_menu(int mode);
-
-void sub_61C610();
-
-// Helper to play accept sound
-void play_accept_sound(int flag, string_hash &hash); 
-
-// Helper to reset menu widget state
-void reset_widget_state(int widget_ptr); 
-
-
-void handle_restart_mission(Float a2); 
-
-void handle_skip_cutscene(Float a2); 
-
-void handle_switch_hero(Float a2); 
-
-void handle_confirmation_state(Float a2, int a3); 
-
-void handle_skip_confirmation();
-
-void handle_hero_toggle(); 
-
-void finalize_confirmation(); 
-
-void setup_confirmation_dialog(); 
-
-int *get_current_widget(); 
-
+    void transition_to_submenu(int target_state);
 	
+    void custom_pause_awards_menu(int a2);
+	
+    void activate_menu(int mode);
+	
+    void sub_61C610();
+	
+	void play_accept_sound(int flag, string_hash &hash); 
+	
+	void reset_widget_state(int widget_ptr); 
+	
+	void handle_restart_mission(Float a2); 
+	
+	void handle_skip_cutscene(Float a2); 
+
+    void handle_switch_hero(Float a2); 
+
+    void handle_confirmation_state(Float a2, int a3); 
+
+    void handle_skip_confirmation();
+
+    void handle_hero_toggle(); 
+
+    void finalize_confirmation(); 
+
+    void setup_confirmation_dialog(); 
+
+    int *get_current_widget(); 
 
 };
+
+extern void pause_menu_root_patch();
+
+extern pause_menu_root *& pause_menu_root_ptr;
 
 struct pause_menu_root2 : FEMenu {
     bool field_2C;
@@ -174,40 +154,23 @@ struct pause_menu_root2 : FEMenu {
 	int field_F9;
     int field_FC;
 
-	
-	    //0x0061BD00
-    //virtual
     void OnUp(int a2);
 	
-	    void _Load();
+	void _Load();
 
-
-    //0x0061BE10
-    //virtual
     void OnDown(int a2);
 	
 	void update_selected();
-	
-	
-		void OnActivate();
-		
-		
-		void sub_62A840();
-		
-		void OnDeactivate(FEMenu *a2);
-		
-		void Draw();
 
+    void OnActivate();
 	
-	};
+	void sub_62A840();
 	
+	void OnDeactivate(FEMenu *a2);
 	
-
-extern void pause_menu_root_patch();
-
-extern pause_menu_root *& pause_menu_root_ptr;
-
-
+	void Draw();
+	
+};
 
 
 extern pause_menu_root2 *& pause_menu_root2_ptr;

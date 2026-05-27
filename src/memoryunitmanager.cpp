@@ -3,7 +3,7 @@
 #include "common.h"
 #include "func_wrapper.h"
 #include "log.h"
-
+#include "variables.h"
 #include <direct.h>
 #include <string.h>
 
@@ -98,6 +98,11 @@ bool StartOperation()
 eStatus GetLastError()
 {
     return mLastError();
+}
+
+void SetCurrentUnit(int unit)
+{
+    dword_151691C() = unit;
 }
 
 eStatus LoadGame(const Container &a1)

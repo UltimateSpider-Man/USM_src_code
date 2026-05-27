@@ -90,6 +90,8 @@ struct IGOZoomOutMap {
 
     //0x006489A0
     IGOZoomOutMap();
+	
+	void OnSelectPress();
 
     void UpdateInScene();
 

@@ -14,6 +14,43 @@
 
 #include <cassert>
 
+
+
+const char *localized_string_table::find(const char *key)
+{
+    auto len = strlen(key);
+
+    auto *search = static_cast<char *>(malloc(len + 2));
+    strcpy(search, key);
+    search[len] = '=';
+    search[len + 1] = '\0';
+
+    if (this->field_0 && this->field_4 && this->field_8 > 0 && this->scripttext_number > 0)
+    {
+        for (int i = 0; i < this->scripttext_number; ++i)
+        {
+            auto *entry = this->field_0->field_0[i];
+            if (strncmp(entry, search, len + 1) == 0)
+            {
+                free(search);
+                return entry + len + 1;
+            }
+        }
+    }
+
+    free(search);
+    return nullptr;
+}
+
+const char *localized_string_table::lookup(localized_string_table *inst, const char *key)
+{
+    if (inst != nullptr) {
+        return inst->find(key);
+    }
+
+    return nullptr;
+}
+
 void localized_string_table::load_localizer()
 {
     TRACE("localized_string_table::load_localizer");

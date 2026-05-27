@@ -46,6 +46,9 @@ extern eStatus LoadGame(const Container &a1);
 
 extern int LoadGameSync(const Container &a1);
 
+extern void SetCurrentUnit(int unit);
+
+
 //0x007B1720
 extern unsigned int GetGameSaveSize(unsigned int a1);
 

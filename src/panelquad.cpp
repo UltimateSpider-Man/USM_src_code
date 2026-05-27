@@ -11,6 +11,8 @@
 #include "trace.h"
 #include "vtbl.h"
 
+
+
 VALIDATE_SIZE(PanelQuad, 0x4C);
 
 PanelQuad::PanelQuad() {
@@ -19,6 +21,11 @@ PanelQuad::PanelQuad() {
 
 PanelQuad::PanelQuad(from_mash_in_place_constructor *a2) {
     THISCALL(0x00637F00, this, a2);
+}
+
+void PanelQuad::SetPos(float a2, float a3)
+{
+  THISCALL(0x00608F70, this, a2, a3);
 }
 
 PanelQuad * __fastcall PanelQuad_constructor(PanelQuad *self, int, from_mash_in_place_constructor *a2)
@@ -164,6 +171,8 @@ float PanelQuad::GetCenterX()
     auto result = this->field_14[0];
     sp_log("%f", result);
     return result;
+	
+	THISCALL(0x0043F770,this);
 }
 
 float PanelQuad::GetCenterY()

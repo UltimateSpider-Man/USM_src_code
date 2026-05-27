@@ -17,6 +17,58 @@
 
 #include "variables.h"
 
+#include "debug_menu.h"
+#include "mstring.h"
+
+ 
+#include "actor.h"
+#include "color32.h"
+#include "entity.h"
+#include "game.h"
+#include "mstring.h"
+#include "ngl.h"
+#include "os_developer_options.h"
+#include "physical_interface.h"
+#include "region.h"
+#include "render_text.h"
+#include "string_hash.h"
+#include "terrain.h"
+#include "trace.h"
+#include "vector2di.h"
+#include "vector3d.h"
+#include "wds.h"
+#include "debug_render.h" 
+#include "subdivision_node_obb_base.h"
+#include "terrain.h"
+#include "geometry_manager.h"   // get_xform, XFORM_WORLD_TO_SCREEN
+#include "matrix4x4.h"          // sub_501B20
+#include "subdivision_node_obb_base.h"   // get_vertices
+#include "terrain.h"            // already pulled in by voice_box
+#include "region.h" 
+#include "ai_pedestrian.h"
+#include "base_ai_core.h"
+#include "event_manager.h"
+#include "event.h"
+
+
+
+#include <ngl_mesh.h>
+
+#include <array>
+#include <cassert>
+#include <cmath>
+ 
+#include <cstdio>
+#include <cstdint>
+ 
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <psapi.h>
+#endif
+
 
 
 
@@ -1246,8 +1298,758 @@ float spider_monkey::delta_callback(int a1) {
     }
 	
 
+	        inline void frame_lock_speed(debug_menu_entry* a2)
+    {
+            os_developer_options::instance->set_int(mString { "MINI_MAP_ZOOM" }, a2->get_ival());
+			g_timer()->normal_motion();
+
+    }
+ 
+static bool   s_master_clock_was_on = false;
+static double s_master_clock_start  = 0.0;
+ 
+static double get_real_seconds()
+{
+#ifdef _WIN32
+    static LARGE_INTEGER s_freq {};
+    if ( s_freq.QuadPart == 0 ) {
+        QueryPerformanceFrequency(&s_freq);
+    }
+    LARGE_INTEGER now {};
+    QueryPerformanceCounter(&now);
+    return double(now.QuadPart) / double(s_freq.QuadPart);
+#else
+    return 0.0;
+#endif
+}
+ 
+static void render_master_clock()
+{
+    auto *opts = os_developer_options::instance;
+    if ( opts == nullptr ) {
+        return;
+    }
+ 
+    if ( !opts->get_flag(mString{"SHOW_MASTER_CLOCK"}) ) {
+        s_master_clock_was_on = false;
+        return;
+    }
+ 
+    if ( !s_master_clock_was_on ) {
+        s_master_clock_was_on = true;
+        s_master_clock_start  = get_real_seconds();
+    }
+ 
+    const double elapsed = get_real_seconds() - s_master_clock_start;
+    const int    total_s = elapsed > 0.0 ? int(elapsed) : 0;
+    const int    minutes = total_s / 60;
+    const int    seconds = total_s % 60;
+ 
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d:%02d", minutes, seconds);
+ 
+    // Anchor near the top-right of the 640x480 reference layout the
+    // game renders in. Drawn at z=1.0 so it sits above the world but
+    // under the console; the same z the FPS block uses.
+    const auto white = uint32_t(0xFFFFFFFFu);
+    nglListAddString(nglSysFont(),
+                     520.0f, 32.0f,
+                     1.0f, white,
+                     0.85f, 0.85f,
+                     buf);
+}
+ 
+// ----------------------------------------------------------------------
+// SHOW_MEMORY_INFO
+//
+// Reference: t=10s in the first video. Three yellow labels stacked
+// vertically on the right side of the screen — "Mem in use", "Mem
+// change", "Free" — each with a right-aligned integer value. The
+// Xbox build values are KB; on PC we use the Win32 process working
+// set as the "in use" figure, the delta between frames as "change",
+// and the system-wide available physical memory as "free". All three
+// are reported in MB so the numbers stay compact.
+// ----------------------------------------------------------------------
+ 
+static uint64_t s_last_in_use_bytes = 0;
+ 
+static void query_memory(uint64_t &in_use, int64_t &change, uint64_t &free_avail)
+{
+    in_use = change = 0;
+    free_avail = 0;
+ 
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc {};
+    pmc.cb = sizeof(pmc);
+    if ( ::GetProcessMemoryInfo(::GetCurrentProcess(), &pmc, sizeof(pmc)) ) {
+        in_use = uint64_t(pmc.WorkingSetSize);
+    }
+ 
+    MEMORYSTATUSEX ms {};
+    ms.dwLength = sizeof(ms);
+    if ( ::GlobalMemoryStatusEx(&ms) ) {
+        free_avail = uint64_t(ms.ullAvailPhys);
+    }
+ 
+    if ( s_last_in_use_bytes != 0 ) {
+        change = int64_t(in_use) - int64_t(s_last_in_use_bytes);
+    }
+    s_last_in_use_bytes = in_use;
+#endif
+}
+ 
+static void render_memory_info()
+{
+    auto *opts = os_developer_options::instance;
+    if ( opts == nullptr ) {
+        return;
+    }
+    if ( !opts->get_flag(mString{"SHOW_MEMORY_INFO"}) ) {
+        return;
+    }
+ 
+    uint64_t in_use_b   = 0;
+    int64_t  change_b   = 0;
+    uint64_t free_b     = 0;
+    query_memory(in_use_b, change_b, free_b);
+ 
+    // Bytes -> MB. Signed for "change" because it can run negative
+    // when memory is freed mid-frame.
+    const int     in_use_mb = int(in_use_b   / (1024 * 1024));
+    const int     free_mb   = int(free_b     / (1024 * 1024));
+    const int     change_kb = int(change_b   / 1024);  // KB granularity for the delta
+ 
+    // The Xbox build labels these in yellow; the values in white. We
+    // approximate by drawing the labels and values in the same yellow
+    // tone the FPS block uses for its high-perf state.
+    const auto label_color = uint32_t(0xFFFFFF20u);  // ABGR: yellow-ish
+    const auto value_color = uint32_t(0xFFFFFFFFu);  // ABGR: white
+ 
+    const float label_x = 410.0f;
+    const float value_x = 540.0f;
+    float       y       = 240.0f;
+    const float dy      = 16.0f;
+    const float scale   = 0.75f;
+ 
+    // Labels (yellow)
+    nglListAddString(nglSysFont(), label_x, y,        1.0f, label_color,
+                     scale, scale, "Mem in use");
+    nglListAddString(nglSysFont(), label_x, y +   dy, 1.0f, label_color,
+                     scale, scale, "Mem change");
+    nglListAddString(nglSysFont(), label_x, y + 2*dy, 1.0f, label_color,
+                     scale, scale, "Free");
+ 
+    // Values (white, right-aligned numerically). nglListAddString
+    // doesn't right-align for us; we just place x near the right
+    // gutter and render the formatted number there. This matches the
+    // Xbox layout closely enough that the screen-space position lines
+    // up with what the reference video shows.
+    char in_use_str[32];
+    char change_str[32];
+    char free_str  [32];
+    std::snprintf(in_use_str, sizeof(in_use_str), "%d", in_use_mb);
+    std::snprintf(change_str, sizeof(change_str), "%d", change_kb);
+    std::snprintf(free_str,   sizeof(free_str),   "%d", free_mb);
+ 
+    nglListAddString(nglSysFont(), value_x, y,        1.0f, value_color,
+                     scale, scale, in_use_str);
+    nglListAddString(nglSysFont(), value_x, y +   dy, 1.0f, value_color,
+                     scale, scale, change_str);
+    nglListAddString(nglSysFont(), value_x, y + 2*dy, 1.0f, value_color,
+                     scale, scale, free_str);
+}
+
+// ----------------------------------------------------------------------
+// SHOW_VOICE_BOX_INFO
+//
+// Reference: t=10s in bandicam_2026-04-30_22-16-45-256.mp4. Toggling
+// the int from 0 → 1 spawns two labels near the centre of the screen:
+//
+//     0x08909065
+//     VEN
+//
+// The hex value is the string_hash of the active region; the
+// three-letter glyph is its name truncated to 3 chars.
+//
+// Two compile-side notes for this codebase:
+//   - region::get_name() returns fixedstring<8>&; its to_string()
+//     returns a raw const char* directly. There is no .c_str() to
+//     call on the result.
+//   - string_hash has explicit constructors string_hash(const char*)
+//     and string_hash(int), but brace-init `string_hash{ptr}` confuses
+//     overload resolution under -Wnarrowing on some compilers, so we
+//     use parenthesised init.
+// ----------------------------------------------------------------------
+ 
+static void render_voice_box_info()
+{
+    auto *opts = os_developer_options::instance;
+    if ( opts == nullptr ) {
+        return;
+    }
+    if ( opts->get_int(mString{"SHOW_VOICE_BOX_INFO"}) <= 0 ) {
+        return;
+    }
+ 
+    // Defaults — these are what gets drawn if every lookup below
+    // fails. They are intentionally non-empty so the overlay is
+    // visible the very first frame the int goes non-zero.
+    char hash_str[32] = "0x00000000";
+    char abbr[8]      = "---";
+ 
+    // Try the standard region path first, then the point query, then
+    // (last resort) just hash the hero's position so we always have
+    // a value to display.
+    if ( g_world_ptr != nullptr )
+    {
+        if ( auto *hero = g_world_ptr->get_hero_ptr(0) )
+        {
+            region *reg = hero->get_primary_region();
+            if ( reg == nullptr )
+            {
+                if ( auto *terrain = g_world_ptr->get_the_terrain() ) {
+                    reg = terrain->find_region(hero->get_abs_position(),
+                                               nullptr);
+                }
+            }
+ 
+            if ( reg != nullptr )
+            {
+                const char *name = reg->get_name().to_string();
+                if ( name != nullptr && name[0] != '\0' )
+                {
+                    // Abbreviation — first 3 characters, upper-cased.
+                    for ( int i = 0; i < 3 && name[i] != '\0'; ++i )
+                    {
+                        char c = name[i];
+                        if ( c >= 'a' && c <= 'z' ) {
+                            c = char(c - 'a' + 'A');
+                        }
+                        abbr[i] = c;
+                    }
+                    abbr[3] = '\0';
+ 
+                    // Hash — string_hash(const char*) is the matching
+                    // ctor; parens not braces (see earlier compile-fix
+                    // commit message).
+                    const string_hash sh(name);
+                    std::snprintf(hash_str, sizeof(hash_str),
+                                  "0x%08X", sh.get_hash());
+                }
+            }
+            else
+            {
+                // No region resolvable — synthesise a fingerprint
+                // from the hero's position so the overlay still
+                // changes as the player moves. This mirrors what
+                // the audio box code does internally to bucket
+                // sounds by spatial cell.
+                const auto p = hero->get_abs_position();
+                const auto px = uint32_t(int32_t(p[0] * 1000.0f));
+                const auto py = uint32_t(int32_t(p[1] * 1000.0f));
+                const auto pz = uint32_t(int32_t(p[2] * 1000.0f));
+                const uint32_t fp = (px * 73856093u) ^
+                                    (py * 19349663u) ^
+                                    (pz * 83492791u);
+                std::snprintf(hash_str, sizeof(hash_str),
+                              "0x%08X", fp);
+                std::snprintf(abbr,     sizeof(abbr),
+                              "POS");
+            }
+        }
+    }
+ 
+    // ---- draw ----
+    //
+    // Match the FPS block's shadow-on-shadow draw order so this
+    // reads against any background the same way the FPS counter
+    // does.  +1/+1 darker offset, +2/+2 darker offset, then the
+    // bright main pass on top.
+    const float x      = 280.0f;
+    const float y_hash = 320.0f;
+    const float y_abbr = 336.0f;
+    const float scale  = 0.85f;
+ 
+    const auto white  = uint32_t(0xFFFFFFFFu);
+    const auto shadow = uint32_t(0xFF101010u);
+ 
+    nglListAddString(nglSysFont(), x + 1.0f, y_hash + 1.0f, 1.01f, shadow,
+                     scale, scale, hash_str);
+    nglListAddString(nglSysFont(), x + 2.0f, y_hash + 2.0f, 1.01f, shadow,
+                     scale, scale, hash_str);
+    nglListAddString(nglSysFont(), x,        y_hash,        1.0f,  white,
+                     scale, scale, hash_str);
+ 
+    nglListAddString(nglSysFont(), x + 1.0f, y_abbr + 1.0f, 1.01f, shadow,
+                     scale, scale, abbr);
+    nglListAddString(nglSysFont(), x + 2.0f, y_abbr + 2.0f, 1.01f, shadow,
+                     scale, scale, abbr);
+    nglListAddString(nglSysFont(), x,        y_abbr,        1.0f,  white,
+                     scale, scale, abbr);
+}
+ 
+// ----------------------------------------------------------------------
+// Master entry point. Called once per frame from spider_monkey::render
+// after the SHOW_FPS / SHOW_BAR_OF_SHAME blocks.
+// ----------------------------------------------------------------------
+
+static bool  s_watermark_was_on = false;
+static float s_watermark_max    = 0.0f;
+ 
+static void render_watermark_velocity()
+{
+    auto *opts = os_developer_options::instance;
+    if ( opts == nullptr ) {
+        return;
+    }
+    if ( !opts->get_flag(mString{"SHOW_WATERMARK_VELOCITY"}) ) {
+        s_watermark_was_on = false;
+        s_watermark_max    = 0.0f;
+        return;
+    }
+ 
+    if ( !s_watermark_was_on ) {
+        s_watermark_was_on = true;
+        s_watermark_max    = 0.0f;
+    }
+ 
+    // Pull current speed; tolerate every level of the chain being null
+    // because the user can flip this flag on at any time, including
+    // before the hero is spawned. Falling back to 0.0 keeps the lines
+    // on screen rather than ping-ponging visible/invisible.
+    float current = 0.0f;
+    if ( g_world_ptr != nullptr )
+    {
+        if ( auto *hero = g_world_ptr->get_hero_ptr(0) )
+        {
+            if ( hero->has_physical_ifc() )
+            {
+                const auto v = hero->physical_ifc()->get_velocity();
+                current = v.length();
+            }
+        }
+    }
+ 
+    if ( current > s_watermark_max ) {
+        s_watermark_max = current;
+    }
+ 
+    char line1[64];
+    char line2[64];
+    std::snprintf(line1, sizeof(line1),
+                  "WATERMARK VELOCITY:%.3f", current);
+    std::snprintf(line2, sizeof(line2),
+                  "WATERMARK VELOCITY MAX:%.3f", s_watermark_max);
+ 
+    // ABGR. Byte layout: A << 24 | B << 16 | G << 8 | R. The FPS
+    // block builds its colour the same way (see spider_monkey.cpp ~
+    // 1350). 0xFF40FFFF == bright yellow (R=FF, G=FF, B=40, A=FF).
+    const auto yellow = uint32_t(0xFF40FFFFu);
+    const auto shadow = uint32_t(0xFF101010u);
+ 
+    // Top-centre. Anchored so the longer "MAX" line still fits in the
+    // 640x480 reference viewport with the menu open.
+    const float x      = 200.0f;
+    const float y_cur  = 70.0f;
+    const float y_max  = 88.0f;
+    const float scale  = 0.85f;
+ 
+    // Drop-shadow pass 1 (offset +1/+1).
+    nglListAddString(nglSysFont(), x + 1.0f, y_cur + 1.0f, 1.01f, shadow,
+                     scale, scale, line1);
+    nglListAddString(nglSysFont(), x + 1.0f, y_max + 1.0f, 1.01f, shadow,
+                     scale, scale, line2);
+ 
+    // Drop-shadow pass 2 (offset +2/+2). Two passes give the text a
+    // visible halo on busy backgrounds the same way the FPS counter
+    // remains readable against the sky.
+    nglListAddString(nglSysFont(), x + 2.0f, y_cur + 2.0f, 1.01f, shadow,
+                     scale, scale, line1);
+    nglListAddString(nglSysFont(), x + 2.0f, y_max + 2.0f, 1.01f, shadow,
+                     scale, scale, line2);
+ 
+    // Bright pass on top.
+    nglListAddString(nglSysFont(), x, y_cur, 1.0f, yellow,
+                     scale, scale, line1);
+    nglListAddString(nglSysFont(), x, y_max, 1.0f, yellow,
+                     scale, scale, line2);
+}
 
 
+
+
+	
+	    
+	
+
+
+
+
+
+static void render_obbs_overlay()
+{
+    auto *opts = os_developer_options::instance;
+    if ( opts == nullptr ) {
+        return;
+    }
+    if ( !opts->get_flag(mString{"SHOW_OBBS"}) ) {
+        return;
+    }
+    if ( g_world_ptr == nullptr ) {
+        return;
+    }
+ 
+    auto *terrain = g_world_ptr->get_the_terrain();
+    if ( terrain == nullptr ) {
+        return;
+    }
+ 
+    // 12 edges of a box, identifying corner pairs by their index XOR
+    // (1, 2 or 4 — i.e. corners that differ on exactly one axis).
+    static const int edges[12][2] = {
+        {0, 1}, {2, 3}, {4, 5}, {6, 7},  // X-axis edges
+        {0, 2}, {1, 3}, {4, 6}, {5, 7},  // Y-axis edges
+        {0, 4}, {1, 5}, {2, 6}, {3, 7},  // Z-axis edges
+    };
+ 
+    // ARGB. nglSetQuadColor expects (B | G<<8 | R<<16 | A<<24) — the
+    // same ARGB layout SHOW_BAR_OF_SHAME uses, distinct from the ABGR
+    // layout nglListAddString takes. Six colours, modulo by region
+    // index so adjacent regions are distinguishable.
+    static const uint32_t palette[6] = {
+        0xFFFFFFFFu,  // white
+        0xFFFF0000u,  // red    (A=FF,R=FF,G=00,B=00)
+        0xFF00FF00u,  // green  (A=FF,R=00,G=FF,B=00)
+        0xFF00FFFFu,  // cyan   (A=FF,R=00,G=FF,B=FF)
+        0xFFFFFF00u,  // yellow
+        0xFFFF00FFu,  // magenta
+    };
+ 
+    // Concatenated world->view + view->screen so we can project a 3D
+    // point straight to pixel coordinates with one matrix-vector mul.
+    const auto &xform_world_to_screen =
+        geometry_manager::get_xform(geometry_manager::XFORM_WORLD_TO_SCREEN);
+ 
+    const float thickness = 1.0f;       // pixels — thicker reads better
+                                        //          against busy backgrounds
+    const float quad_z    = 0.5f;       // closer to camera than HUD text;
+                                        // ensures lines aren't depth-tested
+                                        // away by the comic panel borders
+ 
+    const int total = terrain->total_regions;
+    int       drawn = 0;
+ 
+    for ( int i = 0; i < total; ++i )
+    {
+        auto *reg = terrain->regions[i];
+        if ( reg == nullptr || reg->obb == nullptr ) {
+            continue;
+        }
+        if ( !reg->is_loaded() ) {
+            continue;
+        }
+ 
+        // World-space corners of this region's OBB.
+        vector3d world_corners[8] {};
+        reg->obb->get_vertices(world_corners);
+ 
+        // Project all 8 to screen. screen[2] is the depth value after
+        // perspective divide — > 0 means the point is in front of the
+        // camera. We track it per-corner so we can cull edges where
+        // either endpoint is behind us.
+        vector3d screen_pts[8] {};
+        bool     in_front[8]  {};
+        for ( int c = 0; c < 8; ++c )
+        {
+            screen_pts[c] = sub_501B20(xform_world_to_screen,
+                                       world_corners[c]);
+            in_front[c]   = screen_pts[c][2] > 0.0f;
+        }
+ 
+        const uint32_t color = palette[drawn % 6];
+ 
+        for ( const auto &e : edges )
+        {
+            const int a = e[0];
+            const int b = e[1];
+            if ( !in_front[a] || !in_front[b] ) {
+                continue;
+            }
+ 
+            const float x1 = screen_pts[a][0];
+            const float y1 = screen_pts[a][1];
+            const float x2 = screen_pts[b][0];
+            const float y2 = screen_pts[b][1];
+ 
+            // Direction and perpendicular for the line strip.
+            const float dx = x2 - x1;
+            const float dy = y2 - y1;
+            const float len_sq = dx * dx + dy * dy;
+            if ( len_sq < 0.5f ) {
+                continue;  // degenerate — corners projected to same pixel
+            }
+            const float len = std::sqrt(len_sq);
+            const float inv = 1.0f / len;
+            const float nx  = -dy * inv;       // perpendicular
+            const float ny  =  dx * inv;
+            const float hx  = nx * thickness * 0.5f;
+            const float hy  = ny * thickness * 0.5f;
+ 
+            // Build a 4-vertex strip along the edge. Vertex order
+            // matches the nglQuad strip convention (the same order
+            // nglSetQuadRect produces): v0 = top-left equivalent,
+            // v1 = top-right, v2 = bottom-right, v3 = bottom-left.
+            nglQuad q;
+            nglInitQuad(&q);
+            nglSetQuadColor(&q, color);
+            nglSetQuadBlend(&q, static_cast<nglBlendModeType>(2), 0);
+            nglSetQuadZ(&q, quad_z);
+            nglSetQuadVPos(&q, 0, x1 - hx, y1 - hy);
+            nglSetQuadVPos(&q, 1, x2 - hx, y2 - hy);
+            nglSetQuadVPos(&q, 2, x2 + hx, y2 + hy);
+            nglSetQuadVPos(&q, 3, x1 + hx, y1 + hy);
+            nglListAddQuad(&q);
+        }
+ 
+        ++drawn;
+    }
+}
+
+
+static void render_terrain_info_overlay()
+{
+    auto *opts = os_developer_options::instance;
+    if ( opts == nullptr ) {
+        return;
+    }
+    if ( !opts->get_flag(mString{"SHOW_TERRAIN_INFO"}) ) {
+        return;
+    }
+    if ( g_world_ptr == nullptr ) {
+        return;
+    }
+
+    auto *hero = g_world_ptr->get_hero_ptr(0);
+    if ( hero == nullptr || !hero->has_physical_ifc() ) {
+        return;
+    }
+
+    string_hash terrain_hash;
+    hero->physical_ifc()->get_parent_terrain_type(&terrain_hash);
+
+    const char *name = terrain_hash.to_string();
+
+    // Build the line. If the dictionary doesn't have the hash, name
+    // either comes back as the hex fingerprint or — depending on
+    // build — an empty string. Fall back to the raw hash so the
+    // overlay is still useful in that case.
+    char line[80];
+    if ( name != nullptr && name[0] != '\0' ) {
+        std::snprintf(line, sizeof(line), "TERRAIN: %s", name);
+    } else {
+        std::snprintf(line, sizeof(line), "TERRAIN: 0x%08X",
+                      terrain_hash.get_hash());
+    }
+
+    // ABGR. White main pass, dark shadow.
+    const auto white  = uint32_t(0xFFFFFFFFu);
+    const auto shadow = uint32_t(0xFF101010u);
+
+    const float x     = 460.0f;
+    const float y     = 40.0f;
+    const float scale = 0.85f;
+
+    nglListAddString(nglSysFont(), x + 1.0f, y + 1.0f, 1.01f, shadow,
+                     scale, scale, line);
+    nglListAddString(nglSysFont(), x + 2.0f, y + 2.0f, 1.01f, shadow,
+                     scale, scale, line);
+    nglListAddString(nglSysFont(), x,        y,        1.0f,  white,
+                     scale, scale, line);
+}
+
+
+// ----------------------------------------------------------------------
+// SWING_DEBUG_TRAILS
+//
+// Treyarch's swing-trail debug flag. Renders a small blue marker in
+// world space at the hero's current position so the swing path can be
+// eyeballed against the geometry it sweeps through. The marker is a
+// fixed-size screen-space quad (no depth scaling) for legibility, and
+// uses the same world->screen projection + nglQuad blend setup as the
+// SHOW_OBBS overlay so the two flags compose without z-fighting.
+// ----------------------------------------------------------------------
+
+static void render_swing_debug_trails()
+{
+    auto *opts = os_developer_options::instance;
+    if ( opts == nullptr ) {
+        return;
+    }
+    if ( !opts->get_int(mString{"SWING_DEBUG_TRAILS"}) ) {
+        return;
+    }
+    if ( g_world_ptr == nullptr ) {
+        return;
+    }
+ 
+    auto *hero = g_world_ptr->get_hero_ptr(0);
+    if ( hero == nullptr ) {
+        return;
+    }
+ 
+    // During swing-state transitions the actor's physical interface
+    // is briefly detached (see swing_state::finalize() — it flips
+    // physical_ifc->field_C and tears down swingers[0/1] before the
+    // next state activates). Reading get_abs_position() through that
+    // half-initialized po was driving the in-swing crash; gating on
+    // has_physical_ifc keeps us off the dangling pointer.
+    if ( !hero->has_physical_ifc() ) {
+        return;
+    }
+ 
+    const vector3d world_pos = hero->get_abs_position();
+    if ( !std::isfinite(world_pos[0]) ||
+         !std::isfinite(world_pos[1]) ||
+         !std::isfinite(world_pos[2]) ) {
+        return;
+    }
+ 
+    // Concatenated world->view + view->screen transform; one
+    // matrix-vector mul per point.
+    const auto &xform_world_to_screen =
+        geometry_manager::get_xform(geometry_manager::XFORM_WORLD_TO_SCREEN);
+ 
+    const vector3d screen = sub_501B20(xform_world_to_screen, world_pos);
+ 
+    // Positive-predicate guards. The earlier "screen[2] <= 0.0f" form
+    // silently passed NaN through (NaN compares false against every
+    // ordering operator), and during a swing whip the camera grazes
+    // the near plane often enough that sub_501B20 transiently spits
+    // out NaN / ±inf — that's what was reaching nglSetQuadVPos and
+    // crashing the quad list. "!(x > 0.0f)" rejects NaN correctly.
+    if ( !(screen[2] > 0.0f) ) {
+        return;
+    }
+    if ( !std::isfinite(screen[0]) || !std::isfinite(screen[1]) ) {
+        return;
+    }
+ 
+    const float cx = screen[0];
+    const float cy = screen[1];
+ 
+    // Off-screen reject. Even with finite coords, projection can spit
+    // out ±1e5-magnitude pixel positions when the hero is *just*
+    // off-axis with a near-plane-hugging camera. Letting those through
+    // is technically harmless on the GPU but ngl's quad scratch
+    // buffer asserts on out-of-range vertex positions in debug builds.
+    // 640x480 reference viewport ± a generous margin.
+    if ( cx < -128.0f || cx > 768.0f ||
+         cy < -128.0f || cy > 608.0f ) {
+        return;
+    }
+ 
+    // ARGB layout (B | G<<8 | R<<16 | A<<24) — what nglSetQuadColor
+    // takes, distinct from the ABGR layout nglListAddString takes.
+    // Pure opaque blue.
+    const uint32_t blue   = 0xFF0000FFu;
+    const float    radius = 9.0f;
+    const float    quad_z = 0.5f;
+ 
+    // 16-wedge filled disk. Each quad is a pie slice whose 0th and
+    // 3rd vertices are the centre, which makes the quad's second
+    // triangle (0,2,3) degenerate (zero area) so only triangle
+    // (0,1,2) — the wedge itself — actually rasterises. 16 segments
+    // reads as a clean circle at radius=9 without blowing out the
+    // per-frame quad submission budget.
+    static constexpr int   wedges = 16;
+    static constexpr float two_pi = 6.28318530717958647692f;
+ 
+    float prev_x = cx + radius;
+    float prev_y = cy;
+    for ( int i = 1; i <= wedges; ++i )
+    {
+        const float t      = (float(i) / float(wedges)) * two_pi;
+        const float next_x = cx + radius * std::cos(t);
+        const float next_y = cy + radius * std::sin(t);
+ 
+        nglQuad q;
+        nglInitQuad(&q);
+        nglSetQuadColor(&q, blue);
+        nglSetQuadBlend(&q, static_cast<nglBlendModeType>(2), 0);
+        nglSetQuadZ(&q, quad_z);
+        nglSetQuadVPos(&q, 0, cx,     cy);       // centre
+        nglSetQuadVPos(&q, 1, prev_x, prev_y);   // last perimeter pt
+        nglSetQuadVPos(&q, 2, next_x, next_y);   // next perimeter pt
+        nglSetQuadVPos(&q, 3, cx,     cy);       // centre (degenerate)
+        nglListAddQuad(&q);
+ 
+        prev_x = next_x;
+        prev_y = next_y;
+    }
+}
+
+
+   static void apply_pedestrian_enable_flag()
+   {
+		   
+		   	        if (os_developer_options::instance->get_flag(mString{ "ENABLE_PEDESTRIANS" }))
+        {
+                        dword_959318();
+        }        
+}	
+       
+   
+
+void render_debug_overlays()
+{
+    TRACE("render_debug_overlays");
+	
+    render_watermark_velocity();
+    render_voice_box_info();
+    render_master_clock();
+    render_memory_info();
+	render_obbs_overlay();
+	render_terrain_info_overlay();
+	render_swing_debug_trails();
+	apply_pedestrian_enable_flag();
+
+}
+
+
+ 
+
+void fog_distance_per_frame_sync()
+{
+    auto *opts = os_developer_options::instance;
+    if ( opts == nullptr ) {
+        return;
+    }
+ 
+
+    static int s_fog_distance_idx = -1;
+    if ( s_fog_distance_idx < 0 ) {
+        s_fog_distance_idx = opts->get_int_from_name(mString{"FOG_DISTANCE"});
+        if ( s_fog_distance_idx < 0 || s_fog_distance_idx >= 76 ) {
+            s_fog_distance_idx = 7; 
+        }
+    }
+ 
+    int v = opts->m_ints[s_fog_distance_idx];
+ 
+    if ( v <= 0 ) {
+
+        g_distance_clipping_enabled() = false;
+        return;
+    }
+ 
+    if ( v > 100 ) {
+        v = 100;
+    }
+ 
+
+    g_distance_clipping()         = 100 - v;
+    g_distance_clipping_enabled() = true;
+}
 
 
 
@@ -1260,32 +2062,57 @@ void spider_monkey::render()
     }
 
     {
+
 		
 	        if (os_developer_options::instance->get_flag(mString{ "SHOW_OBBS" }))
         {
                     auto *the_terrain = g_world_ptr->get_the_terrain();
         the_terrain->show_obbs();
         }	
-
-	        if (os_developer_options::instance->get_flag(mString{ "DISABLE_AUDIO_BOXES" }))
+					 
+		if (os_developer_options::instance->get_flag(mString{ "SHOW_DEBUG_TEXT" }))
         {
-            app::cleanup();
-        }					 
-
+            g_game_ptr->render_district_labels();
+        }
+         
         if (os_developer_options::instance->get_flag(mString{ "SHOW_DEBUG_INFO" }))
         {
             g_game_ptr->show_debug_info();
+        }
+		
+		        if (os_developer_options::instance->get_int(mString{ "FOG_DISTANCE" }))
+        {
+            fog_distance_per_frame_sync();
         }
 		        if (os_developer_options::instance->get_flag(mString{ "SHOW_BAR_OF_SHAME" }))
         {
             g_game_ptr->render_bar_of_shame();
         }
-		            if (os_developer_options::instance->get_int(mString { "MINI_MAP_ZOOM" })) {
+		
+
+
+		
+		      if (os_developer_options::instance->get_int(mString { "MINI_MAP_ZOOM" })) {
                     debug_menu_entry a1;
                 a1.set_game_flags_handler(mini_map_zoom);
             }
 			
-	
+					      switch (os_developer_options::instance->get_int(mString { "FRAME_LOCK" }))
+            {
+            case 0:
+                g_timer()->normal_motion();
+                break;
+            case 1:
+                
+                break;
+             case 2: 
+               g_timer()->super_speed_motion();
+            default:
+                break;
+            }
+			
+		
+	render_debug_overlays();
 
             
 			
@@ -1444,3 +2271,8 @@ void spider_monkey_patch()
 
     REDIRECT(0x0052B5DC, spider_monkey::is_running);
 }
+
+
+
+
+

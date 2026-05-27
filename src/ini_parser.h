@@ -27,3 +27,6 @@ namespace ini_parser {
     extern char & stored_num;
 
 }
+
+
+extern void ini_parser_patch();

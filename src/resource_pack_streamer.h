@@ -71,6 +71,7 @@ public:
     bool is_active() const {
         return active;
     }
+	
 
     bool is_disk_idle() const;
 

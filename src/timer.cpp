@@ -4,6 +4,7 @@
 #include "func_wrapper.h"
 #include "game.h"
 #include "trace.h"
+#include "variables.h"
 #include "utility.h"
 
 #include <profileapi.h>
@@ -42,6 +43,24 @@ float Timer::sub_5821D0()
 {
     float (__fastcall *func)(void *) = CAST(func, 0x005821D0);
     auto time_inc = func(this);
+
+#if FPS_UNLOCK_60
+    // The Timer was bumped to TargetFPS in main.cpp (Timer{60.0, 60.0}),
+    // so the original returns ~1/TargetFPS per call instead of ~1/30.
+    //
+    // Scale by 30/Target to preserve wall-clock speed for frame-counter
+    // based game logic (animation frame counts, "field_140 = 3.0" style
+    // cooldowns, hard-coded ticks like frame_advance(0.06666667)).
+    //
+    // Doing the scale here -- one chokepoint -- is simpler and safer
+    // than scaling per-call-site downstream.
+    if (g_config.EnableHighFPS &&
+        g_config.CompensateSimDt &&
+        g_config.TargetFPS > 60)
+    {
+        time_inc *= 60.0f / static_cast<float>(g_config.TargetFPS);
+    }
+#endif
 
     return time_inc;
 }

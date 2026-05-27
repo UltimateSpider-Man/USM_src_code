@@ -25,14 +25,18 @@ void pause_menu_transition::set_transition(int a1) {
     this->field_48 = a1;
 }
 
-void pause_menu_transition::Update(Float a2) {
-    THISCALL(0x0061C680, this, a2);
-}
+void pause_menu_transition::Update(Float a2)  {
+		
+			         void (__thiscall *func)(const pause_menu_transition*,Float ) = CAST(func, 0x0061C680);
+        return func(this, a2);
+    }
+
 
 void pause_menu_transition::_Load()
 {
     TRACE("pause_menu_transition::Load");
-    THISCALL(0x0061C640, this);
+	         void (__thiscall *func)(const pause_menu_transition*) = CAST(func, 0x0061C640);
+        return func(this);
 }
 
 void pause_menu_transition_patch()

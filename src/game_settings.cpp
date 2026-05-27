@@ -242,58 +242,17 @@ int game_settings::load()
 
 void game_settings::load_game(int slot_num)
 {
-    assert(this->m_game_data_valid[slot_num]);
 
-    if constexpr (1)
-    {
-        if (this->field_4C2)
-        {
-            if (this->field_4C8 > 2) {
-                this->field_4C2 = false;
-                this->start_new_game();
-                mission_manager::s_inst->lock();
-                this->field_4C1 = false;
-                std::memcpy(&this->field_340,
-                            this->field_49C[slot_num] + sizeof(game_data_essentials),
-                            sizeof(this->field_340));
-                this->sub_579990();
-                std::memcpy(this->field_494[0], this->field_49C[slot_num] + sizeof(game_data_essentials) + sizeof(game_data_meat), this->field_4B4);
-                std::memcpy(this->field_494[1],
-                            this->field_49C[slot_num] + this->field_4B4 + sizeof(game_data_essentials) + sizeof(game_data_meat),
-                            this->field_4B4);
-                this->field_4BF = true;
-                this->soft_load(0);
-                this->export_game_settings();
-                this->export_game_options();
-
-                std::memcpy(this->field_4A8,
-                            this->field_28C[slot_num].field_2E,
-                            sizeof(this->field_4A8));
-
-                this->field_4B8 = slot_num;
-                auto *v4 = g_world_ptr->get_chase_cam_ptr(0);
-                g_game_ptr->set_current_camera(v4, true);
-            }
-        }
-        else
-        {
-            this->field_4C2 = true;
-            this->field_4C8 = 0;
-            this->m_slot_num = slot_num;
-            mission_manager::s_inst->unload_script_now();
-            auto v3 = g_world_ptr->num_players;
-            if (v3 > 0) {
-                g_world_ptr->remove_player(v3 - 1);
-            }
-        }
-
-    } else {
         THISCALL(0x0057F410, this, slot_num);
-    }
+    
 }
 
-void game_settings::load_most_recent_game() {
-    THISCALL(0x0057F580, this);
+
+
+void game_settings::load_most_recent_game() 
+{
+
+   THISCALL(0x0057F580, this);
 }
 
 int *GetSystemDate(int *out) {

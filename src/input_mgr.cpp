@@ -273,7 +273,7 @@ void input_mgr::insert_device(input_device *a2)
 
     // sp_log("0x%X", a2->get_id());
 
-    if constexpr(0)
+    if constexpr(1)
     {
         auto *v2 = a2;
         auto id = a2->get_id();
@@ -286,9 +286,7 @@ void input_mgr::insert_device(input_device *a2)
             *((DWORD *)&this[0xFFFF562B] + v2->get_id() - 0x11) = (DWORD)v2;
         } else if ( IS_KEYBOARD_DEVICE(v2->get_id()) ) {
             this->keyboard_devices[DEVICE_ID_TO_KEYBOARD_INDEX(v2->get_id())] = v2;
-        } else if ( IS_MOUSE_DEVICE(v2->get_id()) ) {
-            *((DWORD *)&this[0xFFFE027F] + v2->get_id() - 0x14) = (DWORD)v2;
-        }
+        } 
     }
     else
     {

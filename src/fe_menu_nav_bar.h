@@ -26,6 +26,9 @@ struct menu_nav_bar {
     //0x00612080
     void Load();
 
+	void Draw(){
+	    };
+
     //0x006121C0
     void AddButtons(menu_nav_bar::button_type a2, menu_nav_bar::button_type a3, global_text_enum a4);
 

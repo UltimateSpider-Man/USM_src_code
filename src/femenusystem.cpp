@@ -41,7 +41,7 @@ FEMenuSystem::FEMenuSystem(int a2, font_index a3)
     }
 }
 
-void FEMenuSystem::MakeActive(int idx) {
+void FEMenuSystem::MakeDeactive(int idx) {
     if constexpr (1) {
         auto idx = this->m_index;
         if (idx != -1) {
@@ -71,6 +71,12 @@ void FEMenuSystem::MakeActive(int idx) {
     } else {
         THISCALL(0x0060B610, this, idx);
     }
+}
+
+void FEMenuSystem::MakeActive(int idx) {
+
+        THISCALL(0x0060B610, this, idx);
+    
 }
 
 void FEMenuSystem::UpdateButtonDown()

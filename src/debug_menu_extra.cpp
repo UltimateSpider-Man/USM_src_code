@@ -16,8 +16,58 @@
 #include "igofrontend.h"
 #include "femanager.h"
 #include "rumble_manager.h"
+#include "memoryunitmanager.h"
 
+#include "variables.h"
 #include <cassert>
+
+bool sub_6702DE()
+{
+    return  MemoryUnitManager::LoadGame(0);
+}
+
+int sub_69FD54(int a1)
+{
+   MemoryUnitManager::SetCurrentUnit(a1);
+}
+
+int sub_B7F990()
+{
+  return sub_69FD54(8);
+}
+
+int sub_69A45D()
+{
+  return sub_B7F990();
+}
+
+
+void sub_1059CD0(int a1)
+{
+    dword_151691C() = a1;
+}
+
+
+
+int sub_B7F9D0()
+{
+    sub_6702DE();
+    sub_69A45D();
+
+    auto *settings = g_game_ptr->get_game_settings();
+    settings->reset_container(0);
+    settings->save(0);
+
+    while (sub_6702DE()) {
+    }
+
+    return 0;
+}
+
+int sub_66FBE0(void)
+{
+  return sub_B7F9D0();
+}
 
 void district_variants_handler(debug_menu_entry *entry)
 {
@@ -1151,15 +1201,7 @@ void game_flags_handler(debug_menu_entry *a1)
     case 6u: //Show Districts
     {
         debug_menu::hide();
-        os_developer_options::instance->set_flag(mString{"SHOW_STREAMER_INFO"}, a1->get_bval());
-
-        if ( a1->get_bval() )
-        {
-            os_developer_options::instance->set_flag(mString{"SHOW_DEBUG_TEXT"}, true);
-        }
-
-        //TODO
-        //sub_66C242(&g_game_ptr->field_4C);
+        os_developer_options::instance->set_flag(mString{"SHOW_DEBUG_TEXT"}, a1->get_bval());
         break;
     }
     case 7u: //Show Hero Position
@@ -1258,23 +1300,36 @@ void game_flags_handler(debug_menu_entry *a1)
     }
     case 14u:
     {
-        //TODO
-        //sub_66FBE0();
+        if (auto* gp = g_game_ptr) {
+            if (auto* gs = gp->gamefile) {
+        g_game_ptr->get_game_settings();
+	    gs->reset_container(0);		
+        gs->save(0);
         debug_menu::hide();
         break;
+		            }
+					            }
     }
     case 15u:
     {
-        //sub_697DB1();
+        if (auto* gp = g_game_ptr) {
+            if (auto* gs = gp->gamefile) {		
+        gs->load_game(0);
         debug_menu::hide();
         break;
+		            }
+					            }
     }
     case 16u:
     {
         //TODO
-        //sub_698D33();
-        debug_menu::hide();
+        if (auto* gp = g_game_ptr) {
+            if (auto* gs = gp->gamefile) {
+     gs->load_most_recent_game();				
+     debug_menu::hide();	 
         break;
+		            }
+					            }
     }
     case 17u:
     {

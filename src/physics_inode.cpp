@@ -5,6 +5,8 @@
 #include "common.h"
 #include "config.h"
 #include "entity_base.h"
+
+#include "entity.h"
 #include "func_wrapper.h"
 #include "game.h"
 #include "game_settings.h"
@@ -370,11 +372,16 @@ bool physics_inode::get_collided_last_frame() const
     return this->field_1C->is_flag(0x20u);
 }
 
-vector3d physics_inode::get_abs_position() {
-    entity_base *v1 = this->get_actor();
-    auto result = v1->get_abs_position();
 
-    return result;
+vector3d physics_inode::get_abs_position()
+{
+    auto *ent = this->field_C;
+
+    if (ent->is_ext_flagged(0x10000000u)) {
+        ent->update_abs_po(true);
+    }
+
+    return ent->get_abs_po().get_position();
 }
 
 vector3d physics_inode::get_last_collision_normal() const

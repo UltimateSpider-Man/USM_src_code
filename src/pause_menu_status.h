@@ -2,9 +2,6 @@
 
 #include "femenu.h"
 
-
-#include "pause_menu_awards.h"
-
 struct PanelQuad;
 struct FEText;
 struct PauseMenuSystem;
@@ -47,7 +44,9 @@ struct pause_menu_status : FEMenu {
     mString *get_element_desc(mString *out, int a3);
 	
 	
-	pause_menu_awards get_element_value(int index);
+	 const mString *get_element_value(int index);
+	
+	mString *get_element_value_0(mString *out, int index);
 
 
     //0x0061CC30
@@ -60,6 +59,18 @@ struct pause_menu_status : FEMenu {
     //0x0063B890
     //virtual
     void _Load();
+	
+	void OnUp(int a2);
+	
+	void OnDown(int a2);
+	
+	void Down();
+	
+	char OnMouseEvent(int msg, int a3, int a4);
+
+
+	    void Init();
 };
 
 extern void pause_menu_status_patch();
+

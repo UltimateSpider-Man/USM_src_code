@@ -40,6 +40,16 @@ mission_manager::mission_manager()
     }
 }
 
+bool  mission_manager::sub_5C5920()
+{
+    if constexpr (1)
+    {}
+    else
+    {
+      return (bool)  THISCALL(0x005C5920, this);
+    }
+}
+
 bool mission_manager::sub_5C58D0(){
 
         THISCALL(0x005C58D0, this);

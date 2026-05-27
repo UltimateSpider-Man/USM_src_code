@@ -100,7 +100,7 @@ struct mission_manager {
  
  bool isCurrentScript(const char* scriptName) const;
  
-	
+	bool  sub_5C5920();
 
     void sub_5BACA0(Float a2);
 

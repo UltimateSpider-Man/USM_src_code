@@ -32,6 +32,7 @@ FEText::FEText(font_index a2,
     THISCALL(0x00617500, this, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
 }
 
+
 void FEText::_unmash(mash_info_struct *a1, void *a3)
 {
     TRACE("FEText::unmash");
