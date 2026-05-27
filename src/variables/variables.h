@@ -7,6 +7,8 @@
 
 #include <dsound.h>
 
+// Forward decl so GameConfig can name nglFrameLockType without pulling ngl.h in here.
+
 // @todo: global config
 struct GameConfig {
 	bool DebugMode = false;
@@ -14,6 +16,40 @@ struct GameConfig {
 	bool WindowedMode = false;
 
 	bool NoLoadScreen = false;
+
+	bool EnableFpuExceptionHandling = false;
+
+	// ---------------------------------------------------------------
+	// 60 FPS patch
+	// ---------------------------------------------------------------
+	// Master switch. When false, every other field below is ignored
+	// and the engine runs at its stock 30 FPS lock.
+	bool EnableHighFPS = false;
+
+	// Target tick rate fed to the simulation Timer (Timer{fps, fps}).
+	// Stock value is 30. 60 is the common unlock target.
+	int TargetFPS = 60;
+
+	// Value written into dword_922920 before nglSetFrameLock is called.
+	// Mapping is the engine's nglFrameLockType enum:
+	//   0 = NONE (no vsync lock; Timer alone caps the rate)
+	//   1 = 60 Hz lock
+	//   2 = 30 Hz lock (stock)
+	// If you can't confirm the enum, 0 is the safe default.
+	int FrameLockValue = 1;
+
+	// When true, dt fed into game::frame_advance is scaled by
+	// (30 / TargetFPS) so that frame-counter-based logic
+	// (animation frame counts, "field_140 = 3.0" style cooldowns,
+	// hard-coded ticks like frame_advance(0.06666667)) keeps its
+	// original wall-clock speed at the higher tick rate.
+	//
+	// Trade-off: any subsystem that consumes time_inc as real seconds
+	// (physics, audio fades, game_clock) will then run at
+	// (30 / TargetFPS) wall-clock speed. If that is unacceptable for
+	// a particular subsystem, leave this false and instead halve the
+	// hard-coded constants inside that subsystem.
+	bool CompensateSimDt = true;
 };
 
 extern GameConfig g_config;
@@ -28,6 +64,12 @@ struct PolytubeCustomMaterial;
 inline constexpr bool STANDALONE_SYSTEM = 0;
 
 extern PolytubeCustomMaterial *& webline_texture;
+
+extern Var<float> dword_151691C;
+
+extern Var<bool> dword_959318;
+
+extern Var<int> dword_96BA08;
 
 inline Var<float> g_strafe_mult {0x00921B70};
 
@@ -85,7 +127,9 @@ extern Var<int> g_TOD;
 
 extern Var<char *[14]> dword_965C24;
 
-extern Var<char[1024]> g_scene_name;
+extern char (&g_scene_name)[1024];
+
+
 
 extern Var<bool> bExit;
 
@@ -177,3 +221,10 @@ inline constexpr uint32_t RESOURCE_ENTITY_MASH_VERSION = 0x24D;
 inline constexpr uint32_t RESOURCE_NONENTITY_MASH_VERSION = 0x12D;
 inline constexpr uint32_t RESOURCE_AUTO_MASH_VERSION = 0x249;
 inline constexpr uint32_t RESOURCE_RAW_MASH_VERSION = 0x115;
+
+
+inline constexpr uint32_t RESOURCE_PACK_VERSION_XBOX_BUILD = 0xE;
+inline constexpr uint32_t RESOURCE_ENTITY_MASH_VERSION_XBOX_BUILD = 0x24E;
+inline constexpr uint32_t RESOURCE_NONENTITY_MASH_VERSION_XBOX_BUILD = 0x12E;
+inline constexpr uint32_t RESOURCE_AUTO_MASH_VERSION_XBOX_BUILD = 0x24C;
+inline constexpr uint32_t RESOURCE_RAW_MASH_VERSION_XBOX_BUILD = 0x116;

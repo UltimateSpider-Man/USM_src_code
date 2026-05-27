@@ -7,6 +7,9 @@
 
 PolytubeCustomMaterial *& webline_texture = var<PolytubeCustomMaterial *>(0x00958058);
 
+
+Var<float> dword_151691C = {0x151691C};
+
 Var<float> flt_87EBD4 = {0x87EBD4};
 
 Var<float> flt_86F860 = {0x86F860};
@@ -47,7 +50,9 @@ Var<int> g_TOD{0x0091E000};
 
 Var<char *[14]> dword_965C24 { 0x00965C24 };
 
-Var<char[1024]> g_scene_name = (0x0095C308);
+char (&g_scene_name)[1024] = var<char[1024]>(0x0095C308);
+
+
 
 Var<bool> bExit{0x0095C178};
 
@@ -67,6 +72,9 @@ Var<bool> byte_965BF5 = {0x00965BF5};
 Var<bool> byte_965BF6 = {0x00965BF6};
 
 Var<int> dword_922908 = {0x00922908};
+
+
+Var<int> dword_96BA08 = {0x0096BA08};
 
 Var<bool> byte_922994{0x00922994};
 
@@ -92,6 +100,8 @@ Var<char> g_enable_stencil_shadows = {0x00921C98};
 Var<int> g_cur_shadow_target = {0x00965F44};
 
 Var<bool> byte_975468{0x00975468};
+
+Var<bool> dword_959318{0x00959318};
 
 Var<string_hash> bip01_l_calf = {0x0095BA1C};
 Var<string_hash> bip01_r_calf = {0x0095AB1C};
