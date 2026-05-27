@@ -2,9 +2,6 @@
 
 #include <unordered_map>
 #include "resource_versions.h"
-
-#include "ltd_edition.h"
-#include "nal_skeleton.h"
 #include "main.h"
 #include "aeps.h"
 #include "ai_find_best_swing_anchor.h"
@@ -107,6 +104,7 @@
 #include "game_data_meat.h"
 #include "game_settings.h"
 #include "gamepadinput.h"
+#include "gamepad_menu.h"
 #include "geometry_manager.h"
 #include "ghetto_mash_file_header.h"
 #include "glass_house_manager.h"
@@ -144,6 +142,7 @@
 #include "motion_effect_struct.h"
 #include "mission_manager.h"
 #include "morph_file_resource_handler.h"
+#include "debug_render.h"
 #include "moved_entities.h"
 #include "mouselook_controller.h"
 #include "mstring.h"
@@ -175,6 +174,7 @@
 #include "pause_menu_root.h"
 #include "pause_menu_save_load_display.h"
 #include "pause_menu_status.h"
+#include "pause_menu_awards.h"
 #include "pause_menu_transition.h"
 #include "pause_menu_options_display.h"
 #include "pausemenusystem.h"
@@ -269,7 +269,7 @@
 #include "worldly_pack_slot.h"
 #include "script_file_loader.h"
 
-#include "replay_missions.h"
+
 
 #include "main_menu_credits.h"
 
@@ -343,13 +343,161 @@ BOOL restore_text_perms() {
 
 
 
-void ToggleFullScreen(bool windowed)
+// Toggles between windowed and exclusive-fullscreen at runtime.
+//
+// Three things have to happen for windowed mode to actually look right:
+//   1. g_Windowed / g_config.WindowedMode must agree, because the engine
+//      reads them from different places (renderer init, present-params
+//      builder, input clipping, etc.).
+//   2. The game's internal D3D path at 0x0076D230 has to flip the device
+//      (it ultimately drives IDirect3DDevice9::Reset with present params
+//      derived from g_Windowed).
+//   3. The Win32 window itself has to be restyled, resized, and re-placed
+//      — without this the OS window is still the popup/topmost shape we
+//      built for the previous mode and the result looks broken.
+//
+// All entry points (init_hook on startup, ALT+ENTER at runtime, debug menu)
+// route through here so the three pieces stay in sync.
+void apply_windowed_mode(bool windowed)
 {
-    // 0x0076D230 seems to take “windowed” (same semantics as g_Windowed)
+    // 1) Update globals first so any callbacks pumped by the calls below
+    //    (WM_SIZE, WM_ACTIVATEAPP, ...) observe the new mode.
+    g_config.WindowedMode = windowed;
+    g_Windowed() = windowed;
+
+    // 2) Ask the game to flip its D3D device. Safe to call before the
+    //    device exists — 0x0076D230 early-outs on null device pointer.
     ESI_CALL(0x0076D230, windowed);
 
-    // Keep the game responsive when not focused in windowed mode
-    os_developer_options::instance->set_flag(mString{ "ALWAYS_ACTIVE" }, windowed);
+    // 3) Keep the game ticking when it loses focus in windowed mode,
+    //    otherwise alt-tabbing freezes audio / animation.
+    if (os_developer_options::instance) {
+        os_developer_options::instance->set_flag(mString{ "ALWAYS_ACTIVE" }, windowed);
+    }
+
+    // 4) Restyle / move the OS window. If the game hasn't created its
+    //    window yet (early init), there's nothing to restyle and
+    //    register_class_and_create_window will pick the right path
+    //    based on g_config.WindowedMode set above.
+    HWND hwnd = g_appHwnd();
+    if (!hwnd) {
+        return;
+    }
+
+    const int cx = g_cx();
+    const int cy = g_cy();
+
+    DWORD style;
+    DWORD exStyle;
+    int x, y, w, h;
+
+    if (windowed) {
+        // Real overlapped window: caption + sysmenu + minimize, no resize
+        // (the game can't react to client-area changes anyway).
+        style   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
+        exStyle = 0;
+
+        RECT rc{ 0, 0, cx, cy };
+        AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+        w = rc.right  - rc.left;
+        h = rc.bottom - rc.top;
+
+        // Position policy:
+        //   - First entry to windowed mode (or coming from a fullscreen-shaped
+        //     window): place inside the work area so the title bar isn't
+        //     jammed against the screen edge or hidden by the taskbar.
+        //   - Subsequent entries (init_hook re-runs, ALT+ENTER round trips):
+        //     keep whatever position the user has dragged the window to.
+        //     Without this, every toggle yanks the window back to center.
+        const int screenW = GetSystemMetrics(SM_CXSCREEN);
+        const int screenH = GetSystemMetrics(SM_CYSCREEN);
+
+        RECT cur{};
+        GetWindowRect(hwnd, &cur);
+        const bool looksFullscreenShaped =
+            (cur.left   <= 0 && cur.top    <= 0 &&
+             cur.right  >= screenW && cur.bottom >= screenH);
+        const bool firstPlacement = (cur.right - cur.left == 0);
+
+        if (looksFullscreenShaped || firstPlacement) {
+            // Center inside the work area (taskbar-aware).
+            RECT work{ 0, 0, screenW, screenH };
+            SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
+            const int workW = work.right  - work.left;
+            const int workH = work.bottom - work.top;
+            x = work.left + (workW - w) / 2;
+            y = work.top  + (workH - h) / 2;
+            if (x < work.left) x = work.left;
+            if (y < work.top)  y = work.top;
+        } else {
+            // Preserve current top-left.
+            x = cur.left;
+            y = cur.top;
+        }
+
+        // Track non-client offset — the engine's mouse code reads these
+        // to translate screen->client coords (same globals create_window
+        // writes on initial startup).
+        Var<int> dword_9874D4{ 0x009874D4 };
+        Var<int> dword_955158{ 0x00955158 };
+        dword_9874D4() = -rc.left;
+        dword_955158() = -rc.top;
+    } else {
+        // Borderless popup covering the whole screen. We use WS_POPUP +
+        // WS_EX_TOPMOST to match what the engine's fullscreen path builds.
+        style   = WS_POPUP | WS_VISIBLE;
+        exStyle = WS_EX_TOPMOST;
+        x = 0;
+        y = 0;
+        w = GetSystemMetrics(SM_CXSCREEN);
+        h = GetSystemMetrics(SM_CYSCREEN);
+
+        Var<int> dword_9874D4{ 0x009874D4 };
+        Var<int> dword_955158{ 0x00955158 };
+        dword_9874D4() = 0;
+        dword_955158() = 0;
+    }
+
+    // Apply style first, then move/resize with SWP_FRAMECHANGED so the
+    // new non-client area is recomputed.
+    SetWindowLongA(hwnd, GWL_STYLE,   static_cast<LONG>(style));
+    SetWindowLongA(hwnd, GWL_EXSTYLE, static_cast<LONG>(exStyle));
+
+    SetWindowPos(hwnd,
+                 windowed ? HWND_NOTOPMOST : HWND_TOPMOST,
+                 x, y, w, h,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+
+    // Re-clip the cursor to the new client rect in fullscreen, release in
+    // windowed. Matches what WM_DESTROY's ClipCursor(nullptr) cleans up.
+    if (windowed) {
+        ClipCursor(nullptr);
+    } else {
+        RECT clip;
+        if (GetClientRect(hwnd, &clip)) {
+            POINT tl{ clip.left,  clip.top    };
+            POINT br{ clip.right, clip.bottom };
+            ClientToScreen(hwnd, &tl);
+            ClientToScreen(hwnd, &br);
+            clip.left = tl.x; clip.top = tl.y;
+            clip.right = br.x; clip.bottom = br.y;
+            ClipCursor(&clip);
+        }
+    }
+
+    sp_log("apply_windowed_mode: %s\n", windowed ? "windowed" : "fullscreen");
+}
+
+// Back-compat shim — existing call sites (init_hook, ALT+ENTER) keep using
+// this name.
+void ToggleFullScreen(bool windowed)
+{
+    apply_windowed_mode(windowed);
 }
 
 void init_hook(HWND hwnd) {
@@ -358,6 +506,21 @@ void init_hook(HWND hwnd) {
 
     g_Windowed() = windowedMode;
     CDECL_CALL(0x0076E3E0, hwnd);
+	
+    g_config.WindowedMode = windowedMode;
+    g_Windowed() = windowedMode;
+    if (os_developer_options::instance) {
+        os_developer_options::instance->set_flag(mString{"WINDOW_DEFAULT"}, windowedMode);
+    }
+	
+					        if (os_developer_options::instance->get_flag(mString{ "ENABLE_FPU_EXCEPTION_HANDLING" }))
+        {
+
+                 os_developer_options::instance->set_flag(mString{ "ENABLE_FPU_EXCEPTION_HANDLING" }, g_config.EnableFpuExceptionHandling);
+
+ 
+        }
+	
 
     g_Windowed() = windowedMode;
     ToggleFullScreen(windowedMode);
@@ -445,8 +608,7 @@ BOOL install_patches()
         REDIRECT(0x007700D9, nglLoadMeshFileInternal);
         REDIRECT(0x00778649, nglLoadMeshFileInternal);
 		
-		        REDIRECT(0x004DCE59, entity_handle_manager::find_entity);
-        REDIRECT(0x0055D23E, entity_handle_manager::find_entity);
+		
 		    
 
 
@@ -638,7 +800,7 @@ void parse_cmd(const char *str)
                 g_is_the_packer() = true;
             } else if (strnicmp(i, "smokelevel", strlen(i)) == 0 ||
                        strnicmp(i, "runlevel", strlen(i)) == 0) {
-                strcpy(g_scene_name(), strtok(nullptr, " "));
+                strcpy(g_scene_name, strtok(nullptr, " "));
                 if (strnicmp(i, "smokelevel", strlen(i)) == 0) {
                     os_developer_options::instance->set_flag(75, true);
                 }
@@ -998,6 +1160,8 @@ void bink_set_sound_system() {
     CDECL_CALL(0x0060BBA0);
     //BinkSetSoundSystem(BinkOpenDirectSound, pUnkOuter());
 }
+
+
 
 bool get_path(const char *a1, const char *a2, char *out, unsigned int str_len) {
     if constexpr (1) {
@@ -1469,7 +1633,7 @@ int __stdcall myWinMain(HINSTANCE hInstance,
 
     ShowWindow(g_appHwnd(), 3);
 
-    g_Windowed() = 0;
+    g_Windowed() = g_config.WindowedMode;   // honor -windowed; was hard-coded to 0
     UpdateWindow(g_appHwnd());
     SetWindowPos(g_appHwnd(), nullptr, 0, 0, g_cx(), g_cy(), 4u);
 
@@ -2087,7 +2251,11 @@ void create_window(LPCSTR lpClassName,
     else                                // WINDOWED PATH
     {
         RECT Rect{0,0,a6,a7};
-        dwStylea = 0x80C80000;          // original game style
+        // Real overlapped window: caption + sysmenu + minimize, no resize.
+        // (Original game used 0x80C80000 = WS_POPUP|WS_CAPTION|WS_SYSMENU,
+        //  which is a valid but odd hybrid — Alt-Tab and dragging behave
+        //  poorly. WS_OVERLAPPED is what users expect.)
+        dwStylea = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
         AdjustWindowRectEx(&Rect, dwStylea, FALSE, 0);
 
         w = Rect.right  - Rect.left;
@@ -2098,10 +2266,12 @@ void create_window(LPCSTR lpClassName,
         dword_9874D4() = -Rect.left;
         dword_955158() = -Rect.top;
 
-        if (x == -1)
+        if (x == -1 || x == 0)
             x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
-        if (y == -1)
+        if (y == -1 || y == 0)
             y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
     }
 
     SetLastError(0);
@@ -2133,25 +2303,19 @@ void register_class_and_create_window(LPCSTR lpClassName,
                                       WNDPROC windowProc,
                                       HINSTANCE hInstance,
                                       int a9,
-                                      DWORD dwStyle) {
+                                      DWORD /*dwStyle*/) {
     if (g_appHwnd()) {
         DestroyWindow(g_appHwnd());
         g_appHwnd() = nullptr;
     }
-    const bool wnd = !g_config.WindowedMode;
-    create_window(lpClassName,
-                  lpWindowName,
-                  hInstance,
-                  X,
-                  Y,
-                  a5,
-                  a6,
-                  wnd ? 1u : 0u);
-				  
+
+    // Class must exist before CreateWindowExA can use it.
     register_class(lpClassName, windowProc, hInstance, a9);
 
-bool fullscreen = !g_config.WindowedMode; // default fullscreen, -windowed -> window
-create_window(lpClassName, lpWindowName, hInstance, X, Y, a5, a6, (DWORD)fullscreen);
+    // create_window's last param: nonzero = fullscreen path, zero = windowed path.
+    // -windowed (g_config.WindowedMode == true) -> 0 -> windowed path.
+    const DWORD fullscreen = g_config.WindowedMode ? 0u : 1u;
+    create_window(lpClassName, lpWindowName, hInstance, X, Y, a5, a6, fullscreen);
 }
 
 unsigned int hook_controlfp(unsigned int, unsigned int) {
@@ -2357,21 +2521,6 @@ static void *HookVTableFunction(void *pVTable, void *fnHookFunc, int nOffset) {
     return (void *) ptrOriginal;
 }
 
-typedef enum {
-    MENU_SELECT,
-    MENU_ACCEPT,
-    MENU_BACK,
-	MENU_START,
-
-    MENU_UP,
-    MENU_DOWN,
-    MENU_LEFT,
-    MENU_RIGHT,
-
-
-    MENU_KEY_MAX
-} MenuKey;
-
 uint32_t controllerKeys[MENU_KEY_MAX];
 uint32_t keys[256];
 
@@ -2432,6 +2581,12 @@ static constexpr DWORD MAX_ELEMENTS_PAGE = 18;
 
 void menu_setup(int game_state, int keyboard);
 void menu_input_handler(int keyboard, int SCROLL_SPEED);
+void menu_input_handler_empty_dbg_controls(int keyboard, int SCROLL_SPEED);
+
+// Defined further down next to apply_freeze_toggle(); forward-declared here
+// because GetDeviceStateHook (below) calls it when handling the TAB / L3
+// debug-menu focus toggle.
+static void set_hero_frozen(bool frozen);
 
 int is_menu_key_pressed(MenuKey key, int keyboard) {
     return (get_menu_key_value(key, keyboard) == 2);
@@ -2462,6 +2617,27 @@ void read_and_update_controller_key_dpad(LPDIJOYSTATE2 joy, int angle, MenuKey k
 }
 
 
+// Helper: treat a DirectInput axis as a digital direction.
+//   axis_value  : raw DIJOYSTATE2 axis (default DInput range 0..65535, centered at 32768)
+//   positive    : true => fires when axis is past center + threshold
+//                 false => fires when axis is below center - threshold
+//   key         : MenuKey slot to update
+static void read_and_update_controller_key_axis(LONG axis_value, bool positive, MenuKey key) {
+    constexpr LONG CENTER    = 32768;
+    constexpr LONG THRESHOLD = 8192;     // ~25% deflection
+
+    bool active = positive
+        ? (axis_value > CENTER + THRESHOLD)
+        : (axis_value < CENTER - THRESHOLD);
+
+    if (active) {
+        ++controllerKeys[key];
+    } else {
+        controllerKeys[key] = 0;
+    }
+}
+
+
 void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
 	LPDIJOYSTATE2 joy = (decltype(joy)) lpvData;
 
@@ -2474,6 +2650,22 @@ void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
 	read_and_update_controller_key_dpad(joy, 9000, MENU_RIGHT);
 	read_and_update_controller_key_dpad(joy, 18000, MENU_DOWN);
 	read_and_update_controller_key_dpad(joy, 27000, MENU_LEFT);
+
+	// L3 / R3 stick clicks (DS4 buttons 10 and 11 via DirectInput).
+	read_and_update_controller_key_button(joy, 10, MENU_L3);
+	read_and_update_controller_key_button(joy, 11, MENU_R3);
+
+	// Left analog stick directions (lX = horizontal, lY = vertical, up = small Y).
+	read_and_update_controller_key_axis(joy->lX, 13, MENU_L3_LEFT);
+	read_and_update_controller_key_axis(joy->lX, 14,  MENU_L3_RIGHT);
+	read_and_update_controller_key_axis(joy->lY, 15, MENU_L3_UP);
+	read_and_update_controller_key_axis(joy->lY, 16,  MENU_L3_DOWN);
+
+	// Right analog stick directions (DS4: lZ = horizontal, lRz = vertical, up = small).
+	read_and_update_controller_key_axis(joy->lZ,  17, MENU_R3_LEFT);
+	read_and_update_controller_key_axis(joy->lZ,  18,  MENU_R3_RIGHT);
+	read_and_update_controller_key_axis(joy->lRz, 19, MENU_R3_UP);
+	read_and_update_controller_key_axis(joy->lRz, 20,  MENU_R3_DOWN);
 }
 
 
@@ -2590,6 +2782,53 @@ else if (is_menu_key_clicked(MENU_LEFT, keyboard)) { // Use is_menu_key_clicked 
 }
 
 
+void menu_input_handler_empty_dbg_controls(int keyboard, int SCROLL_SPEED) {
+    if (is_menu_key_clicked(MENU_DOWN, keyboard)) {
+
+        int key_val = get_menu_key_value(MENU_DOWN, keyboard);
+        if (key_val == 1) {
+        }
+        else if ((key_val >= SCROLL_SPEED) && (key_val % SCROLL_SPEED == 0)) {
+
+        }
+    }
+    else if (is_menu_key_clicked(MENU_UP, keyboard)) {
+
+        int key_val = get_menu_key_value(MENU_UP, keyboard);
+        if (key_val == 1) {
+
+        }
+        else if ((key_val >= SCROLL_SPEED) && (key_val % SCROLL_SPEED == 0)) {
+        }
+    }
+    else if (is_menu_key_pressed(MENU_ACCEPT, keyboard))
+    {
+
+
+        //current_menu->handler(entry, ENTER);
+    }
+    else if (is_menu_key_pressed(MENU_BACK, keyboard)) {
+    }
+else if (is_menu_key_clicked(MENU_LEFT, keyboard)) { // Use is_menu_key_clicked here
+        debug_menu_entry* cur = &current_menu->entries[current_menu->window_start + current_menu->cur_index];
+        int key_val = get_menu_key_value(MENU_LEFT, keyboard);
+        if (key_val == 1) {
+        } else if ((key_val >= SCROLL_SPEED) && (key_val % SCROLL_SPEED == 0)) {
+        }
+    } else if (is_menu_key_clicked(MENU_RIGHT, keyboard)) { // Use is_menu_key_clicked here
+        debug_menu_entry* cur = &current_menu->entries[current_menu->window_start + current_menu->cur_index];
+        int key_val = get_menu_key_value(MENU_RIGHT, keyboard);
+        if (key_val == 1) {
+        } else if ((key_val >= SCROLL_SPEED) && (key_val % SCROLL_SPEED == 0)) {
+
+        }
+    }
+
+
+}
+
+
+
 
 
 typedef int (__stdcall* GetDeviceState_ptr)(IDirectInputDevice8*, DWORD, LPVOID);
@@ -2610,6 +2849,21 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* self, DWORD cbData, LP
 			GetDeviceStateHandleKeyboardInput(lpvData);
 		else if (cbData == sizeof(DIJOYSTATE2))
 			GetDeviceStateHandleControllerInput(lpvData);
+
+		// Global windowed-mode toggle on DIK_X.
+		//
+		// Placed here (before the g_state guard below) so the hotkey works
+		// in menus, loading screens, and frontends — not just during
+		// RUNNING. Edge-triggered with the same `keys[i] == 2; keys[i] = 0`
+		// pattern the debug menu uses, so a held key fires exactly once.
+		//
+		// This is parallel to the ALT+ENTER handler in WindowProc; both
+		// route through apply_windowed_mode so the three pieces (globals,
+		// D3D device, OS window) stay in sync.
+		if (cbData == 256 && keys[DIK_X] == 2) {
+			keys[DIK_X] = 0;
+			apply_windowed_mode(!g_config.WindowedMode);
+		}
 
 		int game_states = 0;
 		if (g_game_ptr)
@@ -2635,13 +2889,48 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* self, DWORD cbData, LP
         int keyboard = cbData == 256;
         menu_setup((int)g_state, keyboard);
 
-        if (debug_enabled) {
+        // --- Debug-menu focus toggle ---
+        // While the debug menu is on-screen (debug_enabled || debug_disabled),
+        // edge-detect TAB on the keyboard or L3 on the gamepad. Each press
+        // flips debug_menu::has_focus and re-syncs the hero-frozen flag so
+        // the two stay coupled:
+        //   has_focus == true  -> menu eats input, hero is frozen
+        //   has_focus == false -> menu still drawn (dimmed), input passes
+        //                         through to the game, hero can move
+        if (debug_enabled || debug_disabled) {
+            bool toggle = false;
+            if (keyboard && keys[DIK_TAB] == 2) {
+                keys[DIK_TAB] = 0;
+                toggle = true;
+            }
+            if (!keyboard && controllerKeys[MENU_SELECT] == 2) {
+                controllerKeys[MENU_SELECT] = 0;
+                toggle = true;
+            }
+            if (toggle) {
+                debug_menu::has_focus = !debug_menu::has_focus;
+                set_hero_frozen(debug_menu::has_focus);
+            }
+        }
+
+        // Route nav input to the menu ONLY when it owns focus. The original
+        // guard here was `if (debug_enabled, debug_disabled)` which is a
+        // comma operator -- it silently evaluated only `debug_disabled` and
+        // ignored `debug_enabled` entirely. Using the proper boolean OR plus
+        // the focus check fixes both bugs.
+        if ((debug_enabled || debug_disabled) && debug_menu::has_focus) {
             menu_input_handler(keyboard, 5);
         }
     }
-    if (debug_enabled) {
+
+    // Blank game input ONLY while the menu has focus. When the user has
+    // toggled focus off (TAB / L3) the menu stays drawn but input is
+    // forwarded to the hero -- this is the new "control the hero with
+    // the menu still up" behavior.
+    if ((debug_enabled || debug_disabled) && debug_menu::has_focus) {
         memset(lpvData, 0, cbData);
     }
+
 
 
     static constexpr struct {
@@ -3910,49 +4199,1698 @@ inline constexpr auto NUM_OPTIONS = 150u + 76u;
 typedef bool(__fastcall* entity_tracker_manager_get_the_arrow_target_pos_ptr)(void*, void*, vector3d*);
 entity_tracker_manager_get_the_arrow_target_pos_ptr entity_tracker_manager_get_the_arrow_target_pos = (entity_tracker_manager_get_the_arrow_target_pos_ptr)0x0062EE10;
 
-    void speed_motion_handler(debug_menu_entry* a1)
-    {
-        switch (a1->get_ival()) {
-		case 0u:
-		os_developer_options::instance->set_int(mString{ "FRAME_LIMIT" } ,0);			
-        g_timer()->normal_motion();
-            break;
-        case 1u:
-        os_developer_options::instance->set_int(mString{ "FRAME_LIMIT" } ,1);			
-        g_timer()->speed_motion();
-            break;
-        case 2u:
-        os_developer_options::instance->set_int(mString{ "FRAME_LIMIT" } ,2);			
-        g_timer()->super_speed_motion();
-            break;
-        case 3u:
-		os_developer_options::instance->set_int(mString{ "FRAME_LIMIT" } ,3);			
-        g_timer()->slow_motion();
-            break;
-	    case 4u:
-		os_developer_options::instance->set_int(mString{ "FRAME_LIMIT" } ,4);			
-        g_timer()->super_slow_motion();
-            break;
-		case 5u:
-		os_developer_options::instance->set_int(mString{ "FRAME_LIMIT" } ,5);			
-        g_timer()->normal_motion();
-            break;
-		case 1000u:
-		os_developer_options::instance->set_int(mString{ "FRAME_LIMIT" } ,1000);			
-        g_timer()->normal_motion();
-            break;
 
+
+
+
+
+void devopt_flags_handler(debug_menu_entry *a1)
+{
+    switch ( a1->get_id() )
+    {
+    case 0u: //CD_ONLY
+    {
+        os_developer_options::instance->set_flag(mString { "CD_ONLY" }, a1->get_bval());
+
+		
+        break;
     }
-	
-	    }
+    case 1u: //ENVMAP_TOOL
+    {
+        os_developer_options::instance->set_flag(mString { "ENVMAP_TOOL" }, a1->get_bval());
+
+        break;
+    }
+    case 2u: //NO_CD
+    {
+        os_developer_options::instance->set_flag(mString { "NO_CD" }, a1->get_bval());
+        break;
+    }
+    case 3u: //CHATTY_LOAD
+    {
+        os_developer_options::instance->set_flag(mString { "CHATTY_LOAD" }, a1->get_bval());
+        break;
+    }
+    case 4u: //WINDOW_DEFAULT
+    {
+        os_developer_options::instance->set_flag(mString { "WINDOW_DEFAULT" }, a1->get_bval());
+        break;
+    }
+    case 5u: //SHOW_FPS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_FPS" }, a1->get_bval());
+        break;
+    }
+    case 6u: //SHOW_STREAMER_INFO
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_STREAMER_INFO" }, a1->get_bval());
+        break;
+    }
+    case 7u: //SHOW_STREAMER_SPAM
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_STREAMER_SPAM" }, a1->get_bval());
+        break;
+    }
+    case 8u: //SHOW_RESOURCE_SPAM
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_RESOURCE_SPAM" }, a1->get_bval());
+        break;
+    }
+    case 9u: //SHOW_MEMORY_INFO
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_MEMORY_INFO" }, a1->get_bval());
+        break;
+    }
+    case 10u: //SHOW_SPIDEY_SPEED
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_SPIDEY_SPEED" }, a1->get_bval());
+        break;
+    }
+    case 11u: //TRACE_MISSION_MANAGER
+    {
+        os_developer_options::instance->set_flag(mString { "TRACE_MISSION_MANAGER" }, a1->get_bval());
+        break;
+    }
+    case 12u: //DUMP_MISSION_HEAP
+    {
+        os_developer_options::instance->set_flag(mString { "DUMP_MISSION_HEAP" }, a1->get_bval());
+        break;
+    }
+    case 13u: //CAMERA_CENTRIC_STREAMER
+    {
+        os_developer_options::instance->set_flag(mString { "CAMERA_CENTRIC_STREAMER" }, a1->get_bval());
+        break;
+    }
+    case 14u: //RENDER_LOWLODS
+    {
+        os_developer_options::instance->set_flag(mString { "RENDER_LOWLODS" }, a1->get_bval());
+        break;
+    }
+    case 15u: //LOAD_STRING_HASH_DICTIONARY
+    {
+        os_developer_options::instance->set_flag(mString { "LOAD_STRING_HASH_DICTIONARY" }, a1->get_bval());
+        break;
+    }
+    case 16u: //LOG_RUNTIME_STRING_HASHES
+    {
+        os_developer_options::instance->set_flag(mString { "LOG_RUNTIME_STRING_HASHES" }, a1->get_bval());
+        break;
+    }
+    case 17u: //SHOW_WATERMARK_VELOCITY
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_WATERMARK_VELOCITY" }, a1->get_bval());
+        break;
+    }
+    case 18u: //SHOW_STATS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_STATS" }, a1->get_bval());
+        break;
+    }
+    case 19u: //ENABLE_ZOOM_MAP
+    {
+        os_developer_options::instance->set_flag(mString { "ENABLE_ZOOM_MAP" }, a1->get_bval());
+        break;
+    }
+    case 20u: //SHOW_DEBUG_INFO
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_DEBUG_INFO" }, a1->get_bval());
+        break;
+    }
+    case 21u: //SHOW_PROFILE_INFO
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_PROFILE_INFO" }, a1->get_bval());
+        break;
+    }
+    case 22u: //SHOW_LOCOMOTION_INFO
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_LOCOMOTION_INFO" }, a1->get_bval());
+        break;
+    }
+    case 23u: //GRAVITY
+    {
+        os_developer_options::instance->set_flag(mString { "GRAVITY" }, a1->get_bval());
+        break;
+    }
+    case 24u: //TEST_MEMORY_LEAKS
+    {
+        os_developer_options::instance->set_flag(mString { "TEST_MEMORY_LEAKS" }, a1->get_bval());
+        break;
+    }
+    case 25u: //HALT_ON_ASSERTS
+    {
+        os_developer_options::instance->set_flag(mString { "HALT_ON_ASSERTS" }, a1->get_bval());
+        break;
+    }
+    case 26u: //SCREEN_ASSERTS
+    {
+        os_developer_options::instance->set_flag(mString { "SCREEN_ASSERTS" }, a1->get_bval());
+        break;
+    }
+    case 27u: //NO_ANIM_WARNINGS
+    {
+        os_developer_options::instance->set_flag(mString { "NO_ANIM_WARNINGS" }, a1->get_bval());
+        break;
+    }
+    case 28u: //PROFILING_ON
+    {
+        os_developer_options::instance->set_flag(mString { "PROFILING_ON" }, a1->get_bval());
+        break;
+    }
+    case 29u: //MONO_AUDIO
+    {
+        os_developer_options::instance->set_flag(mString { "MONO_AUDIO" }, a1->get_bval());
+        break;
+    }
+    case 30u: //NO_MESSAGES
+    {
+        os_developer_options::instance->set_flag(mString { "NO_MESSAGES" }, a1->get_bval());
+        break;
+    }
+    case 31u: //LOCK_STEP
+    {
+        os_developer_options::instance->set_flag(mString { "LOCK_STEP" }, a1->get_bval());
+        break;
+    }
+    case 32u: //TEXTURE_DUMP
+    {
+        os_developer_options::instance->set_flag(mString { "TEXTURE_DUMP" }, a1->get_bval());
+        break;
+    }
+    case 33u: //DISABLE_SOUND_WARNINGS
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_SOUND_WARNINGS" }, a1->get_bval());
+        break;
+    }
+    case 34u: //DISABLE_SOUND_DEBUG_OUTPUT
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_SOUND_DEBUG_OUTPUT" }, a1->get_bval());
+        break;
+    }
+    case 35u: //DELETE_UNUSED_SOUND_BANKS_ON_PACK
+    {
+        os_developer_options::instance->set_flag(mString { "DELETE_UNUSED_SOUND_BANKS_ON_PACK" }, a1->get_bval());
+        break;
+    }
+    case 36u: //LOCKED_HERO
+    {
+        os_developer_options::instance->set_flag(mString { "LOCKED_HERO" }, a1->get_bval());
+        break;
+    }
+    case 37u: //FOG_OVERR IDE
+    {
+        os_developer_options::instance->set_flag(mString { "FOG_OVERR IDE" }, a1->get_bval());
+        break;
+    }
+    case 38u: //FOG_DISABLE
+    {
+        os_developer_options::instance->set_flag(mString { "FOG_DISABLE" }, a1->get_bval());
+        break;
+    }
+    case 39u: //MOVE_EDITOR
+    {
+        os_developer_options::instance->set_flag(mString { "MOVE_EDITOR" }, a1->get_bval());
+        break;
+    }
+    case 40u: //AI_PATH_DEBUG
+    {
+        os_developer_options::instance->set_flag(mString { "AI_PATH_DEBUG" }, a1->get_bval());
+        break;
+    }
+    case 41u: //AI_PATH_COLOR
+    {
+        os_developer_options::instance->set_flag(mString { "AI_PATH_COLOR" }, a1->get_bval());
+        break;
+    }
+    case 42u: //AI_CRITTER_ACTIVITY
+    {
+        os_developer_options::instance->set_flag(mString { "AI_CRITTER_ACTIVITY" }, a1->get_bval());
+        break;
+    }
+    case 43u: //AI_PATH_COLOR_CRITTER
+    {
+        os_developer_options::instance->set_flag(mString { "AI_PATH_COLOR_CRITTER" }, a1->get_bval());
+        break;
+    }
+    case 44u: //AI_PATH_COLOR_HERO
+    {
+        os_developer_options::instance->set_flag(mString { "AI_PATH_COLOR_HERO" }, a1->get_bval());
+        break;
+    }
+    case 45u: //NO_PARTICLES
+    {
+        os_developer_options::instance->set_flag(mString { "NO_PARTICLES" }, a1->get_bval());
+        break;
+    }
+    case 46u: //NO_PARTICLE_PUMP
+    {
+        os_developer_options::instance->set_flag(mString { "NO_PARTICLE_PUMP" }, a1->get_bval());
+        break;
+    }
+    case 47u: //SHOW_NORMALS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_NORMALS" }, a1->get_bval());
+        break;
+    }
+    case 48u: //SHOW_SHADOW_BALL
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_SHADOW_BALL" }, a1->get_bval());
+        break;
+    }
+    case 49u: //SHOW_LIGHTS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_LIGHTS" }, a1->get_bval());
+        break;
+    }
+    case 50u: //SHOW_PLRCTRL
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_PLRCTRL" }, a1->get_bval());
+        break;
+    }
+    case 51u: //SHOW_PSX_INFO
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_PSX_INFO" }, a1->get_bval());
+        break;
+    }
+    case 52u: //FLAT_SHADE
+    {
+        os_developer_options::instance->set_flag(mString { "FLAT_SHADE" }, a1->get_bval());
+        break;
+    }
+    case 53u: //INTERFACE_DISABLE
+    {
+        os_developer_options::instance->set_flag(mString { "INTERFACE_DISABLE" }, a1->get_bval());
+        break;
+    }
+    case 54u: //WIDGET_TOOLS
+    {
+        os_developer_options::instance->set_flag(mString { "WIDGET_TOOLS" }, a1->get_bval());
+        break;
+    }
+    case 55u: //LIGHTING
+    {
+        os_developer_options::instance->set_flag(mString { "LIGHTING" }, a1->get_bval());
+        break;
+    }
+    case 56u: //FAKE_POINT_LIGHTS
+    {
+        os_developer_options::instance->set_flag(mString { "FAKE_POINT_LIGHTS" }, a1->get_bval());
+        break;
+    }
+    case 57u: //BSP_SPRAY_PAINT
+    {
+        os_developer_options::instance->set_flag(mString { "BSP_SPRAY_PAINT" }, a1->get_bval());
+        break;
+    }
+    case 58u: //CAMERA_EDITOR
+    {
+        os_developer_options::instance->set_flag(mString { "CAMERA_EDITOR" }, a1->get_bval());
+        break;
+    }
+    case 59u: //IGNORE_RAMPING
+    {
+        os_developer_options::instance->set_flag(mString { "IGNORE_RAMPING" }, a1->get_bval());
+        break;
+    }
+    case 60u: //POINT_SAMPLE
+    {
+        os_developer_options::instance->set_flag(mString { "POINT_SAMPLE" }, a1->get_bval());
+        break;
+    }
+    case 61u: //DISTANCE_FADING
+    {
+        os_developer_options::instance->set_flag(mString { "DISTANCE_FADING" }, a1->get_bval());
+        break;
+    }
+    case 62u: //OVERRIDE_CONTROLLER_OPTIONS
+    {
+        os_developer_options::instance->set_flag(mString { "OVERRIDE_CONTROLLER_OPTIONS" }, a1->get_bval());
+        break;
+    }
+    case 63u: //DISABLE_MOUSE_PLAYER_CONTROL
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_MOUSE_PLAYER_CONTROL" }, a1->get_bval());
+        break;
+    }
+    case 64u: //NO_MOVIES
+    {
+        os_developer_options::instance->set_flag(mString { "NO_MOVIES" }, a1->get_bval());
+        break;
+    }
+    case 65u: //XBOX_USER_CAM
+    {
+        os_developer_options::instance->set_flag(mString { "XBOX_USER_CAM" }, a1->get_bval());
+        break;
+    }
+    case 66u: //NO_LOAD_SCREEN
+    {
+        os_developer_options::instance->set_flag(mString { "NO_LOAD_SCREEN" }, a1->get_bval());
+        break;
+    }
+    case 67u: //EXCEPTION_HANDLER
+    {
+        os_developer_options::instance->set_flag(mString { "EXCEPTION_HANDLER" }, a1->get_bval());
+        break;
+    }
+    case 68u: //NO_EXCEPTION_HANDLER
+    {
+        os_developer_options::instance->set_flag(mString { "NO_EXCEPTION_HANDLER" }, a1->get_bval());
+        break;
+    }
+    case 69u: //NO_CD_CHECK
+    {
+        os_developer_options::instance->set_flag(mString { "NO_CD_CHECK" }, a1->get_bval());
+        break;
+    }
+    case 70u: //NO_LOAD_METER
+    {
+        os_developer_options::instance->set_flag(mString { "NO_LOAD_METER" }, a1->get_bval());
+        break;
+    }
+    case 71u: //NO_MOVIE_BUFFER_WARNING
+    {
+        os_developer_options::instance->set_flag(mString { "NO_MOVIE_BUFFER_WARNING" }, a1->get_bval());
+        break;
+    }
+    case 72u: //LIMITED_EDITION_DISC
+    {
+        os_developer_options::instance->set_flag(mString { "LIMITED_EDITION_DISC" }, a1->get_bval());
+        break;
+    }
+    case 73u: //NEW_COMBAT_LOCO
+    {
+        os_developer_options::instance->set_flag(mString { "NEW_COMBAT_LOCO" }, a1->get_bval());
+        break;
+    }
+    case 74u: //LEVEL_WARP
+    {
+        os_developer_options::instance->set_flag(mString { "LEVEL_WARP" }, a1->get_bval());
+        break;
+    }
+    case 75u: //SMOKE_TEST
+    {
+        os_developer_options::instance->set_flag(mString { "SMOKE_TEST" }, a1->get_bval());
+        break;
+    }
+    case 76u: //SMOKE_TEST_LEVEL
+    {
+        os_developer_options::instance->set_flag(mString { "SMOKE_TEST_LEVEL" }, a1->get_bval());
+        break;
+    }
+    case 77u: //COMBO_TESTER
+    {
+        os_developer_options::instance->set_flag(mString { "COMBO_TESTER" }, a1->get_bval());
+        break;
+    }
+    case 78u: //DROP _SHADOWS_ALWAYS_RAYCAST
+    {
+        os_developer_options::instance->set_flag(mString { "DROP _SHADOWS_ALWAYS_RAYCAST" }, a1->get_bval());
+        break;
+    }
+    case 79u: //DISABLE_DROP_SHADOWS
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_DROP_SHADOWS" }, a1->get_bval());
+        break;
+    }
+    case 80u: //DISABLE_HIRES_SHADOWS
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_HIRES_SHADOWS" }, a1->get_bval());
+        break;
+    }
+    case 81u: //DISABLE_STENCIL_SHADOWS
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_STENCIL_SHADOWS" }, a1->get_bval());
+        break;
+    }
+    case 82u: //DISABLE_COLORVOLS
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_COLORVOLS" }, a1->get_bval());
+        break;
+    }
+    case 83u: //DISABLE_RENDER_ENTS
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_RENDER_ENTS" }, a1->get_bval());
+        break;
+    }
+    case 84u: //DISABLE_FULLSCREEN_BLUR
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_FULLSCREEN_BLUR" }, a1->get_bval());
+        break;
+    }
+    case 85u: //FORCE_TIGHTCRAWL
+    {
+        os_developer_options::instance->set_flag(mString { "FORCE_TIGHTCRAWL" }, a1->get_bval());
+        break;
+    }
+    case 86u: //FORCE_NONCRAWL
+    {
+        os_developer_options::instance->set_flag(mString { "FORCE_NONCRAWL" }, a1->get_bval());
+        break;
+    }
+    case 87u: //SHOW_DEBUG_TEXT
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_DEBUG_TEXT" }, a1->get_bval());
+        break;
+    }
+    case 88u: //SHOW_STYLE_POINTS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_STYLE_POINTS" }, a1->get_bval());
+        break;
+    }
+    case 89u: //CAMERA_MOUSE_MODE
+    {
+        os_developer_options::instance->set_flag(mString { "CAMERA_MOUSE_MODE" }, a1->get_bval());
+        break;
+    }
+    case 90u: //USERCAM_ON_CONTROLLER2
+    {
+        os_developer_options::instance->set_flag(mString { "USERCAM_ON_CONTROLLER2" }, a1->get_bval());
+        break;
+    }
+    case 91u: //DISABLE_ANCHOR_RETICLE_RENDERING
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_ANCHOR_RETICLE_RENDERING" }, a1->get_bval());
+        break;
+    }
+    case 92u: //SHOW_ANCHOR_LINE
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_ANCHOR_LINE" }, a1->get_bval());
+        break;
+    }
+    case 93u: //FREE_SPIDER_REFLEXES
+    {
+        os_developer_options::instance->set_flag(mString { "FREE_SPIDER_REFLEXES" }, a1->get_bval());
+        break;
+    }
+    case 94u: //SHOW_BAR_OF_SHAME
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_BAR_OF_SHAME" }, a1->get_bval());
+        break;
+    }
+    case 95u: //SHOW_ENEMY_HEALTH_WIDGETS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_ENEMY_HEALTH_WIDGETS" }, a1->get_bval());
+        break;
+    }
+    case 96u: //ALLOW_IGC_PAUSE
+    {
+        os_developer_options::instance->set_flag(mString { "ALLOW_IGC_PAUSE" }, a1->get_bval());
+        break;
+    }
+    case 97u: //SHOW_OBBS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_OBBS" }, a1->get_bval());
+        break;
+    }
+    case 98u: //SHOW_DISTRICTS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_DISTRICTS" }, a1->get_bval());
+        break;
+    }
+    case 99u: //SHOW_CHUCK_DEBUGGER
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_CHUCK_DEBUGGER" }, a1->get_bval());
+        break;
+    }
+    case 100u: //CHUCK_OLD_FASHIONED
+    {
+        os_developer_options::instance->set_flag(mString { "CHUCK_OLD_FASHIONED" }, a1->get_bval());
+        break;
+    }
+    case 101u: //CHUCK_DISABLE_BREAKPOINTS
+    {
+        os_developer_options::instance->set_flag(mString { "CHUCK_DISABLE_BREAKPOINTS" }, a1->get_bval());
+        break;
+    }
+    case 102u: //SHOW_AUDIO_BOXES
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_AUDIO_BOXES" }, a1->get_bval());
+        break;
+    }
+    case 103u: //DISABLE_SOUNDS
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_SOUNDS" }, a1->get_bval());
+        break;
+    }
+    case 104u: //SHOW_TERRAIN_INFO
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_TERRAIN_INFO" }, a1->get_bval());
+        break;
+    }
+    case 105u: //DISABLE_AUDIO_BOXES
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_AUDIO_BOXES" }, a1->get_bval());
+        break;
+    }
+    case 106u: //NSL_OLD_FASHIONED
+    {
+        os_developer_options::instance->set_flag(mString { "NSL_OLD_FASHIONED" }, a1->get_bval());
+        break;
+    }
+    case 107u: //SHOW_MASTER_CLOCK
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_MASTER_CLOCK" }, a1->get_bval());
+        break;
+    }
+    case 108u: //LOAD_GRADIENTS
+    {
+        os_developer_options::instance->set_flag(mString { "LOAD_GRADIENTS" }, a1->get_bval());
+        break;
+    }
+    case 109u: //BONUS_LEVELS_AVAILABLE
+    {
+        os_developer_options::instance->set_flag(mString { "BONUS_LEVELS_AVAILABLE" }, a1->get_bval());
+        break;
+    }
+    case 110u: //COMBAT_DISPLAY
+    {
+        os_developer_options::instance->set_flag(mString { "COMBAT_DISPLAY" }, a1->get_bval());
+        break;
+    }
+    case 111u: //COMBAT_DEBUGGER
+    {
+        os_developer_options::instance->set_flag(mString { "COMBAT_DEBUGGER" }, a1->get_bval());
+        break;
+    }
+    case 112u: //ALLOW_ERROR_POPUPS
+    {
+        os_developer_options::instance->set_flag(mString { "ALLOW_ERROR_POPUPS" }, a1->get_bval());
+        break;
+    }
+    case 113u: //ALLOW_WARNING_POPUPS
+    {
+        os_developer_options::instance->set_flag(mString { "ALLOW_WARNING_POPUPS" }, a1->get_bval());
+        break;
+    }
+    case 114u: //OUTPUT_WARNING_DISABLE
+    {
+        os_developer_options::instance->set_flag(mString { "OUTPUT_WARNING_DISABLE" }, a1->get_bval());
+        break;
+    }
+    case 115u: //OUTPUT_ASSERT_DISABLE
+    {
+        os_developer_options::instance->set_flag(mString { "OUTPUT_ASSERT_DISABLE" }, a1->get_bval());
+        break;
+    }
+    case 116u: //ASSERT_ON_WARNING
+    {
+        os_developer_options::instance->set_flag(mString { "ASSERT_ON_WARNING" }, a1->get_bval());
+        break;
+    }
+    case 117u: //ALWAYS_ACTIVE
+    {
+        os_developer_options::instance->set_flag(mString { "ALWAYS_ACTIVE" }, a1->get_bval());
+        break;
+    }
+    case 118u: //FORCE_PROGRESSION
+    {
+        os_developer_options::instance->set_flag(mString { "FORCE_PROGRESSION" }, a1->get_bval());
+        break;
+    }
+    case 119u: //LINK
+    {
+        os_developer_options::instance->set_flag(mString { "LINK" }, a1->get_bval());
+        break;
+    }
+    case 120u: //WAIT_FOR_LINK
+    {
+        os_developer_options::instance->set_flag(mString { "WAIT_FOR_LINK" }, a1->get_bval());
+        break;
+    }
+    case 121u: //SHOW_END_OF_PACK
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_END_OF_PACK" }, a1->get_bval());
+        break;
+    }
+    case 122u: //LIVE_IN_GLASS_HOUSE
+    {
+        os_developer_options::instance->set_flag(mString { "LIVE_IN_GLASS_HOUSE" }, a1->get_bval());
+        break;
+    }
+    case 123u: //SHOW_GLASS_HOUSE
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_GLASS_HOUSE" }, a1->get_bval());
+        break;
+    }
+    case 124u: //DISABLE_RACE_PREVIEW
+    {
+        os_developer_options::instance->set_flag(mString { "DISABLE_RACE_PREVIEW" }, a1->get_bval());
+        break;
+    }
+    case 125u: //FREE_MINI_MAP
+    {
+        os_developer_options::instance->set_flag(mString { "FREE_MINI_MAP" }, a1->get_bval());
+        break;
+    }
+    case 126u: //SHOW_LOOPING_ANIM_WARNINGS
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_LOOPING_ANIM_WARNINGS" }, a1->get_bval());
+        break;
+    }
+    case 127u: //SHOW_PERF_INFO
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_PERF_INFO" }, a1->get_bval());
+        break;
+    }
+    case 128u: //COPY_ERROR_TO_CLIPBOARD
+    {
+        os_developer_options::instance->set_flag(mString { "COPY_ERROR_TO_CLIPBOARD" }, a1->get_bval());
+        break;
+    }
+    case 129u: //BOTH_HANDS_UP_REORIENT
+    {
+        os_developer_options::instance->set_flag(mString { "BOTH_HANDS_UP_REORIENT" }, a1->get_bval());
+        break;
+    }
+    case 130u: //SHOW_CAMERA_PROJECTION
+    {
+        os_developer_options::instance->set_flag(mString { "SHOW_CAMERA_PROJECTION" }, a1->get_bval());
+        break;
+    }
+    case 131u: //OLD_DEFAULT_CONTROL_SETTINGS
+    {
+        os_developer_options::instance->set_flag(mString { "OLD_DEFAULT_CONTROL_SETTINGS" }, a1->get_bval());
+        break;
+    }
+    case 132u: //IGC_SPEED_CONTROL
+    {
+        os_developer_options::instance->set_flag(mString { "IGC_SPEED_CONTROL" }, a1->get_bval());
+        break;
+    }
+    case 133u: //RTDT_ENABLED
+    {
+        os_developer_options::instance->set_flag(mString { "RTDT_ENABLED" }, a1->get_bval());
+        break;
+    }
+    case 134u: //ENABLE_DECALS
+    {
+        os_developer_options::instance->set_flag(mString { "ENABLE_DECALS" }, a1->get_bval());
+        break;
+    }
+    case 135u: //AUTO_STICK_TO_WALLS
+    {
+        os_developer_options::instance->set_flag(mString { "AUTO_STICK_TO_WALLS" }, a1->get_bval());
+        break;
+    }
+    case 136u: //ENABLE_PEDESTRIANS
+    {
+        os_developer_options::instance->set_flag(mString { "ENABLE_PEDESTRIANS" }, a1->get_bval());
+        break;
+    }
+    case 137u: //CAMERA_INVERT_LOOKAROUND
+    {
+        os_developer_options::instance->set_flag(mString { "CAMERA_INVERT_LOOKAROUND" }, a1->get_bval());
+        break;
+    }
+    case 138u: //CAMERA_INVERT_LOOKAROUND_X
+    {
+        os_developer_options::instance->set_flag(mString { "CAMERA_INVERT_LOOKAROUND_X" }, a1->get_bval());
+        break;
+    }
+    case 139u: //CAMERA_INVERT_LOOKAROUND_Y
+    {
+        os_developer_options::instance->set_flag(mString { "CAMERA_INVERT_LOOKAROUND_Y" }, a1->get_bval());
+        break;
+    }
+    case 140u: //FORCE_COMBAT_CAMERA_OFF
+    {
+        os_developer_options::instance->set_flag(mString { "FORCE_COMBAT_CAMERA_OFF" }, a1->get_bval());
+        break;
+    }
+    case 141u: //DISPLAY_THOUGHT_BUBBLES
+    {
+        os_developer_options::instance->set_flag(mString { "DISPLAY_THOUGHT_BUBBLES" }, a1->get_bval());
+        break;
+    }
+    case 142u: //ENABLE_DEBUG_LOG
+    {
+        os_developer_options::instance->set_flag(mString { "ENABLE_DEBUG_LOG" }, a1->get_bval());
+        break;
+    }
+    case 143u: //ENABLE_LONG_CALLSTACK
+    {
+        os_developer_options::instance->set_flag(mString { "ENABLE_LONG_CALLSTACK" }, a1->get_bval());
+        break;
+    }
+    case 144u: //RENDER_FE_UI
+    {
+        os_developer_options::instance->set_flag(mString { "RENDER_FE_UI" }, a1->get_bval());
+        break;
+    }
+    case 145u: //LOCK_INTERIORS
+    {
+        os_developer_options::instance->set_flag(mString { "LOCK_INTERIORS" }, a1->get_bval());
+        break;
+    }
+    case 146u: //MEMCHECK_ON_LOAD
+    {
+        os_developer_options::instance->set_flag(mString { "MEMCHECK_ON_LOAD" }, a1->get_bval());
+        break;
+    }
+    case 147u: //DISPLAY_ALS_USAGE_PROFILE
+    {
+        os_developer_options::instance->set_flag(mString { "DISPLAY_ALS_USAGE_PROFILE" }, a1->get_bval());
+        break;
+    }
+    case 148u: //ENABLE_FPU_EXCEPTION_HANDLING
+    {
+        os_developer_options::instance->set_flag(mString { "ENABLE_FPU_EXCEPTION_HANDLING" }, false);
+        break;
+    }
+    case 149u: //UNLOCK_ALL_UNLOCKABLES
+    {
+        os_developer_options::instance->set_flag(mString { "UNLOCK_ALL_UNLOCKABLES" }, a1->get_bval());
+        break;
+    }
+    default:
+        return;
+    }
+}
+
 
 
 void create_devopt_menu(debug_menu* parent)
 {
     assert(parent != nullptr);
-
-    auto* v22 = create_menu("Devopts", handle_game_entry, 300);
-
+ 
+    auto* game_menu = create_menu("Devopts");
+    auto* v92       = game_menu;
+    auto* v4        = create_menu_entry(game_menu);
+ 
+    parent->add_entry(v4);
+ 
+    debug_menu_entry v89;
+ 
+    // === BEGIN GENERATED FLAG ENTRIES (150 total, indices 0..149) =========
+    // Generated from os_developer_options.cpp::g_flag_names; do not hand-edit
+    // individual entries — regenerate the whole block if a flag is added or
+    // renamed in g_flag_names. Two flag names contain embedded spaces
+    // ("FOG_OVERR IDE", "DROP _SHADOWS_ALWAYS_RAYCAST"); these are typos in
+    // the original game data preserved verbatim because flag lookups are
+    // exact-string matches.
+ 
+    v89 = debug_menu_entry(mString{ "CD_ONLY" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CD_ONLY" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(0);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ENVMAP_TOOL" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ENVMAP_TOOL" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(1);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_CD" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_CD" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(2);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CHATTY_LOAD" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CHATTY_LOAD" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(3);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "WINDOW_DEFAULT" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "WINDOW_DEFAULT" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(4);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_FPS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_FPS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(5);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_STREAMER_INFO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_STREAMER_INFO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(6);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_STREAMER_SPAM" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_STREAMER_SPAM" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(7);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_RESOURCE_SPAM" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_RESOURCE_SPAM" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(8);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_MEMORY_INFO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_MEMORY_INFO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(9);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_SPIDEY_SPEED" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_SPIDEY_SPEED" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(10);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "TRACE_MISSION_MANAGER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "TRACE_MISSION_MANAGER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(11);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DUMP_MISSION_HEAP" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DUMP_MISSION_HEAP" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(12);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CAMERA_CENTRIC_STREAMER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CAMERA_CENTRIC_STREAMER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(13);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "RENDER_LOWLODS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "RENDER_LOWLODS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(14);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LOAD_STRING_HASH_DICTIONARY" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LOAD_STRING_HASH_DICTIONARY" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(15);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LOG_RUNTIME_STRING_HASHES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LOG_RUNTIME_STRING_HASHES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(16);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_WATERMARK_VELOCITY" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_WATERMARK_VELOCITY" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(17);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_STATS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_STATS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(18);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ENABLE_ZOOM_MAP" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ENABLE_ZOOM_MAP" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(19);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_DEBUG_INFO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_DEBUG_INFO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(20);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_PROFILE_INFO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_PROFILE_INFO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(21);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_LOCOMOTION_INFO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_LOCOMOTION_INFO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(22);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "GRAVITY" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "GRAVITY" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(23);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "TEST_MEMORY_LEAKS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "TEST_MEMORY_LEAKS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(24);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "HALT_ON_ASSERTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "HALT_ON_ASSERTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(25);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SCREEN_ASSERTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SCREEN_ASSERTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(26);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_ANIM_WARNINGS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_ANIM_WARNINGS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(27);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "PROFILING_ON" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "PROFILING_ON" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(28);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "MONO_AUDIO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "MONO_AUDIO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(29);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_MESSAGES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_MESSAGES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(30);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LOCK_STEP" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LOCK_STEP" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(31);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "TEXTURE_DUMP" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "TEXTURE_DUMP" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(32);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_SOUND_WARNINGS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_SOUND_WARNINGS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(33);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_SOUND_DEBUG_OUTPUT" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_SOUND_DEBUG_OUTPUT" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(34);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DELETE_UNUSED_SOUND_BANKS_ON_PACK" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DELETE_UNUSED_SOUND_BANKS_ON_PACK" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(35);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LOCKED_HERO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LOCKED_HERO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(36);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FOG_OVERR IDE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FOG_OVERR IDE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(37);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FOG_DISABLE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FOG_DISABLE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(38);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "MOVE_EDITOR" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "MOVE_EDITOR" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(39);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "AI_PATH_DEBUG" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "AI_PATH_DEBUG" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(40);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "AI_PATH_COLOR" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "AI_PATH_COLOR" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(41);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "AI_CRITTER_ACTIVITY" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "AI_CRITTER_ACTIVITY" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(42);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "AI_PATH_COLOR_CRITTER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "AI_PATH_COLOR_CRITTER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(43);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "AI_PATH_COLOR_HERO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "AI_PATH_COLOR_HERO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(44);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_PARTICLES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_PARTICLES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(45);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_PARTICLE_PUMP" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_PARTICLE_PUMP" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(46);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_NORMALS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_NORMALS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(47);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_SHADOW_BALL" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_SHADOW_BALL" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(48);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_LIGHTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_LIGHTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(49);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_PLRCTRL" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_PLRCTRL" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(50);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_PSX_INFO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_PSX_INFO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(51);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FLAT_SHADE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FLAT_SHADE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(52);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "INTERFACE_DISABLE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "INTERFACE_DISABLE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(53);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "WIDGET_TOOLS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "WIDGET_TOOLS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(54);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LIGHTING" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LIGHTING" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(55);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FAKE_POINT_LIGHTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FAKE_POINT_LIGHTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(56);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "BSP_SPRAY_PAINT" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "BSP_SPRAY_PAINT" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(57);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CAMERA_EDITOR" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CAMERA_EDITOR" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(58);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "IGNORE_RAMPING" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "IGNORE_RAMPING" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(59);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "POINT_SAMPLE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "POINT_SAMPLE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(60);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISTANCE_FADING" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISTANCE_FADING" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(61);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "OVERRIDE_CONTROLLER_OPTIONS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "OVERRIDE_CONTROLLER_OPTIONS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(62);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_MOUSE_PLAYER_CONTROL" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_MOUSE_PLAYER_CONTROL" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(63);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_MOVIES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_MOVIES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(64);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "XBOX_USER_CAM" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "XBOX_USER_CAM" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(65);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_LOAD_SCREEN" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_LOAD_SCREEN" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(66);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "EXCEPTION_HANDLER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "EXCEPTION_HANDLER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(67);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_EXCEPTION_HANDLER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_EXCEPTION_HANDLER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(68);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_CD_CHECK" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_CD_CHECK" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(69);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_LOAD_METER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_LOAD_METER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(70);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NO_MOVIE_BUFFER_WARNING" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NO_MOVIE_BUFFER_WARNING" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(71);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LIMITED_EDITION_DISC" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LIMITED_EDITION_DISC" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(72);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NEW_COMBAT_LOCO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NEW_COMBAT_LOCO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(73);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LEVEL_WARP" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LEVEL_WARP" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(74);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SMOKE_TEST" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SMOKE_TEST" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(75);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SMOKE_TEST_LEVEL" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SMOKE_TEST_LEVEL" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(76);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "COMBO_TESTER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "COMBO_TESTER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(77);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DROP _SHADOWS_ALWAYS_RAYCAST" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DROP _SHADOWS_ALWAYS_RAYCAST" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(78);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_DROP_SHADOWS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_DROP_SHADOWS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(79);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_HIRES_SHADOWS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_HIRES_SHADOWS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(80);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_STENCIL_SHADOWS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_STENCIL_SHADOWS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(81);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_COLORVOLS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_COLORVOLS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(82);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_RENDER_ENTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_RENDER_ENTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(83);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_FULLSCREEN_BLUR" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_FULLSCREEN_BLUR" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(84);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FORCE_TIGHTCRAWL" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FORCE_TIGHTCRAWL" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(85);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FORCE_NONCRAWL" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FORCE_NONCRAWL" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(86);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_DEBUG_TEXT" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_DEBUG_TEXT" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(87);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_STYLE_POINTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_STYLE_POINTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(88);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CAMERA_MOUSE_MODE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CAMERA_MOUSE_MODE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(89);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "USERCAM_ON_CONTROLLER2" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "USERCAM_ON_CONTROLLER2" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(90);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_ANCHOR_RETICLE_RENDERING" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_ANCHOR_RETICLE_RENDERING" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(91);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_ANCHOR_LINE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_ANCHOR_LINE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(92);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FREE_SPIDER_REFLEXES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FREE_SPIDER_REFLEXES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(93);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_BAR_OF_SHAME" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_BAR_OF_SHAME" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(94);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_ENEMY_HEALTH_WIDGETS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_ENEMY_HEALTH_WIDGETS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(95);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ALLOW_IGC_PAUSE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ALLOW_IGC_PAUSE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(96);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_OBBS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_OBBS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(97);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_DISTRICTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_DISTRICTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(98);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_CHUCK_DEBUGGER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_CHUCK_DEBUGGER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(99);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CHUCK_OLD_FASHIONED" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CHUCK_OLD_FASHIONED" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(100);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CHUCK_DISABLE_BREAKPOINTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CHUCK_DISABLE_BREAKPOINTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(101);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_AUDIO_BOXES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_AUDIO_BOXES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(102);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_SOUNDS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_SOUNDS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(103);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_TERRAIN_INFO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_TERRAIN_INFO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(104);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_AUDIO_BOXES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_AUDIO_BOXES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(105);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "NSL_OLD_FASHIONED" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "NSL_OLD_FASHIONED" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(106);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_MASTER_CLOCK" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_MASTER_CLOCK" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(107);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LOAD_GRADIENTS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LOAD_GRADIENTS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(108);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "BONUS_LEVELS_AVAILABLE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "BONUS_LEVELS_AVAILABLE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(109);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "COMBAT_DISPLAY" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "COMBAT_DISPLAY" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(110);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "COMBAT_DEBUGGER" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "COMBAT_DEBUGGER" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(111);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ALLOW_ERROR_POPUPS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ALLOW_ERROR_POPUPS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(112);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ALLOW_WARNING_POPUPS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ALLOW_WARNING_POPUPS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(113);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "OUTPUT_WARNING_DISABLE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "OUTPUT_WARNING_DISABLE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(114);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "OUTPUT_ASSERT_DISABLE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "OUTPUT_ASSERT_DISABLE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(115);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ASSERT_ON_WARNING" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ASSERT_ON_WARNING" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(116);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ALWAYS_ACTIVE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ALWAYS_ACTIVE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(117);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FORCE_PROGRESSION" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FORCE_PROGRESSION" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(118);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LINK" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LINK" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(119);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "WAIT_FOR_LINK" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "WAIT_FOR_LINK" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(120);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_END_OF_PACK" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_END_OF_PACK" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(121);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LIVE_IN_GLASS_HOUSE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LIVE_IN_GLASS_HOUSE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(122);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_GLASS_HOUSE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_GLASS_HOUSE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(123);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISABLE_RACE_PREVIEW" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISABLE_RACE_PREVIEW" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(124);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FREE_MINI_MAP" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FREE_MINI_MAP" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(125);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_LOOPING_ANIM_WARNINGS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_LOOPING_ANIM_WARNINGS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(126);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_PERF_INFO" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_PERF_INFO" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(127);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "COPY_ERROR_TO_CLIPBOARD" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "COPY_ERROR_TO_CLIPBOARD" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(128);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "BOTH_HANDS_UP_REORIENT" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "BOTH_HANDS_UP_REORIENT" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(129);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "SHOW_CAMERA_PROJECTION" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "SHOW_CAMERA_PROJECTION" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(130);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "OLD_DEFAULT_CONTROL_SETTINGS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "OLD_DEFAULT_CONTROL_SETTINGS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(131);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "IGC_SPEED_CONTROL" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "IGC_SPEED_CONTROL" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(132);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "RTDT_ENABLED" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "RTDT_ENABLED" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(133);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ENABLE_DECALS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ENABLE_DECALS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(134);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "AUTO_STICK_TO_WALLS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "AUTO_STICK_TO_WALLS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(135);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ENABLE_PEDESTRIANS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ENABLE_PEDESTRIANS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(136);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CAMERA_INVERT_LOOKAROUND" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CAMERA_INVERT_LOOKAROUND" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(137);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CAMERA_INVERT_LOOKAROUND_X" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CAMERA_INVERT_LOOKAROUND_X" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(138);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "CAMERA_INVERT_LOOKAROUND_Y" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "CAMERA_INVERT_LOOKAROUND_Y" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(139);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "FORCE_COMBAT_CAMERA_OFF" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "FORCE_COMBAT_CAMERA_OFF" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(140);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISPLAY_THOUGHT_BUBBLES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISPLAY_THOUGHT_BUBBLES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(141);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ENABLE_DEBUG_LOG" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ENABLE_DEBUG_LOG" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(142);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ENABLE_LONG_CALLSTACK" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ENABLE_LONG_CALLSTACK" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(143);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "RENDER_FE_UI" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "RENDER_FE_UI" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(144);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "LOCK_INTERIORS" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "LOCK_INTERIORS" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(145);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "MEMCHECK_ON_LOAD" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "MEMCHECK_ON_LOAD" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(146);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "DISPLAY_ALS_USAGE_PROFILE" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "DISPLAY_ALS_USAGE_PROFILE" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(147);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "ENABLE_FPU_EXCEPTION_HANDLING" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "ENABLE_FPU_EXCEPTION_HANDLING" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(148);
+    v92->add_entry(&v89);
+ 
+    v89 = debug_menu_entry(mString{ "UNLOCK_ALL_UNLOCKABLES" });
+    v89.set_bval(os_developer_options::instance->get_flag(mString{ "UNLOCK_ALL_UNLOCKABLES" }));
+    v89.set_game_flags_handler(devopt_flags_handler);
+    v89.set_id(149);
+    v92->add_entry(&v89);
+    // === END GENERATED FLAG ENTRIES ======================================
+ 
+    // Trailing INT_OPTION pass — picks up integer-typed devopts (the bool
+    // ones are already covered by the 150-entry block above).
     for (auto idx = 0u; idx < NUM_OPTIONS; ++idx)
     {
         auto* v21 = get_option(idx);
@@ -3960,38 +5898,18 @@ void create_devopt_menu(debug_menu* parent)
         {
         case game_option_t::INT_OPTION:
         {
-            auto v20 = debug_menu_entry(mString{ v21->m_name });
-            v20.set_p_ival(v21->m_value.p_ival);
-            v20.set_min_value(-1000.0);
-            v20.set_max_value(1000.0);
-            v22->add_entry(&v20);
-            break;
-        }
-        case game_option_t::FLAG_OPTION:
-        {
-            auto v19 = debug_menu_entry(mString{ v21->m_name });
-            v19.set_pt_bval((bool*)v21->m_value.p_bval);
-            v22->add_entry(&v19);
-            break;
-        }
-        case game_option_t::FLOAT_OPTION:
-        {
-            auto v18 = debug_menu_entry(mString{ v21->m_name });
-            v18.set_pt_fval(v21->m_value.p_fval);
-            v18.set_min_value(-1000.0);
-            v18.set_max_value(1000.0);
-            v22->add_entry(&v18);
+            v89 = debug_menu_entry(mString{ v21->m_name });
+            v89.set_p_ival(v21->m_value.p_ival);
+            v89.set_min_value(-1000.0);
+            v89.set_max_value(1000.0);
+            v92->add_entry(&v89);
             break;
         }
         default:
             break;
         }
     }
-
-    auto v5 = debug_menu_entry(v22);
-    parent->add_entry(&v5);
 }
-
 #include "timer.h"
 
     void slow_motion_handler(debug_menu_entry* a1)
@@ -4060,12 +5978,7 @@ void create_game_flags_menu(debug_menu *parent)
     v89.set_bval(false);
     v89.set_game_flags_handler(slow_motion_handler);
     v92->add_entry(&v89);
-	
-	v89 = debug_menu_entry(mString{ "Speed Motion Control" });
-    v89.set_ival(0);
-	v89.set_max_value(4);
-	v89.set_game_flags_handler(speed_motion_handler);
-    v92->add_entry(&v89);
+
 
     v89 = debug_menu_entry{ mString{"Monkey Enabled"} };
 
@@ -4161,281 +6074,263 @@ void create_game_flags_menu(debug_menu *parent)
 }
 
 
+
+
+
+
+
 void create_game_flags_menu(debug_menu* parent);
 
+// Character List (Script > Pop Character / Pop All Characters)
+// ----------------------------------------------------------------------------------
+// Implements the debug menu character spawning functionality:
+//   - "Pop Character"     : spawns the currently selected character near the hero
+//   - "Pop All Characters": spawns every character in the list near the hero
+//   - [character names]   : selecting one directly spawns that character
+//
+// Characters are spawned via wds_entity_manager::create_and_add_entity_or_subclass
+// at the hero's current position with a small offset.
+// ----------------------------------------------------------------------------------
 
-#include "debug_menu.h"
+
+#include "entity_base.h"
 #include "entity.h"
-#include "mstring.h"
-#include "resource_manager.h"
-#include "string_hash.h"
+#include "oldmath_po.h"
+#include "vector3d.h"
 #include "wds.h"
+#include "terrain.h"
+#include "string_hash.h"
+#include "mstring.h"
 
-#include <vector>
-
-
-static std::vector<entity*> g_spawned;
-static int g_counter = 0;
-
-// =============================================================================
-// HEROES & VILLAINS - Characters from Ultimate Spider-Man (2005)
-// Based on Script menu character listing
-// =============================================================================
-static const char* CHARS[] = {
+static const char *g_character_names[] = {
+    "alex_ohirn",
+    "alex_ohirn_prison",
+    "arachno_man",
+    "beetle",
+    "bolivar_trask_old",
+    "boomerang",
+    "carnage",
+    "eddie_brock",
+    "eddie_brock_sr",
+    "electro_naked",
+    "electro_nosuit",
+    "electro_suit",
+    "gang_ftb_base",
+    "gang_ftb_boss",
+    "gang_ftb_lt",
+    "gang_mercs_base",
+    "gang_mercs_boss",
+    "gang_mercs_lt",
+    "gang_skin_base",
+    "gang_skin_boss",
+    "gang_skin_lt",
+    "gang_srk_base",
+    "gang_srk_boss",
+    "gang_srk_lt",
+    "gmu_businessman",
+    "gmu_child_male",
+    "gmu_cop_fat",
+    "gmu_cop_thin",
+    "gmu_cop_thin_igc",
+    "gmu_jogger_fem",
+    "gmu_lab_fem",
+    "gmu_man",
+    "gmu_medic_fem",
+    "gmu_sable_merc",
+    "gmu_storeowner",
+    "gmu_street_vendor",
+    "gmu_student_female",
+    "gmu_student_male",
+    "gmu_utilityworker_male",
+    "gmu_woman",
+    "johnny_storm",
+    "kong",
+    "liz_allen",
+    "mary_jane",
+    "nick_fury",
+    "origin_spider",
     "ped_fem",
     "ped_male",
-	"gang1"
-
+    "peter_hooded",
+    "peter_parker",
+    "peter_shirtless",
+    "rhino",
+    "rhino_igc",
+    "richard_parker",
+    "sable",
+    "sharon_carter",
+    "shield_agent",
+    "shield_agent_jetpack",
+    "shield_agent_test",
+    "shocker",
+    "toomes",
+    "usm_blacksuit",
+    "usm_peterhead",
+    "usm_venomhand",
+    "usm_wrestling",
+    "venom_eddie",
+    "venom_spider",
+    "venom_viewer",
+    "wolverine",
 };
 
-// =============================================================================
-// SPAWN SINGLE CHARACTER
-// =============================================================================
-static entity* spawn_character(const char* char_name, const vector3d& spawn_pos) {
+static constexpr int g_character_count = sizeof(g_character_names) / sizeof(g_character_names[0]);
+
+// Tracks which character entry was last highlighted/selected in the list
+static int g_selected_character_index = 0;
+
+// Spawns a single character by name at the hero's position + offset
+static entity *spawn_character_at_hero(const char *char_name, float offset_x = 2.0f, float offset_z = 0.0f)
+{
     if (g_world_ptr == nullptr) {
         return nullptr;
     }
-    
-    // Create unique entity ID
-    char id_buf[32];
-    sprintf(id_buf, "DBGSPN_%d", g_counter++);
-    
-    string_hash type_hash{int(to_hash(char_name))};
-    string_hash id_hash{id_buf};
-    
-    // Acquire entity (works for characters in loaded packs)
-    entity* spawned = g_world_ptr->ent_mgr.acquire_entity(type_hash, id_hash, 129);
-    
-    if (spawned != nullptr) {
-        spawned->set_abs_position(spawn_pos);
-        spawned->set_visible(true, false);
-        g_spawned.push_back(spawned);
-    }
-    
-    return spawned;
-}
 
-// =============================================================================
-// TEST SPAWN CALLBACK - Single character
-// =============================================================================
-void test_spawn_callback(debug_menu_entry* entry) {
-    printf("\n========================================\n");
-    printf("test_spawn_callback CALLED\n");
-    printf("========================================\n");
-    
-    if (entry == nullptr) {
-        printf("ERROR: entry is nullptr!\n");
-        return;
-    }
-    
-    printf("entry->text = '%s'\n", entry->text);
-    printf("entry->entry_type = %d\n", (int)entry->entry_type);
-    
-    if (g_world_ptr == nullptr) {
-        printf("ERROR: g_world_ptr is nullptr!\n");
-        return;
-    }
-    
-    // Get hero
-    entity* hero = g_world_ptr->get_hero_ptr(0);
+    auto *hero = g_world_ptr->get_hero_ptr(0);
     if (hero == nullptr) {
-        printf("ERROR: hero is nullptr!\n");
-        return;
+        return nullptr;
     }
-    
-    printf("Hero found at: <%.2f, %.2f, %.2f>\n",
-           hero->get_abs_position()[0],
-           hero->get_abs_position()[1],
-           hero->get_abs_position()[2]);
-    
-    // Calculate spawn position
-    po hero_po = hero->get_abs_po();
-    vector3d pos = hero_po.get_position();
-    vector3d fwd = hero_po.get_z_facing();
-    
-    vector3d spawn_pos;
-    spawn_pos[0] = pos[0] + fwd[0] * 3.0f;
-    spawn_pos[1] = pos[1] + 0.5f;
-    spawn_pos[2] = pos[2] + fwd[2] * 3.0f;
-    
-    printf("Spawn position: <%.2f, %.2f, %.2f>\n",
-           spawn_pos[0], spawn_pos[1], spawn_pos[2]);
-    
-    const char* char_name = entry->text;
-    printf("Creating hash for: '%s'\n", char_name);
-    
-    string_hash type_hash{int(to_hash(char_name))};
-    printf("Type hash: 0x%08X\n", type_hash.source_hash_code);
-    
-    entity* spawned = spawn_character(char_name, spawn_pos);
-    
-    if (spawned != nullptr) {
-        printf("SUCCESS! Entity spawned: %p\n", (void*)spawned);
-        printf("Total spawned: %zu\n", g_spawned.size());
+
+    // Build spawn transform from hero's current position
+    po spawn_po {identity_matrix};
+    auto &hero_po = hero->get_abs_po();
+    spawn_po = hero_po;
+
+    // Offset the spawn position so the character doesn't overlap the hero
+    auto hero_pos = hero->get_abs_position();
+    vector3d spawn_pos = hero_pos;
+    spawn_pos[0] += offset_x;
+    spawn_pos[2] += offset_z;
+    spawn_po.set_position(spawn_pos);
+
+    // Create entity using type_hash == id_hash (same name for both)
+    string_hash type_hash {char_name};
+    string_hash id_hash {char_name};
+    mString empty_str {};
+
+    auto *ent = g_world_ptr->ent_mgr.create_and_add_entity_or_subclass(
+        type_hash,
+        id_hash,
+        spawn_po,
+        empty_str,
+        129,
+        nullptr);
+
+    if (ent != nullptr) {
+        ent->set_visible(true, false);
+
+        auto *the_terrain = g_world_ptr->get_the_terrain();
+        if (the_terrain != nullptr) {
+            ent->compute_sector(the_terrain, 0, ent);
+        }
+
+        printf("[CharList] Spawned character: %s\n", char_name);
     } else {
-        printf("FAILED! acquire_entity returned nullptr\n");
-        printf("Character '%s' not found in any loaded pack!\n", char_name);
+        printf("[CharList] Failed to spawn character: %s\n", char_name);
     }
-    
-    printf("========================================\n\n");
-    
+
+    return ent;
+}
+
+// Handler: spawn a single character when its menu entry is selected
+static void character_select_handler(debug_menu_entry *entry)
+{
+    if (entry == nullptr) {
+        return;
+    }
+
+    // entry->text contains the character name
+    const char *char_name = entry->text;
+
+    // Update the selected index based on the entry's ID
+    g_selected_character_index = entry->get_id();
+
+    spawn_character_at_hero(char_name, 2.0f, 0.0f);
     debug_menu::hide();
 }
 
-// =============================================================================
-// SPAWN ALL CALLBACK - Spawn all characters in a grid
-// =============================================================================
-void test_spawn_all_callback(debug_menu_entry*) {
-    printf("\n========================================\n");
-    printf("SPAWN ALL CHARACTERS\n");
-    printf("========================================\n");
-    
-    if (g_world_ptr == nullptr) {
-        printf("ERROR: g_world_ptr is nullptr!\n");
-        debug_menu::hide();
-        return;
+// Handler: "Pop Character" — spawns the last selected/highlighted character
+static void pop_character_handler(debug_menu_entry *entry)
+{
+    if (g_selected_character_index >= 0 && g_selected_character_index < g_character_count) {
+        const char *char_name = g_character_names[g_selected_character_index];
+        spawn_character_at_hero(char_name, 2.0f, 0.0f);
     }
-    
-    entity* hero = g_world_ptr->get_hero_ptr(0);
-    if (hero == nullptr) {
-        printf("ERROR: hero is nullptr!\n");
-        debug_menu::hide();
-        return;
-    }
-    
-    po hero_po = hero->get_abs_po();
-    vector3d base_pos = hero_po.get_position();
-    vector3d fwd = hero_po.get_z_facing();
-    vector3d right = hero_po.get_x_facing();
-    
-    int spawned_count = 0;
-    int failed_count = 0;
-    
-    // Grid layout: 5 columns
-    const int COLS = 5;
-    const float SPACING = 2.5f;
-    
-    for (int i = 0; CHARS[i] != nullptr; ++i) {
-        int row = i / COLS;
-        int col = i % COLS;
-        
-        // Calculate grid position in front of hero
-        vector3d spawn_pos;
-        spawn_pos[0] = base_pos[0] + fwd[0] * (5.0f + row * SPACING) + right[0] * ((col - 2) * SPACING);
-        spawn_pos[1] = base_pos[1] + 0.5f;
-        spawn_pos[2] = base_pos[2] + fwd[2] * (5.0f + row * SPACING) + right[2] * ((col - 2) * SPACING);
-        
-        entity* spawned = spawn_character(CHARS[i], spawn_pos);
-        
-        if (spawned != nullptr) {
-            spawned_count++;
-            printf("[OK] %s\n", CHARS[i]);
-        } else {
-            failed_count++;
-            printf("[FAIL] %s\n", CHARS[i]);
-        }
-    }
-    
-    printf("========================================\n");
-    printf("Spawned: %d | Failed: %d\n", spawned_count, failed_count);
-    printf("========================================\n\n");
-    
+
     debug_menu::hide();
 }
 
-// =============================================================================
-// POP CALLBACK - Remove last spawned
-// =============================================================================
-void test_pop_callback(debug_menu_entry*) {
-    printf("test_pop_callback called\n");
-    
-    if (g_spawned.empty()) {
-        printf("Nothing to pop\n");
-        debug_menu::hide();
-        return;
+// Handler: "Pop All Characters" — spawns every character in the list
+static void pop_all_characters_handler(debug_menu_entry *entry)
+{
+    // Arrange characters in a grid pattern around the hero
+    float offset_x = 3.0f;
+    float offset_z = 0.0f;
+    const float spacing = 3.0f;
+    const int chars_per_row = 8;
+
+    for (int i = 0; i < g_character_count; ++i) {
+        float row = static_cast<float>(i / chars_per_row);
+        float col = static_cast<float>(i % chars_per_row);
+
+        float ox = (col - chars_per_row / 2.0f) * spacing;
+        float oz = (row + 1.0f) * spacing;
+
+        spawn_character_at_hero(g_character_names[i], ox, oz);
     }
-    
-    entity* e = g_spawned.back();
-    g_spawned.pop_back();
-    
-    if (e != nullptr && g_world_ptr != nullptr) {
-        printf("Releasing entity...\n");
-        g_world_ptr->ent_mgr.release_entity(e);
-        printf("Released\n");
-    }
-    
+
     debug_menu::hide();
 }
 
-// =============================================================================
-// POP ALL CALLBACK - Remove all spawned
-// =============================================================================
-void test_pop_all_callback(debug_menu_entry*) {
-    printf("Releasing all spawned entities...\n");
-    
-    int count = 0;
-    while (!g_spawned.empty()) {
-        entity* e = g_spawned.back();
-        g_spawned.pop_back();
-        
-        if (e != nullptr && g_world_ptr != nullptr) {
-            g_world_ptr->ent_mgr.release_entity(e);
-            count++;
-        }
-    }
-    
-    printf("Released %d entities\n", count);
-    debug_menu::hide();
-}
+// Populates the character list submenu with Pop Character, Pop All, and all names
+static void populate_character_list_menu(debug_menu_entry *entry)
+{
+    auto *submenu = create_menu("Script", debug_menu::sort_mode_t::ascending);
 
-// =============================================================================
-// INIT FUNCTION - Call this to add menu entries
-// =============================================================================
-void init_simple_spawner(debug_menu* menu) {
-    printf("\n========================================\n");
-    printf("init_simple_spawner called\n");
-    printf("menu = %p\n", (void*)menu);
-    printf("========================================\n");
-    
-    if (menu == nullptr) {
-        printf("ERROR: menu is nullptr!\n");
-        return;
-    }
-    
-    // Add utility entries at top
+    debug_menu_entry v1;
+    debug_menu_entry *block = v1.alloc_block(submenu, 4);
+    block[0] = debug_menu_entry{submenu};
+    entry->set_submenu(submenu);
+
+    // --- "Pop Character" entry ---
     {
-        debug_menu_entry e{mString{"Spawn All Characters"}};
-        e.set_game_flags_handler(test_spawn_all_callback);
-        menu->add_entry(&e);
-        printf("Added [SPAWN ALL] entry\n");
+        auto *pop_entry = create_menu_entry(mString{"Pop Character"});
+        pop_entry->set_game_flags_handler(pop_character_handler);
+        pop_entry->set_id(0);
+        submenu->add_entry(pop_entry);
     }
-    
+
+    // --- "Pop All Characters" entry ---
     {
-        debug_menu_entry e{mString{"Pop All Characters"}};
-        e.set_game_flags_handler(test_pop_all_callback);
-        menu->add_entry(&e);
-        printf("Added [POP ALL] entry\n");
+        auto *pop_all_entry = create_menu_entry(mString{"Pop All Characters"});
+        pop_all_entry->set_game_flags_handler(pop_all_characters_handler);
+        pop_all_entry->set_id(1);
+        submenu->add_entry(pop_all_entry);
     }
-    
-    {
-        debug_menu_entry e{mString{"Pop Character"}};
-        e.set_game_flags_handler(test_pop_callback);
-        menu->add_entry(&e);
-        printf("Added [POP] entry\n");
+
+    // --- Individual character entries ---
+    for (int i = 0; i < g_character_count; ++i) {
+        auto *char_entry = create_menu_entry(mString{g_character_names[i]});
+        char_entry->set_game_flags_handler(character_select_handler);
+        char_entry->set_id(static_cast<uint16_t>(i));
+        submenu->add_entry(char_entry);
     }
-    
-    // Add character entries
-    for (int i = 0; CHARS[i] != nullptr; ++i) {
-        debug_menu_entry e{mString{CHARS[i]}};
-        e.set_game_flags_handler(test_spawn_callback);
-        menu->add_entry(&e);
-        printf("Added entry: '%s'\n", CHARS[i]);
-    }
-    
-    printf("init_simple_spawner complete\n");
-    printf("========================================\n\n");
 }
 
+// Creates the "Script" submenu and adds it to the parent (root) debug menu
+void create_character_list_menu(debug_menu *parent)
+{
+    auto *char_list_menu = create_menu("Script");
+
+    debug_menu_entry v1;
+    debug_menu_entry *block = v1.alloc_block(char_list_menu, 4);
+    block[0] = debug_menu_entry{char_list_menu};
+
+    auto *entry = create_menu_entry(char_list_menu);
+    entry->set_submenu(nullptr);
+    entry->set_game_flags_handler(populate_character_list_menu);
+    parent->add_entry(entry);
+}
 
 
 
@@ -4449,7 +6344,7 @@ void create_script_menu()
         debug_menu_entry* block = v1.alloc_block(script_menu, 4);
         block[0] = debug_menu_entry{ script_menu };
         debug_menu::root_menu->add_entry(script_menu);
-		    init_simple_spawner(script_menu);
+		  create_character_list_menu(script_menu);
     }
 }
 
@@ -4519,9 +6414,7 @@ void debug_menu::init() {
 }
 #ifdef _WIN32
 #define _USE_MATH_DEFINES
-#ifndef NOMINMAX
 #define NOMINMAX
-#endif
 #endif
 
 
@@ -4540,45 +6433,83 @@ void debug_nglListEndScene_hook() {
 
     nglListEndScene();
 }
+static bool s_hero_frozen = false;
+
 void close_debug()
 {
     debug_enabled = 0;
     debug_disabled = 0;
     g_game_ptr->unpause();
     g_game_ptr->enable_physics(true);
-	pause_menu_system_ptr->Deactivate();
+	g_game_ptr->freeze_hero(false);
+	// menu fully closed -> drop focus and reset hero-frozen tracker
+	debug_menu::has_focus = false;
+	s_hero_frozen = false;
+}
+
+static void apply_freeze_toggle()
+{
+    s_hero_frozen = !s_hero_frozen;
+    g_game_ptr->unpause();
+    g_game_ptr->freeze_hero(s_hero_frozen);
+}
+
+// Non-toggling counterpart to apply_freeze_toggle(): drives s_hero_frozen
+// and the in-game hero-freeze flag to an exact requested state. Used by
+// the new debug-menu focus toggle (TAB / L3) so freezing the hero stays
+// in lock-step with debug_menu::has_focus, instead of just flipping
+// whatever the previous value happened to be.
+static void set_hero_frozen(bool frozen)
+{
+    s_hero_frozen = frozen;
+    if (g_game_ptr != nullptr) {
+        g_game_ptr->unpause();
+        g_game_ptr->freeze_hero(frozen);
+    }
 }
 
 void disable_physics()
 {
-    debug_enabled = 1;
+    debug_enabled  = 1; apply_freeze_toggle();
     g_game_ptr->unpause();
     current_menu = current_menu;
-    g_game_ptr->enable_physics(false);
-					
-}
+  //  g_game_ptr->enable_physics(false);
+    debug_menu::active_menu->has_focus = true;   // menu just opened -> grab focus
+	
+	debug_menu::active_menu->had_menu_this_frame = true;
 
+
+}
 
 
 void enable_physics()
 {
-    debug_disabled = 1;
+
+	debug_disabled  = 1; apply_freeze_toggle();
     g_game_ptr->unpause();
     current_menu = current_menu;
-    g_game_ptr->enable_physics(true);
-					
-}
+ //   g_game_ptr->enable_physics(true);
+    debug_menu::active_menu->has_focus = true;   // menu just opened -> grab focus
+	
+	debug_menu::active_menu->had_menu_this_frame = true;
+
+
+}	
 
 void custom()
 {
-    debug_disabled = 1;
+    debug_disabled  = 1; apply_freeze_toggle();
     g_game_ptr->unpause();
     current_menu = current_menu;
-    !os_developer_options::instance->get_flag("ENABLE_ZOOM_MAP");
-    spider_monkey::is_running();
-    g_game_ptr->enable_physics(false);
-					
-}
+  //  g_game_ptr->enable_physics(false);
+    debug_menu::active_menu->has_focus = true;   // menu just opened -> grab focus
+	
+	debug_menu::active_menu->had_menu_this_frame = true;
+
+}	
+
+
+
 
 
 
@@ -4587,7 +6518,7 @@ void custom()
 #include "fe_health_widget.h"
 
 
-constexpr auto NUM_HEROES = 25u;
+constexpr auto NUM_HEROES = 24u;
 
 const char* hero_list[NUM_HEROES] = {
     "ultimate_spiderman",
@@ -4603,8 +6534,7 @@ const char* hero_list[NUM_HEROES] = {
     "carnage",
     "rhino",
     "green_goblin",
-    "army_mary_jane",
-	"mary_jane",
+    "mary_jane",
     "venarge",
     "electro_suit",
     "electro_nosuit",
@@ -4672,6 +6602,7 @@ level_descriptor_t* get_level_descriptors(int* arg0)
 static int main_flow[] = { 5, 6, 14 };
 game_process mainflow_proc{ "main", main_flow, 3 };
 
+#pragma once
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -4681,9 +6612,7 @@ game_process mainflow_proc{ "main", main_flow, 3 };
 #include <vector>
 
 #if defined(_WIN32)
-#ifndef NOMINMAX
 #define NOMINMAX
-#endif
 #include <shellapi.h>
 #include <windows.h>
 #else // POSIX (including WSL)
@@ -5303,7 +7232,6 @@ debug_menu_root *& menu_ptr = var<debug_menu_root*>(0);
 
 
 
-
 void menu_setup(int game_state, int keyboard) {
 	if (is_menu_key_pressed(MENU_START, keyboard) && (game_state == 6)) {
 
@@ -5317,30 +7245,7 @@ void menu_setup(int game_state, int keyboard) {
 				
             }
 
-            else if (!debug_disabled && game_state == 6) {
-                g_game_ptr->unpause();
-                debug_disabled = !debug_disabled;
-                current_menu = current_menu;
-                disable_physics();
-
-            }
-
-            else if (!debug_enabled && game_state == 6) {
-                g_game_ptr->unpause();
-                debug_enabled = !debug_enabled;
-                current_menu = current_menu;
-                enable_physics();
-
-            }
-
-            else if (!debug_disabled, debug_enabled && game_state == 6) {
-                g_game_ptr->unpause();
-                debug_enabled, debug_disabled = !debug_disabled, debug_enabled;
-                current_menu = current_menu;
-                disable_physics();
-            }
-        }
-
+ }
         if (is_menu_key_pressed(MENU_SELECT, keyboard) && (game_state == 7)) {
 
 
@@ -5355,29 +7260,7 @@ void menu_setup(int game_state, int keyboard) {
 
             }
 
-            else if (!debug_disabled && game_state == 7) {
-                g_game_ptr->unpause();
-                debug_disabled = !debug_disabled;
-                current_menu = current_menu;
-                enable_physics();
-
-            }
-
-            else if (!debug_enabled && game_state == 7) {
-                g_game_ptr->unpause();
-                debug_enabled = !debug_enabled;
-                current_menu = current_menu;
-                enable_physics();
-
-            }
-
-            else if (!debug_enabled, debug_disabled && game_state == 7) {
-                g_game_ptr->unpause();
-                debug_disabled, debug_enabled = !debug_disabled, debug_enabled;
-                current_menu = current_menu;
-				debug_menu::hide();
-                enable_physics();
-            }
+ 
 
 
         if (level_select_menu->used_slots == 0)
@@ -5686,29 +7569,36 @@ BOOL install_redirects()
 	
 	FEMultiLineText_patch();
 	
+	    
+		
+		
 	
-	// ltd_edition_patch();
+	resource_amalgapak_header_patch();
 	
-	     //   FrontEndMenuSystem_patch();
+	        cursor_patch();
+	
+	        FrontEndMenuSystem_patch();
 			
 			script_file_loader_patch();
 			
-		//	pause_menu_root_patch();
+			pause_menu_root_patch();
 			
-						replay_missions_patch();
+			PauseMenuSystem_patch();
 			
+			IGOZoomOutMap_patch();
+			
+			pause_menu_awards_patch();	
+
+            pause_menu_status_patch();			
 			
 			pause_menu_goals_patch();
-			
-			        PauseMenuSystem_patch();
 			
 			
 			unlockables_menu_patch();
 			
 		    pause_menu_message_log_patch();
 			
-			
-			pause_menu_status_patch();
+		
 
           FEText_patch();
 
@@ -5718,10 +7608,7 @@ BOOL install_redirects()
 	
 	script_lib_debug_menu_patch();
 	
-	
-	//main_menu_credits_patch();
-	
-		
+		debug_render_patch();
 
     //REDIRECT(0, sub_5952D0);
 
@@ -5797,16 +7684,8 @@ BOOL install_redirects()
     }
 	
 
-    SET_JUMP(0x0077A870, nglLoadTextureTM2);
-	SET_JUMP(0x5EF340, inverse_kinematics::compute_bend_plane_normal);
-    SET_JUMP(0x5EEEE0, inverse_kinematics::compute_arm_elbow_bend_direction);
-    //SET_JUMP(0x5EF100, inverse_kinematics::compute_arm_elbow_bend_direction_mirrored);
-
-    SET_JUMP(0x797210, inverse_kinematics::nalIKMap2DTo3D);
-    SET_JUMP(0x797070, inverse_kinematics::nalIKSolve2D);
-    SET_JUMP(0x5EEC20, inverse_kinematics::solve_two_bone);
-    SET_JUMP(0x5F16E0, inverse_kinematics::DecomposeIKSpin);
-    	
+    //SET_JUMP(0x0077A870, nglLoadTextureTM2);
+		
 
     return true;
 
@@ -5826,6 +7705,9 @@ BOOL install_redirects()
     ngl_patch();
 	
 	REDIRECT(0x00822556, myWinMain);
+	
+	
+			
 
     //standalone patches
     if constexpr (1)
@@ -6030,7 +7912,7 @@ BOOL install_redirects()
 
     if constexpr (0)
     {
-
+        PauseMenuSystem_patch();
 
         cg_mesh_patch();
 
@@ -6455,7 +8337,6 @@ BOOL install_redirects()
 
         pick_up_state_patch();
 
-        cursor_patch();
 
         //message_board_patch();
 
@@ -6505,33 +8386,76 @@ std::vector<uint8_t> read_file(const fs::path& filePath) {
 
 
 void enumerate_mods() {
-    fs::path modsDir = fs::current_path() / "mods";
+    Mods.clear();
+    ModFileOverrides.clear();
+
+    const fs::path modsDir = fs::current_path() / "mods";
     if (!fs::is_directory(modsDir))
         return;
 
-    for (const auto& entry : fs::directory_iterator(modsDir)) {
-        if (entry.is_regular_file()) {
-            const fs::path& path = entry.path();
-            std::vector<uint8_t> fileData = read_file(path);
+    auto normalize_rel = [](std::string s) {
+        // lower case + backslashes
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+        std::replace(s.begin(), s.end(), '/', '\\');
+        // trim leading .\\
+        while (s.rfind(".\\", 0) == 0) s.erase(0, 2);
+        return s;
+    };
 
-            tlresource_type resType = TLRESOURCE_TYPE_NONE;
-            std::string ext = transformToLower(path.extension().string());
-            if (ext == ".dds" || ext == ".tga")
-                resType = TLRESOURCE_TYPE_TEXTURE;
-            else if (ext == ".obj" || ext == ".fbx" || ext == ".dae" || ext == ".gltf")
-                resType = TLRESOURCE_TYPE_MESH;
-            // @todo platform
-            else if (ext == ".pcmesh")  // @todo: other exts
-                resType = TLRESOURCE_TYPE_MESH_FILE;
+    for (const auto& entry : fs::recursive_directory_iterator(modsDir)) {
+        if (!entry.is_regular_file())
+            continue;
 
-            auto hash = to_hash(path.stem().string().c_str());
-            Mods[hash] = Mod{path, resType, std::move(fileData)};
-            printf("name = %s\nhash = 0x%08X\n", path.stem().string().c_str(), hash);
+        const fs::path& path = entry.path();
+        std::string ext = transformToLower(path.extension().string());
+
+        // 1) Exact file override table (used by NFL openFile hook)
+        //    Key is path relative to mods/, including extension.
+        {
+            const fs::path rel = fs::relative(path, modsDir);
+            const std::string relKey = normalize_rel(rel.generic_string());
+            ModFileOverrides[relKey] = path;
+
+            // Convenience: if a mod is placed under "mods/data/...", allow it to override
+            // the engine request "data\\..." directly.
+            if (relKey.rfind("data\\", 0) == 0) {
+                ModFileOverrides[relKey] = path;
+                ModFileOverrides[relKey.substr(5)] = path; // also allow without the leading "data\\"
+            }
         }
+
+        // 2) In-memory override (used by NGL callback + some handlers)
+        //    Keying is extension-less (like ngl_readfile_callback does).
+        //    Example: mods/characters/spidey.fbx -> key "characters/spidey".
+        tlresource_type resType = TLRESOURCE_TYPE_NONE;
+        if (ext == ".dds" || ext == ".tga")
+            resType = TLRESOURCE_TYPE_TEXTURE;
+        else if (ext == ".obj" || ext == ".fbx" || ext == ".dae" || ext == ".gltf" || ext == ".glb")
+            resType = TLRESOURCE_TYPE_MESH;
+        else if (ext == ".pcmesh" || ext == ".pcm")
+            resType = TLRESOURCE_TYPE_MESH_FILE;
+
+        // We also allow WAV files to be tracked as raw file mods (Type stays NONE),
+        // so you can still access them via ModFileOverrides without bloating memory.
+        const bool shouldKeepInMemory = (resType != TLRESOURCE_TYPE_NONE);
+
+        if (!shouldKeepInMemory)
+            continue;
+
+        std::vector<uint8_t> fileData = read_file(path);
+
+        // Build a relative no-ext key (forward slashes -> lower-case -> hashed)
+        const fs::path relNoExt = fs::relative(path, modsDir).replace_extension();
+        const std::string relNoExtKey = transformToLower(relNoExt.generic_string());
+        const uint32_t hash = to_hash(relNoExtKey.c_str());
+
+        Mods[hash] = Mod{path, (int)resType, std::move(fileData)};
+        //printf("mod: %s -> 0x%08X\n", relNoExtKey.c_str(), hash);
     }
 
 #   if MOD_MESH_DBG_REPLACE_ALL
-        dbgReplaceMesh = getMod(0x1189ab87, TLRESOURCE_TYPE_MESH);
+        dbgReplaceMesh = getMod(0x1189ab87, TLRESOURCE_TYPE_MESH_FILE);
+		dbgReplaceMesh = getMod(0xCB5B8BA9, TLRESOURCE_TYPE_MESH_FILE);
 #   endif
 }
 
@@ -6548,7 +8472,6 @@ BOOL install_hooks() {
 
 
 
-//#include "modloader.h"
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD fdwReason, [[maybe_unused]] LPVOID lpvReserved) {
     //printf("DLLMain %lu 0x%08X\n", fdwReason, (int) lpvReserved);
@@ -6572,18 +8495,25 @@ if (strstr(args, " -windowed"))
         
         if (strstr(args, " -noloadscreen"))
             g_config.NoLoadScreen = true;
+		
+		        if (strstr(args, " -enablefpuexceptionhandling"))
+            g_config.EnableFpuExceptionHandling = false;
 
         bool res = install_hooks();
         if (res) 
         enumerate_mods();
-			         //init_hooks();
 		    os_developer_options::os_developer_init();
             ini_parser::parse("debug_menu.ini", os_developer_options::instance);
+			    if (os_developer_options::instance->get_flag(mString{"WINDOW_DEFAULT"})) {
+        g_config.WindowedMode = true;
+    }
+
+    sub_5C9EA0();
         return res;
 		
 
     } else if (fdwReason == DLL_PROCESS_DETACH) {
-		          // destroy_hooks();
+
         FreeConsole();
 
     }

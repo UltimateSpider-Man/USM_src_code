@@ -24,6 +24,7 @@
 #include <string.h>
 
 extern unsigned char rawData[];
+extern unsigned char rawData2[];
 /* The size is baked into the declaration in USM.c: rawData[5926912].
  * We know the value at compile-time, so hard-code it. Alternatively
  * read sizeof(rawData) in USM.c and expose via an extern — but that
