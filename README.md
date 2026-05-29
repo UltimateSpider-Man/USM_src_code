@@ -1,13 +1,13 @@
 Ultimate Spider-Man 2005 Src Code
 ======
 
-is a almost completed src code game engine that supports playing Ultimate Spider-Man by Treyarch. You need to own the game for src code to play Ultimate Spider-Man.
+is a src code game engine that supports playing Ultimate Spider-Man by Treyarch. You need to own the game for src code to play Ultimate Spider-Man.
 
 Current Status
 --------------
 
-The engine is not complete and is at the prototyping stage.
-
+almost completed
+ 
 Requiments:
 * Linux or Ubuntu on Windows 10
 * MinGW-w64 compiler
