@@ -2,6 +2,7 @@
 
 #include "mod_gif.h"  // GIF texture mods (mods/*.gif -> animated textures)
 #include "mod_png.h"  // PNG texture mods (mods/*.png)
+#include "main_menu_start_prelib.h"
 #include <unordered_map>
 #include "resource_versions.h"
 #include "main.h"
@@ -2673,6 +2674,7 @@ void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
 }
 
 
+
 DWORD modulo(int num, DWORD mod) {
     if (mod == 0) {
         return 0;   
@@ -2777,24 +2779,6 @@ static bool scroll_repeat_should_step(int key_val, int scroll_speed)
 
     return (key_val >= period) && (key_val % period == 0);
 }
-
-
-
-
-// ----------------------------------------------------------------------
-// Scroll auto-repeat acceleration for MENU_UP / MENU_DOWN.
-//
-// key_val is the number of frames the key has been held (keys[i] is
-// ++'d every frame the key is down, reset to 0 on release - see
-// GetDeviceStateHandleKeyboardInput). The base repeat fires one step
-// every SCROLL_SPEED frames. After the key has been held for
-// kScrollAccelHoldFrames frames (2 s at 60 fps = 120), the repeat
-// period is shortened by kScrollAccelFactor (1.5x), so the cursor
-// scrolls faster the longer up/down is held.
-//
-//   base period   = SCROLL_SPEED            (e.g. 5 frames/step)
-//   fast period   = SCROLL_SPEED / 1.5      (e.g. 3 frames/step)
-// ----------------------------------------------------------------------
 void menu_input_handler(int keyboard, int SCROLL_SPEED) {
     if (is_menu_key_clicked(MENU_DOWN, keyboard)) {
 
@@ -2846,7 +2830,7 @@ else if (is_menu_key_clicked(MENU_LEFT, keyboard)) { // Use is_menu_key_clicked 
     }
 
     debug_menu_entry* highlighted = &current_menu->entries[current_menu->window_start + current_menu->cur_index];
- //   assert(highlighted->frame_advance_callback != nullptr);
+    assert(highlighted->frame_advance_callback != nullptr);
     highlighted->frame_advance_callback(highlighted);
 }
 
@@ -3330,7 +3314,7 @@ void vm_debug_menu_entry_garbage_collection_callback(void* a1, list* lst) {
     for (list* cur = end->next; cur != end; cur = cur->next) {
 
         debug_menu_entry* entry = ((debug_menu_entry*)cur->data);
-        printf("Will delete %s %08X\n", entry->text, entry);
+        //printf("Will delete %s %08X\n", entry->text, entry);
         remove_debug_menu_entry(entry);
     }
 }
@@ -5035,7 +5019,8 @@ void devopt_flags_handler(debug_menu_entry *a1)
     }
 }
 
-
+#include "os_developer_options_build.h"
+#include "devopt_build.h"
 
 void create_devopt_menu(debug_menu* parent)
 {
@@ -5954,10 +5939,10 @@ void create_devopt_menu(debug_menu* parent)
     
 		    for (auto idx = 0u; idx < NUM_OPTIONS; ++idx)
     {
-        auto* v21 = get_option(idx);
+        auto* v21 = get_option_build(idx);
         switch (v21->m_type)
         {
-        case game_option_t::INT_OPTION:
+        case game_option_build_t::INT_OPTION:
         {
             v89 = debug_menu_entry(mString{ v21->m_name });
             v89.set_p_ival(v21->m_value.p_ival);
@@ -7552,7 +7537,6 @@ string_hash names[120] = {
 
 
 
-
 bool __fastcall slf__create_debug_menu_entry(script_library_class::function* func, void*, vm_stack* stack, void* unk)
 {
     stack->pop(4);
@@ -7574,32 +7558,6 @@ bool __fastcall slf__create_debug_menu_entry(script_library_class::function* fun
     script_executable* se = stack->my_thread->ex->owner->parent;
     printf("total_script_objects = %d\n", se->total_script_objects);
     
-    for (auto i = 0; i < se->total_script_objects; ++i) {
-        auto* so = se->script_objects[i];
-        printf("Name of script_object = %s\n", so->name.to_string());
-
-        auto* so_menu = create_menu(so->name.to_string(), debug_menu::sort_mode_t::ascending);
-        auto* so_entry = create_menu_entry(so->name.to_string());
-        so_entry->set_data(so);
-        so_entry->set_submenu(so_menu);
-        script_menu->add_entry(so_entry);
-
-        for (auto j = 0; j < so->total_funcs; ++j) {
-            auto* fn = so->funcs[j];
-            printf("Func name: %s\n", fn->fullname.to_string());
-
-            debug_menu_entry fn_entry{ fn->fullname.to_string() };
-            script_instance* instance = stack->my_thread->inst;
-
-            fn_entry.set_data(nullptr);
-            fn_entry.set_submenu(nullptr);
-            fn_entry.m_id = j;
-            fn_entry.set_script_handler_from_char(instance, fn->fullname.to_string());
-            add_debug_menu_entry(so_menu, &fn_entry);
-        }
-
-        printf("\n");
-    }
 
     se->add_allocated_stuff_for_debug_menu(vm_debug_menu_entry_garbage_collection_id, (int)res, 0);
 
@@ -7609,8 +7567,6 @@ bool __fastcall slf__create_debug_menu_entry(script_library_class::function* fun
     stack->SP += sz;
     return 1;
 }
-
-
 
 
 
@@ -7640,7 +7596,7 @@ BOOL install_redirects()
 	
 	FEMultiLineText_patch();
 	
-	    
+	    main_menu_start_build_patch();
 		
 		    //    fe_mini_map_widget_patch();
 	
@@ -7648,7 +7604,10 @@ BOOL install_redirects()
 	
 	        cursor_patch();
 	
-	       FrontEndMenuSystem_patch();
+	   
+	   FrontEndMenuSystem_build_patch();
+	   
+	   resource_directory_patch();
 			
 			script_file_loader_patch();
 			
@@ -8454,6 +8413,7 @@ std::vector<uint8_t> read_file(const fs::path& filePath) {
 }
 
 
+
 void enumerate_mods() {
     Mods.clear();
     ModFileOverrides.clear();
@@ -8569,8 +8529,6 @@ void enumerate_mods() {
 		dbgReplaceMesh = getMod(0xCB5B8BA9, TLRESOURCE_TYPE_MESH_FILE);
 #   endif
 }
-
-
 
 
 

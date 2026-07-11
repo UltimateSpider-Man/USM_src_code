@@ -3,57 +3,56 @@
 #
 #   Produces, in a single `cmake --build build` invocation:
 #
-#     • build/USM_original.exe          — compiled from USM.c's rawData[5926912]
-#                                byte array (5,926,912 bytes = 5.65 MiB,
-#                                SHA-256 5d554ef6…0488b8 — byte-identical
-#                                to the original Ultimate Spider-Man exe
-#                                because that's what USM.c encodes).
-#     • build/binkw32.dll      — the OpenUSM mod-loader
-#     • build/debug_menu.dll   — the PC debug menu (UPX-compressed)
-#     • build/openusm.dll      — a copy of binkw32.dll under the
-#                                openusm name for asi-loader deploy
-#     • build/USM.exe          — USM_original.exe with a stripped
-#                                openusm.dll injected via tools/dll2exe.exe
-#                                (single-file mod-loader, no asi /
-#                                no on-disk binkw32 hijack required)
-#     • build/USMITA_original.exe — Italian variant, compiled from
-#                                USMITA.c's rawData[5926912] byte array.
-#                                Only built if USMITA.c is present.
-#     • build/USMITA.exe       — USMITA_original.exe with the same
-#                                stripped openusm.dll injected via
-#                                dll2exe.exe (mirrors the USM.exe step,
-#                                reusing the already-stripped DLL).
+#     • build/USM_original.exe   — compiled from USM.c's rawData[5926912]
+#                                  byte array (5,926,912 bytes = 5.65 MiB,
+#                                  byte-identical to the retail USM.exe).
+#     • build/binkw32.dll        — the OpenUSM mod-loader (release)
+#     • build/binkw32_prelib.dll — the OpenUSM mod-loader (prerelease;
+#                                  built from main_beta.cpp). Shipped under
+#                                  the name USM_prelib.dll.
+#     • build/USM.dll            — stripped, shippable copy of binkw32.dll
+#     • build/USM.exe            — USM_original.exe with a stripped
+#                                  binkw32-derived DLL injected via
+#                                  tools/dll2exe.exe.
+#     • build/USMITA_original.exe / USMITA.exe — Italian retail variant,
+#                                  compiled from USMITA.c (optional).
+#     • build/Ultimate_prerelease_original.exe — PRERELEASE variant,
+#                                  compiled from Ultimate_prerelease.c's
+#                                  rawData[5984512] byte array
+#                                  (5,984,512 bytes = 5.71 MiB — note this
+#                                  differs from the 5,926,912-byte retail
+#                                  exes). Built only if the source is present.
+#     • build/USM_prelib.dll     — binkw32_prelib.dll under its shipping name.
+#     • build/Ultimate_prerelease.exe — Ultimate_prerelease_original.exe with
+#                                  a stripped binkw32_prelib DLL
+#                                  (USM_prelib_stripped.dll) injected via
+#                                  dll2exe.exe (mirrors the USM.exe step).
 #
-#   Auto-deploys every output to ../Ultimate Spider-Man/ if that
-#   directory exists next to the source tree. Stock DLLs (binkw32,
-#   d3dx9_24, dsound, MSVCP71, msvcr71, xerces-c_2_3_0) in that
-#   folder are left untouched by this build.
+#   No file literally named openusm.dll / openusm_stripped.dll is produced.
+#   The only DLLs stripped by this build are binkw32.dll (for USM.exe) and
+#   binkw32_prelib.dll (for Ultimate_prerelease.exe).
+#
+#   Auto-deploys every output to ../Ultimate Spider-Man/ if that directory
+#   exists next to the source tree. Stock DLLs (binkw32, d3dx9_24, dsound,
+#   MSVCP71, msvcr71, xerces-c_2_3_0) in that folder are left untouched.
 #
 #   Required layout:
 #
 #       OpenUSM/
 #       ├── CMakeLists.txt                 ← this file
-#       ├── main.cpp                       ← binkw32 entry point
-#       ├── usm_debug_menu.cpp             ← debug_menu entry point
+#       ├── main_final.cpp                 ← binkw32 entry point
+#       ├── main_beta.cpp                  ← binkw32_prelib entry point
 #       ├── USM.c                          ← rawData[5926912] blob (REQUIRED)
-#       ├── USMITA.c                       ← rawData[5926912] blob — ITA
-#       │                                    variant (OPTIONAL; same symbol
-#       │                                    name as USM.c, so it's built
-#       │                                    as a parallel host program)
+#       ├── USMITA.c                       ← rawData[5926912] blob — ITA variant (OPTIONAL)
+#       ├── Ultimate_prerelease.c          ← rawData[5984512] blob — PRERELEASE variant (OPTIONAL)
 #       ├── emit_usm_exe.c                 ← host-tool writer       (REQUIRED)
 #       ├── src/                           ← parent-project libraries
-#       ├── usm_debug_menu/                ← optional: sibling debug
-#       │   ├── usm.cpp                      menu project (USM_DEBUG_MENU_DIR)
-#       │   └── dev_src/*.cpp,*.h
 #       ├── cmake/
 #       │   ├── i686-pc-mingw32.cmake      ← MinGW cross toolchain
 #       │   └── report_size.cmake          ← size reporter for UPX step
 #       ├── tools/
-#       │   └── dll2exe.exe                ← DLL→EXE injector used to
-#       │                                    bake openusm.dll into USM.exe
-#       ├── third_party/
-#       │   ├── glm/                       ← (optional, USE_GLM)
-#       │   └── googletest/                ← (optional, ENABLE_TESTS)
+#       │   └── dll2exe.exe                ← DLL→EXE injector
+#       ├── third_party/{glm,googletest}/  ← (optional)
 #       ├── assimp/                        ← Assimp source tree
 #       └── test/                          ← (optional, ENABLE_TESTS)
 #
@@ -64,18 +63,15 @@
 #
 #   Top-level options:
 #
-#     -DUSE_GLM=ON                   link glm::glm into binkw32/debug_menu
-#     -DUSE_FSTREAM=ON               -DUSE_FSTREAM in binkw32/debug_menu
+#     -DUSE_GLM=ON                   link glm::glm into binkw32/binkw32_prelib
+#     -DUSE_FSTREAM=ON               -DUSE_FSTREAM in binkw32/binkw32_prelib
 #     -DCHECK_STRUCT_SIZES=OFF       disable CHECK_STRUCT_SIZES define
 #     -DTARGET_XBOX=ON               build the Xbox variant of mash
 #     -DENABLE_TESTS=OFF             skip googletest/CTest
-#     -DUSM_BUILD_DEBUG_MENU=OFF     skip the debug_menu target
-#     -DDEBUG_MENU_COMPRESS=OFF      skip the UPX pack of debug_menu.dll
-#     -DDEBUG_MENU_STRIP_BEFORE_UPX=OFF
-#     -DDEBUG_MENU_SIZE_LIMIT=<bytes>  soft warning threshold (1 MiB default)
 #     -DUSM_C_SOURCE=<path>          override USM.c location
 #     -DUSM_C_WRITER_SOURCE=<path>   override emit_usm_exe.c location
 #     -DUSMITA_C_SOURCE=<path>       override USMITA.c location (ITA variant)
+#     -DUltimate_prerelease_C_SOURCE=<path>  override Ultimate_prerelease.c location
 # ═══════════════════════════════════════════════════════════════════════
 
 cmake_minimum_required(VERSION 3.12)
@@ -83,9 +79,10 @@ cmake_minimum_required(VERSION 3.12)
 include(ExternalProject)
 include(cmake/i686-pc-mingw32.cmake)
 
-set(CMAKE_C_FLAGS ${CMAKE_C_FLAGS} "-static -std=gnu11 -g")
+set(CMAKE_C_FLAGS ${CMAKE_C_FLAGS}
+    "-static -std=gnu11 -Os -ffunction-sections -fdata-sections")
 set(CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS}
-    "-fomit-frame-pointer -m32 -fno-asynchronous-unwind-tables -masm=intel -static -g")
+    "-fomit-frame-pointer -m32 -fno-asynchronous-unwind-tables -masm=intel -static -Os -ffunction-sections -fdata-sections")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 17)
@@ -173,7 +170,7 @@ project(USM-dev)
 
 if(MINGW)
     # Drop the "lib" prefix on MinGW so shared libs come out as
-    # binkw32.dll / debug_menu.dll — not libbinkw32.dll etc.
+    # binkw32.dll / binkw32_prelib.dll — not libbinkw32.dll etc.
     set(CMAKE_SHARED_LIBRARY_PREFIX "")
     set(CMAKE_STATIC_LIBRARY_PREFIX "")
     set(CMAKE_SHARED_MODULE_PREFIX  "")
@@ -189,9 +186,6 @@ option(USE_FSTREAM        ""                                             OFF)
 option(CHECK_STRUCT_SIZES ""                                             ON)
 option(TARGET_XBOX        ""                                             OFF)
 option(ENABLE_TESTS       ""                                             ON)
-
-# Optional big-ticket targets — flipping any of these OFF skips that
-# target cleanly (others keep building).
 
 if(CHECK_STRUCT_SIZES)
     add_compile_definitions(CHECK_STRUCT_SIZES)
@@ -235,24 +229,22 @@ target_link_libraries    (mash PUBLIC utility variables)
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#   binkw32.dll — OpenUSM mod loader
+#   binkw32.dll (release) + binkw32_prelib.dll (prerelease) — OpenUSM loaders
+#
+#   Both share the same ${SRC} glob (the in-process mod-loader code). They
+#   differ only in entry point: main_final.cpp vs. main_beta.cpp.
 # ─────────────────────────────────────────────────────────────────────────
 
 file(GLOB SRC "./src/*.cpp" "./src/*.h")
 
-add_library(binkw32 SHARED main.cpp ${SRC})
+add_library(binkw32 SHARED main_final.cpp ${SRC})
 target_compile_options(binkw32 PRIVATE ${flags})
 
+add_library(binkw32_prelib SHARED main_beta.cpp ${SRC})
+target_compile_options(binkw32_prelib PRIVATE ${flags})
 
-# ─────────────────────────────────────────────────────────────────────────
-#   debug_menu.dll — PC debug menu overlay
-#
-#   Shares the same ${SRC} glob as binkw32 (this is intentional — the
-#   debug menu runs inside the same in-process mod-loader code). The
-#   different entry point (usm_debug_menu.cpp vs. main.cpp) is what
-#   makes them distinct DLLs with different init behaviour.
-# ─────────────────────────────────────────────────────────────────────────
-
+add_library(binkw32_build SHARED main_build.cpp ${SRC})
+target_compile_options(binkw32_build PRIVATE ${flags})
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -375,20 +367,22 @@ target_link_libraries     (physics PUBLIC  utility ngl)
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#   Shared settings for binkw32 & debug_menu (same code, different entry)
+#   Shared settings for binkw32 & binkw32_prelib (same code, different entry)
 # ─────────────────────────────────────────────────────────────────────────
 
 if(USE_FSTREAM)
-    target_compile_definitions(binkw32 PUBLIC USE_FSTREAM)
-    endif()
+    target_compile_definitions(binkw32         PUBLIC USE_FSTREAM)
+    target_compile_definitions(binkw32_prelib  PUBLIC USE_FSTREAM)
+	    target_compile_definitions(binkw32_build  PUBLIC USE_FSTREAM)
+endif()
 
+target_include_directories(binkw32        PUBLIC "include" "./src/nfl/src/")
+target_include_directories(binkw32_prelib PUBLIC "include" "./src/nfl/src/")
+target_include_directories(binkw32_build PUBLIC "include" "./src/nfl/src/")
 
-target_include_directories(binkw32 PUBLIC "include" "./src/nfl/src/")
-
-
-target_include_directories(chuck  PUBLIC "include" "src")
-target_include_directories(tx     PUBLIC "include" "src")
-target_include_directories(ngl_dx PUBLIC "include" "src")
+target_include_directories(chuck   PUBLIC "include" "src")
+target_include_directories(tx      PUBLIC "include" "src")
+target_include_directories(ngl_dx  PUBLIC "include" "src")
 target_include_directories(test_tx PUBLIC "include" "src")
 
 
@@ -402,10 +396,14 @@ ExternalProject_Add(AssimpProject
     CMAKE_ARGS
         -DCMAKE_TOOLCHAIN_FILE=${CMAKE_SOURCE_DIR}/cmake/i686-pc-mingw32.cmake
         -DCMAKE_BUILD_TYPE=Release
-        -DASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT=ON
+        -DASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT=OFF
+        -DASSIMP_BUILD_OBJ_IMPORTER=ON
+        -DASSIMP_BUILD_FBX_IMPORTER=ON
+        -DASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT=OFF
         -DASSIMP_BUILD_ASSIMP_TOOLS=OFF
         -DASSIMP_BUILD_TESTS=OFF
-        -DASSIMP_NO_EXPORT=OFF
+        -DASSIMP_WARNINGS_AS_ERRORS=OFF
+        -DASSIMP_NO_EXPORT=ON
         -DBUILD_SHARED_LIBS=OFF
         -DASSIMP_BUILD_ZLIB=ON
         -DASSIMP_BUILD_SAMPLES=OFF
@@ -418,29 +416,75 @@ target_include_directories(binkw32 PUBLIC "./assimp/include/")
 target_link_directories   (binkw32 PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
 add_dependencies          (binkw32 AssimpProject)
 
+target_include_directories(binkw32_prelib PUBLIC "./assimp/include/")
+target_link_directories   (binkw32_prelib PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
+add_dependencies          (binkw32_prelib AssimpProject)
+
+target_include_directories(binkw32_build PUBLIC "./assimp/include/")
+target_link_directories   (binkw32_build PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
+add_dependencies          (binkw32_build AssimpProject)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#   Final link lines for binkw32 and binkw32_prelib
+#
+#   (Top level — NOT inside any if(TARGET USM). The loaders must link
+#    regardless of whether USM.c / the exe blobs are present.)
+# ─────────────────────────────────────────────────────────────────────────
+
+target_link_libraries(ngl_dx PUBLIC d3dx9)
+
+# --- binkw32 (release loader) ---
+target_link_directories(binkw32 PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
+target_link_directories(binkw32 PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
+target_link_libraries  (binkw32 PUBLIC physics
+                                       charanimtype mash chuck nfl ngl nal nsl utility
+                                       winmm psapi d3d9 dinput8 dxguid dsound assimp z)
+if(USE_GLM)
+    target_link_libraries(binkw32 PUBLIC glm::glm)
+endif()
+
+# --- binkw32_prelib (prerelease loader) — identical link set to binkw32 ---
+target_link_directories(binkw32_prelib PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
+target_link_directories(binkw32_prelib PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
+target_link_libraries  (binkw32_prelib PUBLIC physics
+                                       charanimtype mash chuck nfl ngl nal nsl utility
+                                       winmm psapi d3d9 dinput8 dxguid dsound assimp z)
+									   
+									   
+target_link_directories(binkw32_build PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
+target_link_directories(binkw32_build PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
+target_link_libraries  (binkw32_build PUBLIC physics
+                                       charanimtype mash chuck nfl ngl nal nsl utility
+                                       winmm psapi d3d9 dinput8 dxguid dsound assimp z)
+if(USE_GLM)
+    target_link_libraries(binkw32_prelib PUBLIC glm::glm)
+	target_link_libraries(binkw32_build PUBLIC glm::glm)
+endif()
+
+# Pin both loaders' output directory so the inject/deploy steps below know
+# exactly where to find them.
+set_target_properties(binkw32 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+foreach(_USM_LOADER_TARGET binkw32 binkw32_prelib binkw32_build)
+    target_compile_options(${_USM_LOADER_TARGET} PRIVATE
+        -Os -ffunction-sections -fdata-sections)
+    set_property(TARGET ${_USM_LOADER_TARGET} APPEND_STRING PROPERTY
+        LINK_FLAGS " -Wl,--gc-sections -Wl,--strip-all")
+endforeach()
+unset(_USM_LOADER_TARGET)
+set_target_properties(binkw32_prelib PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set_target_properties(binkw32_build PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#   USM_original.exe — compiled from USM.c
-#
-#   USM.c is a 37 MB ASCII-hex C source that declares one giant byte
-#   array:
-#       unsigned char rawData[5926912] = { 0x4D, 0x5A, ... };
-#   These bytes are the stock Ultimate Spider-Man USM_original.exe.
-#
-#   Build pipeline:
-#     1. Compile USM.c + emit_usm_exe.c with the HOST C compiler via
-#        ExternalProject (the MinGW cross-toolchain used everywhere
-#        else in this file can't be used here because the writer has
-#        to RUN on the build machine).
-#     2. Run the compiled writer with ${CMAKE_BINARY_DIR}/USM_original.exe as
-#        argv[1] — it fwrites the 5,926,912 bytes of rawData[] to disk
-#        in 1 MiB chunks.
-#
-#   Output: ${CMAKE_BINARY_DIR}/USM_original.exe — 5,926,912 bytes (5.65 MiB),
-#   SHA-256 5d554ef69e8066eed9e327a4fe331992124aee6de16af54bd7ac5c5dcb0488b8
-#   (byte-identical to the original game executable, because that's
-#   what's sitting inside USM.c's rawData[]).
+#   USM_original.exe — compiled from USM.c   (retail English, 5,926,912 B)
 # ═══════════════════════════════════════════════════════════════════════
 
 set(USM_C_SOURCE
@@ -464,11 +508,8 @@ elseif(NOT EXISTS "${USM_C_WRITER_SOURCE}")
         "with -DUSM_C_WRITER_SOURCE=<path>.")
 else()
     # ── Host-native compile of USM.c + emit_usm_exe.c ────────────────
-    # ExternalProject gives us an escape hatch from the parent
-    # CMAKE_TOOLCHAIN_FILE — we explicitly call `cc` (the host C
-    # compiler from the build environment) instead of the MinGW
-    # i686 cross-compiler. -O0 because optimizing a 5.9 MB initialized
-    # array gains nothing and costs minutes of compile time.
+    # NOTE: emit_usm_exe.c should size its write with sizeof(rawData),
+    # so the same writer works for every blob regardless of length.
     ExternalProject_Add(emit_usm_exe_host
         SOURCE_DIR        "${CMAKE_BINARY_DIR}/emit_usm_exe_src"
         BINARY_DIR        "${CMAKE_BINARY_DIR}/emit_usm_exe_build"
@@ -487,7 +528,6 @@ else()
         BUILD_ALWAYS      FALSE
     )
 
-    # ── Run the writer to produce USM_original.exe ────────────────────────────
     add_custom_command(
         OUTPUT  "${_OUT_USM}"
         COMMAND "${CMAKE_BINARY_DIR}/emit_usm_exe_build/emit_usm_exe"
@@ -499,8 +539,6 @@ else()
 
     add_custom_target(USM ALL DEPENDS "${_OUT_USM}")
 
-    # Compute + display the SHA-256 of USM.c so changes to the rawData[]
-    # blob are obvious at configure time.
     file(SIZE   "${USM_C_SOURCE}" _USM_C_SIZE)
     file(SHA256 "${USM_C_SOURCE}" _USM_C_SHA)
     message(STATUS "USM_original.exe: compiling from USM.c rawData[]")
@@ -513,26 +551,10 @@ endif()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#   USMITA.exe — Italian variant, compiled from USMITA.c
+#   USMITA_original.exe — Italian retail variant, compiled from USMITA.c
 #
-#   USMITA.c is the same kind of ASCII-hex blob as USM.c — it declares
-#   the same `unsigned char rawData[5926912]` symbol but contains the
-#   bytes of the Italian (ITA) release of USM.exe (also 5,926,912 bytes,
-#   5.65 MiB).
-#
-#   Because USM.c and USMITA.c both define `rawData[]`, they CANNOT be
-#   linked into a single host program — that would be a duplicate
-#   symbol error. So we build a parallel writer:
-#
-#       emit_usmita_exe = USMITA.c + emit_usm_exe.c
-#
-#   The writer source is exactly the same emit_usm_exe.c used for the
-#   English exe; only the rawData[] it links against differs. Two host
-#   programs, two distinct rawData[] arrays, two output exes — no
-#   source-file edits needed to either USMITA.c or emit_usm_exe.c.
-#
-#   Skipped silently if USMITA.c isn't present (it's an optional
-#   variant — the English USM.exe build is unaffected).
+#   Same rawData[5926912] symbol as USM.c, so it's built as a parallel
+#   host writer (emit_usmita_exe). Skipped silently if USMITA.c absent.
 # ═══════════════════════════════════════════════════════════════════════
 
 set(USMITA_C_SOURCE
@@ -547,13 +569,8 @@ if(NOT EXISTS "${USMITA_C_SOURCE}")
         "skipped. (Optional Italian variant; set -DUSMITA_C_SOURCE=<path> "
         "to enable.)")
 elseif(NOT EXISTS "${USM_C_WRITER_SOURCE}")
-    # Same writer source as USM.exe; the missing-writer warning was
-    # already emitted by the USM_original.exe block above. Silent here.
+    # Missing-writer warning already emitted by the USM block. Silent here.
 else()
-    # ── Host-native compile of USMITA.c + emit_usm_exe.c ─────────────
-    # Mirrors the USM_original.exe ExternalProject exactly. The output
-    # binary is named differently (emit_usmita_exe) so it cannot
-    # collide with the English writer on disk or at link time.
     ExternalProject_Add(emit_usmita_exe_host
         SOURCE_DIR        "${CMAKE_BINARY_DIR}/emit_usmita_exe_src"
         BINARY_DIR        "${CMAKE_BINARY_DIR}/emit_usmita_exe_build"
@@ -572,7 +589,6 @@ else()
         BUILD_ALWAYS      FALSE
     )
 
-    # ── Run the writer to produce USMITA.exe ─────────────────────────
     add_custom_command(
         OUTPUT  "${_OUT_USMITA}"
         COMMAND "${CMAKE_BINARY_DIR}/emit_usmita_exe_build/emit_usmita_exe"
@@ -595,21 +611,440 @@ else()
 endif()
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#   USM target — post-build: wire in the built mod loader + deploy outputs
+
+# ═══════════════════════════════════════════════════════════════════════
+#   Ultimate_Build_original.exe — Italian retail variant, compiled from ultimate_build.c
 #
-#   No stock DLLs are staged into the build tree by this file. Only
-#   files produced by THIS build are touched:
-#     • $<TARGET_FILE:binkw32>   → copied alongside USM_original.exe as openusm.dll
-#     • $<TARGET_FILE:debug_menu> → built alongside USM_original.exe as debug_menu.dll
-#   If your game install folder exists next to the source tree, the
-#   same three artifacts (USM_original.exe, binkw32.dll, debug_menu.dll) are
-#   also deployed there.
+#   Same rawData[5926912] symbol as USM.c, so it's built as a parallel
+#   host writer (emit_ultimate_build_exe). Skipped silently if ultimate_build.c absent.
+# ═══════════════════════════════════════════════════════════════════════
+
+set(ultimate_build_C_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/ultimate_build.c"
+    CACHE FILEPATH "Path to ultimate_build.c with rawData[5926912] byte array (Italian variant)")
+
+set(_OUT_ultimate_build "${CMAKE_BINARY_DIR}/Ultimate_Build_original.exe")
+
+if(NOT EXISTS "${ultimate_build_C_SOURCE}")
+    message(STATUS
+        "ultimate_build.c not found at ${ultimate_build_C_SOURCE} — ultimate_build target "
+        "skipped. (Optional Italian variant; set -Dultimate_build_C_SOURCE=<path> "
+        "to enable.)")
+elseif(NOT EXISTS "${USM_C_WRITER_SOURCE}")
+    # Missing-writer warning already emitted by the USM block. Silent here.
+else()
+    ExternalProject_Add(emit_ultimate_build_exe_host
+        SOURCE_DIR        "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_src"
+        BINARY_DIR        "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build"
+        DOWNLOAD_COMMAND  ""
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND
+            ${CMAKE_COMMAND} -E make_directory
+                "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build"
+            COMMAND
+            cc -O0
+               "${ultimate_build_C_SOURCE}"
+               "${USM_C_WRITER_SOURCE}"
+               -o "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build/emit_ultimate_build_exe"
+        INSTALL_COMMAND   ""
+        BUILD_BYPRODUCTS  "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build/emit_ultimate_build_exe"
+        BUILD_ALWAYS      FALSE
+    )
+
+    add_custom_command(
+        OUTPUT  "${_OUT_ultimate_build}"
+        COMMAND "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build/emit_ultimate_build_exe"
+                "${_OUT_ultimate_build}"
+        DEPENDS emit_ultimate_build_exe_host "${ultimate_build_C_SOURCE}" "${USM_C_WRITER_SOURCE}"
+        COMMENT "Compiling Ultimate_Build_original.exe from ultimate_build.c rawData[] (5,926,912 bytes / 5.65 MiB)"
+        VERBATIM
+    )
+
+    add_custom_target(ultimate_build ALL DEPENDS "${_OUT_ultimate_build}")
+
+    file(SIZE   "${ultimate_build_C_SOURCE}" _ultimate_build_C_SIZE)
+    file(SHA256 "${ultimate_build_C_SOURCE}" _ultimate_build_C_SHA)
+    message(STATUS "Ultimate_Build_original.exe: compiling from ultimate_build.c rawData[]")
+    message(STATUS "  ultimate_build.c       : ${ultimate_build_C_SOURCE}")
+    message(STATUS "  ultimate_build.c size  : ${_ultimate_build_C_SIZE} bytes")
+    message(STATUS "  ultimate_build.c sha256: ${_ultimate_build_C_SHA}")
+    message(STATUS "  writer         : ${USM_C_WRITER_SOURCE}")
+    message(STATUS "  output         : ${_OUT_ultimate_build} (expected: 5926912 bytes / 5.65 MiB)")
+endif()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#   Ultimate_prerelease_original.exe — PRERELEASE variant
+#
+#   Ultimate_prerelease.c is the same kind of ASCII-hex blob as USM.c, but
+#   declares  unsigned char rawData[5984512]  — the bytes of the Ultimate
+#   Spider-Man PRERELEASE build (5,984,512 bytes / 5.71 MiB).
+#
+#   ⚠ SIZE DIFFERS from retail: 5,984,512 (prerelease) vs 5,926,912
+#     (USM/USMITA). emit_usm_exe.c MUST write sizeof(rawData) bytes (not a
+#     hard-coded 5926912) or this exe will be truncated. If your writer
+#     hard-codes the retail length, parameterise it before building this.
+#
+#   Built as its own host writer (emit_Ultimate_prerelease_exe) so its
+#   rawData[] cannot collide with USM.c / USMITA.c at link time. Skipped
+#   silently if Ultimate_prerelease.c is absent.
+# ═══════════════════════════════════════════════════════════════════════
+
+set(Ultimate_prerelease_C_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/Ultimate_prerelease.c"
+    CACHE FILEPATH "Path to Ultimate_prerelease.c with rawData[5984512] byte array (prerelease variant)")
+
+set(_OUT_Ultimate_prerelease "${CMAKE_BINARY_DIR}/Ultimate_prerelease_original.exe")
+
+if(NOT EXISTS "${Ultimate_prerelease_C_SOURCE}")
+    message(STATUS
+        "Ultimate_prerelease.c not found at ${Ultimate_prerelease_C_SOURCE} — "
+        "Ultimate_prerelease target skipped. (Optional prerelease variant; "
+        "set -DUltimate_prerelease_C_SOURCE=<path> to enable.)")
+elseif(NOT EXISTS "${USM_C_WRITER_SOURCE}")
+    # Missing-writer warning already emitted by the USM block. Silent here.
+else()
+    # ── Host-native compile of Ultimate_prerelease.c + emit_usm_exe.c ──
+    # Mirrors the USM_original.exe ExternalProject. The host program is
+    # named emit_Ultimate_prerelease_exe so it cannot collide with the
+    # English / Italian writers on disk or at link time.
+    ExternalProject_Add(emit_Ultimate_prerelease_exe_host
+        SOURCE_DIR        "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_src"
+        BINARY_DIR        "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build"
+        DOWNLOAD_COMMAND  ""
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND
+            ${CMAKE_COMMAND} -E make_directory
+                "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build"
+            COMMAND
+            cc -O0
+               "${Ultimate_prerelease_C_SOURCE}"
+               "${USM_C_WRITER_SOURCE}"
+               -o "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build/emit_Ultimate_prerelease_exe"
+        INSTALL_COMMAND   ""
+        BUILD_BYPRODUCTS  "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build/emit_Ultimate_prerelease_exe"
+        BUILD_ALWAYS      FALSE
+    )
+
+    add_custom_command(
+        OUTPUT  "${_OUT_Ultimate_prerelease}"
+        COMMAND "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build/emit_Ultimate_prerelease_exe"
+                "${_OUT_Ultimate_prerelease}"
+        DEPENDS emit_Ultimate_prerelease_exe_host
+                "${Ultimate_prerelease_C_SOURCE}" "${USM_C_WRITER_SOURCE}"
+        COMMENT "Compiling Ultimate_prerelease_original.exe from Ultimate_prerelease.c rawData[] (5,984,512 bytes / 5.71 MiB)"
+        VERBATIM
+    )
+
+    add_custom_target(Ultimate_prerelease ALL DEPENDS "${_OUT_Ultimate_prerelease}")
+
+    file(SIZE   "${Ultimate_prerelease_C_SOURCE}" _PRE_C_SIZE)
+    file(SHA256 "${Ultimate_prerelease_C_SOURCE}" _PRE_C_SHA)
+    message(STATUS "Ultimate_prerelease_original.exe: compiling from Ultimate_prerelease.c rawData[]")
+    message(STATUS "  Ultimate_prerelease.c       : ${Ultimate_prerelease_C_SOURCE}")
+    message(STATUS "  Ultimate_prerelease.c size  : ${_PRE_C_SIZE} bytes")
+    message(STATUS "  Ultimate_prerelease.c sha256: ${_PRE_C_SHA}")
+    message(STATUS "  writer         : ${USM_C_WRITER_SOURCE}")
+    message(STATUS "  output         : ${_OUT_Ultimate_prerelease} (expected: 5984512 bytes / 5.71 MiB)")
+endif()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#   Shared dll2exe / strip / WSL setup
+#
+#   Used by BOTH the USM/USMITA inject pipeline and the
+#   Ultimate_prerelease inject pipeline below, so it lives at top level
+#   (not inside any if(TARGET ...)).
+# ─────────────────────────────────────────────────────────────────────────
+
+set(DLL2EXE "${CMAKE_CURRENT_SOURCE_DIR}/tools/dll2exe.exe")
+
+# Locate strip from the active toolchain (MinGW i686 cross-compile, or
+# native MSYS2 MinGW). The toolchain file usually sets CMAKE_STRIP.
+if(NOT CMAKE_STRIP)
+    find_program(CMAKE_STRIP
+        NAMES i686-pc-mingw32-strip
+              i686-w64-mingw32-strip
+              strip)
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────
+#   Should the loader DLL keep its debug symbols when injected into the exe?
+#
+#   The final *.exe is NEVER `strip`ped directly. What the inject pipelines
+#   below strip is the loader DLL copy (USM_stripped.dll / *_prelib_stripped /
+#   *_build_stripped) that dll2exe folds into the retail blob. Turning this
+#   OFF injects the UNstripped loader, so its symbols survive inside the exe.
+#
+#   Tradeoff: symbols are real bytes. With Assimp statically linked, an
+#   unstripped loader is much larger, so the injected exe grows and — even
+#   after UPX --lzma — the packed *.exe will NOT be byte-identical to (and may
+#   exceed the budget of) the stripped build. The size REPORTED by the pack
+#   step is the source of truth. Note that stripping only ever changed the
+#   on-disk size; the loaded image size (PE SizeOfImage) is identical either
+#   way, since symbol/debug sections are not mapped at runtime.
+#
+#   Default ON preserves today's shipping-exe size exactly. Build with
+#   -DUSM_STRIP_INJECTED_DLL=OFF to retain symbols inside the exe.
+# ─────────────────────────────────────────────────────────────────────────
+option(USM_STRIP_INJECTED_DLL
+    "strip --strip-all the loader DLL before dll2exe injects it into the exe"
+    ON)
+
+# Copy-then-maybe-strip helper, generated next to the build outputs (mirrors
+# usm_pack.cmake). Centralises the strip decision for every inject pipeline
+# and stays 3.12-compatible (no file(COPY_FILE)). Never hard-fails on a strip
+# hiccup — it downgrades to a warning so dll2exe still runs.
+set(_USM_MAKE_LOADER_SCRIPT "${CMAKE_BINARY_DIR}/usm_make_loader.cmake")
+file(WRITE "${_USM_MAKE_LOADER_SCRIPT}" [=[
+# usm_make_loader.cmake (generated by CMakeLists.txt)
+#   cmake -DSRC=<built.dll> -DOUT=<loader.dll> \
+#         -DSTRIP=<strip-or-empty> -DDOSTRIP=<ON/OFF> \
+#         -P usm_make_loader.cmake
+# Copy SRC -> OUT, then strip OUT in place ONLY when DOSTRIP is true.
+if(NOT DEFINED SRC OR NOT EXISTS "${SRC}")
+    message(FATAL_ERROR "usm_make_loader: SRC not found: ${SRC}")
+endif()
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E copy "${SRC}" "${OUT}"
+    RESULT_VARIABLE _cp)
+if(NOT _cp EQUAL 0)
+    message(FATAL_ERROR "usm_make_loader: copy failed: ${SRC} -> ${OUT}")
+endif()
+if(DOSTRIP AND STRIP)
+    execute_process(
+        COMMAND "${STRIP}" --strip-all "${OUT}"
+        RESULT_VARIABLE _st)
+    if(NOT _st EQUAL 0)
+        message(WARNING
+            "usm_make_loader: strip exit ${_st} on ${OUT}; left unstripped.")
+    endif()
+else()
+    message(STATUS
+        "usm_make_loader: ${OUT} left UNstripped (debug symbols retained).")
+endif()
+]=])
+
+# WSL detection — on WSL the host is "Linux" but dll2exe.exe runs as a
+# native Windows process via interop, so Linux-style argv paths must be
+# translated to a Windows-resolvable form.
+set(_IS_WSL FALSE)
+if(NOT CMAKE_HOST_WIN32 AND EXISTS "/proc/sys/kernel/osrelease")
+    file(READ "/proc/sys/kernel/osrelease" _OSRELEASE)
+    if(_OSRELEASE MATCHES "[Mm]icrosoft|WSL")
+        set(_IS_WSL TRUE)
+        find_program(WSLPATH wslpath)
+    endif()
+endif()
+
+# Translate a CMake (Linux) path into the form dll2exe.exe expects in argv.
+#   • /mnt/<drive>/...   →   <DRIVE>:/...        (pure string rewrite)
+#   • /home/..., /tmp/.. →   \\wsl$\<distro>\... (via wslpath)
+# The /mnt/ branch deliberately avoids wslpath (it returns empty for paths
+# that don't yet exist on the Windows side, e.g. the dll2exe output at
+# configure time).
+function(_to_dll2exe_path linux_path out_var)
+    set(_p "${linux_path}")
+    if(_IS_WSL)
+        if(_p MATCHES "^/mnt/([a-zA-Z])/(.*)$")
+            string(TOUPPER "${CMAKE_MATCH_1}" _drive)
+            set(_p "${_drive}:/${CMAKE_MATCH_2}")
+        elseif(_p MATCHES "^/mnt/([a-zA-Z])/?$")
+            string(TOUPPER "${CMAKE_MATCH_1}" _drive)
+            set(_p "${_drive}:/")
+        elseif(WSLPATH)
+            execute_process(
+                COMMAND "${WSLPATH}" -m "${linux_path}"
+                OUTPUT_VARIABLE _w
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _r)
+            if(_r EQUAL 0 AND _w)
+                set(_p "${_w}")
+            endif()
+        endif()
+    endif()
+    set(${out_var} "${_p}" PARENT_SCOPE)
+endfunction()
+
+# dll2exe.exe is a Windows PE binary. Pick a launcher:
+#   • Native Windows / WSL: run directly.
+#   • Native Linux/macOS: drive it through wine (wine maps Linux paths
+#     via Z:/ so no translation is needed there).
+if(CMAKE_HOST_WIN32 OR _IS_WSL)
+    set(_DLL2EXE_RUN "${DLL2EXE}")
+else()
+    find_program(WINE_EXECUTABLE wine)
+    if(WINE_EXECUTABLE)
+        set(_DLL2EXE_RUN "${WINE_EXECUTABLE}" "${DLL2EXE}")
+    else()
+        set(_DLL2EXE_RUN "${DLL2EXE}")
+    endif()
+endif()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#   UPX packing of the FINAL injected exes
+#   (USM.exe / Ultimate_prerelease.exe / Ultimate_Build.exe → ~8 MiB)
+#
+#   Each of those exes is the ~5.7 MiB retail/prerelease blob PLUS the
+#   statically-linked OpenUSM loader that dll2exe injects, so on disk they
+#   land well above 8 MiB. `strip` cannot help here — the blob is already a
+#   final retail PE, and the injected loader DLL was --strip-all'd before
+#   injection (unless -DUSM_STRIP_INJECTED_DLL=OFF), so the remaining weight
+#   is genuine code+data. UPX --lzma packs
+#   the whole PE in place; the UPX stub self-extracts at launch and transfers
+#   to the dll2exe-fixed original entry point (-efix).
+#
+#   ORDER MATTERS: packing must run AFTER dll2exe has produced the exe, so
+#   each usm_pack_exe() call below is attached to the SAME target as — and
+#   added strictly after — that target's dll2exe POST_BUILD step. Because it
+#   is also added before the ../Ultimate Spider-Man/ deploy steps, the copy
+#   that lands in the game folder is the packed one.
+#
+#   Tunables:
+#     -DUSM_PACK_EXES=ON             re-enable UPX compression (default OFF)
+#     -DUSM_EXE_SIZE_BUDGET=<bytes>  size ceiling for the report
+#                                    (default 8388608 = 8 MiB)
+#
+#   NOTE: default is now OFF — the final exes are injected but NOT compressed,
+#   so on disk they keep their full ~injected size (retail blob + loader,
+#   which lands well above the 8 MiB budget). UPX is the ONLY thing that
+#   shrinks these on disk; with it off the size is still reported and the
+#   budget check still warns. Set -DUSM_PACK_EXES=ON to compress again.
+#   (Changing this default only affects FRESH build dirs; an already-cached
+#   USM_PACK_EXES keeps its old value until you pass -DUSM_PACK_EXES=... or
+#   delete the build dir.)
+# ─────────────────────────────────────────────────────────────────────────
+
+option(USM_PACK_EXES "UPX-compress the final injected exes" OFF)
+set(USM_EXE_SIZE_BUDGET "8388608" CACHE STRING
+    "Size ceiling in bytes for the packed exes (default 8 MiB = 8388608).")
+option(USM_PACK_DLLS "UPX-compress the produced loader DLLs" ON)
+set(USM_DLL_SIZE_BUDGET "2097152" CACHE STRING
+    "Size ceiling in bytes for packed loader DLLs (default 2 MiB = 2097152).")
+
+find_program(UPX_EXECUTABLE NAMES upx upx-ucl)
+if(UPX_EXECUTABLE)
+    message(STATUS "Final-exe packing: upx = ${UPX_EXECUTABLE} "
+                   "(budget ${USM_EXE_SIZE_BUDGET} bytes)")
+elseif(USM_PACK_EXES)
+    message(WARNING
+        "USM_PACK_EXES is ON but upx was not found — the final exes will be "
+        "size-reported but NOT compressed. Install UPX "
+        "(https://upx.github.io) or configure with -DUSM_PACK_EXES=OFF.")
+endif()
+
+# In-place pack-and-report helper, emitted next to the build outputs so the
+# whole step is self-contained, cross-platform, and never hard-fails the
+# build (any UPX trouble downgrades to a warning).
+set(_USM_PACK_SCRIPT "${CMAKE_BINARY_DIR}/usm_pack.cmake")
+file(WRITE "${_USM_PACK_SCRIPT}" [=[
+# usm_pack.cmake (generated by CMakeLists.txt)
+#   cmake -DFILE=<exe> -DUPX=<upx-or-empty> -DDOPACK=<ON/OFF> \
+#         -DBUDGET=<bytes> -P usm_pack.cmake
+# Always reports FILE's size against BUDGET. Compresses FILE in place with
+# UPX only when DOPACK is ON and a usable UPX is supplied. Any UPX trouble
+# downgrades to a warning so deploy/cleanup still run.
+if(NOT DEFINED FILE OR NOT EXISTS "${FILE}")
+    message(WARNING "usm_pack: target file not found, skipping: ${FILE}")
+    return()
+endif()
+get_filename_component(_name "${FILE}" NAME)
+file(SIZE "${FILE}" _before)
+if(DOPACK AND UPX AND EXISTS "${UPX}")
+    execute_process(
+        COMMAND "${UPX}" --best --lzma --force -q "${FILE}"
+        RESULT_VARIABLE _rc
+        OUTPUT_VARIABLE _out
+        ERROR_VARIABLE  _err)
+    if(NOT _rc EQUAL 0)
+        message(WARNING
+            "usm_pack: upx exit ${_rc} on ${_name}; left uncompressed. "
+            "${_out}${_err}")
+    endif()
+elseif(DOPACK)
+    message(WARNING "usm_pack: no usable UPX; ${_name} left uncompressed.")
+else()
+    message(STATUS "usm_pack: UPX disabled; ${_name} left uncompressed.")
+endif()
+file(SIZE "${FILE}" _after)
+math(EXPR _mib "${_after} / 1048576")
+math(EXPR _kib "(${_after} % 1048576) / 1024")
+if(DEFINED BUDGET AND _after GREATER BUDGET)
+    math(EXPR _bmib "${BUDGET} / 1048576")
+    message(WARNING
+        "${_name}: ${_before} -> ${_after} bytes (~${_mib} MiB ${_kib} KiB) "
+        "OVER budget ${BUDGET} bytes (~${_bmib} MiB).")
+else()
+    message(STATUS
+        "${_name}: ${_before} -> ${_after} bytes "
+        "(~${_mib} MiB ${_kib} KiB) within budget.")
+endif()
+]=])
+
+# usm_pack_exe(<target> <exe-path-on-disk>)
+#   Append a POST_BUILD step to <target> that reports <exe-path>'s size vs
+#   USM_EXE_SIZE_BUDGET and, when USM_PACK_EXES is ON, UPX-packs it in place.
+#   The size is reported either way, so the no-UPX size is always visible.
+#   MUST be called after the target's dll2exe injection command so it runs
+#   later in the POST_BUILD chain (and before the deploy steps below).
+function(usm_pack_exe tgt exe_path)
+    if(USM_PACK_EXES AND UPX_EXECUTABLE)
+        set(_upx_arg "${UPX_EXECUTABLE}")
+    else()
+        set(_upx_arg "")
+    endif()
+    if(USM_PACK_EXES)
+        set(_dopack ON)
+    else()
+        set(_dopack OFF)
+    endif()
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                "-DFILE=${exe_path}"
+                "-DUPX=${_upx_arg}"
+                "-DDOPACK=${_dopack}"
+                "-DBUDGET=${USM_EXE_SIZE_BUDGET}"
+                -P "${_USM_PACK_SCRIPT}"
+        COMMENT "Checking ${exe_path} size (UPX pack=${_dopack}, budget ${USM_EXE_SIZE_BUDGET} bytes)"
+        VERBATIM)
+endfunction()
+
+function(usm_pack_dll tgt dll_path)
+    if(USM_PACK_DLLS AND UPX_EXECUTABLE)
+        set(_upx_arg "${UPX_EXECUTABLE}")
+    else()
+        set(_upx_arg "")
+    endif()
+    if(USM_PACK_DLLS)
+        set(_dopack ON)
+    else()
+        set(_dopack OFF)
+    endif()
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                "-DFILE=${dll_path}"
+                "-DUPX=${_upx_arg}"
+                "-DDOPACK=${_dopack}"
+                "-DBUDGET=${USM_DLL_SIZE_BUDGET}"
+                -P "${_USM_PACK_SCRIPT}"
+        COMMENT "Checking ${dll_path} size (UPX pack=${_dopack}, budget ${USM_DLL_SIZE_BUDGET} bytes)"
+        VERBATIM)
+endfunction()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#   USM.exe / USMITA.exe — inject the release loader (binkw32)
+#
+#     1. binkw32.dll → USM.dll → USM_stripped.dll, then strip USM_stripped.dll
+#     2. dll2exe -efix -injimp USM_original.exe USM_stripped.dll USM.exe
+#        (USMITA.exe reuses the same stripped DLL)
+#
+#   -efix    restore the original PE entry point after the DLL loads
+#   -injimp  rewrite the import table to bind Bink* imports to the loader
 # ─────────────────────────────────────────────────────────────────────────
 
 if(TARGET USM)
-    # Wire the mod loader into the USM build graph so every build of
-    # USM also produces a fresh USM.dll next to it.
     if(TARGET binkw32)
         add_dependencies(USM binkw32)
         add_custom_command(TARGET USM POST_BUILD
@@ -620,157 +1055,35 @@ if(TARGET USM)
             VERBATIM)
     endif()
 
-    # ─────────────────────────────────────────────────────────────────
-    #   USM.exe — final shipping executable
-    #
-    #   tools/dll2exe.exe injects USM.dll into USM_original.exe so
-    #   the game launches with the mod loader baked in (no asi-loader,
-    #   no on-disk binkw32 hijack required).
-    #
-    #   Pipeline:
-    #     1. strip --strip-all USM.dll → openusm_stripped.dll
-    #        (the build runs with -g; embedded debug info would bloat
-    #         USM.exe by several MB for no gain)
-    #     2. dll2exe -efix -injimp
-    #            USM_original.exe openusm_stripped.dll USM.exe
-    #
-    #   dll2exe switches:
-    #     -efix    restore the original PE entry point so the game's
-    #              own startup runs after the DLL loads
-    #     -injimp  rewrite USM.exe's import table to bind Bink* imports
-    #              to openusm.dll's exports — the same hijack pattern
-    #              as the on-disk binkw32.dll, but baked into the exe
-    # ─────────────────────────────────────────────────────────────────
-
-    set(DLL2EXE "${CMAKE_CURRENT_SOURCE_DIR}/tools/dll2exe.exe")
-
-    # Locate strip from the active toolchain (MinGW i686 cross-compile,
-    # or native MSYS2 MinGW). CMake usually sets CMAKE_STRIP from the
-    # toolchain file; fall back to a name search if it didn't.
-    if(NOT CMAKE_STRIP)
-        find_program(CMAKE_STRIP
-            NAMES i686-pc-mingw32-strip
-                  i686-w64-mingw32-strip
-                  strip)
-    endif()
-
-    # ── WSL detection ────────────────────────────────────────────
-    # On WSL the host is "Linux" from CMake's POV (CMAKE_HOST_WIN32
-    # is FALSE), but dll2exe.exe is launched via Win32 interop and
-    # therefore runs as a native Windows process. Linux-style paths
-    # like /mnt/c/Users/... in argv are passed through verbatim and
-    # Windows tries to resolve them as \mnt\c\Users\... on the
-    # current drive — which fails with "failed to load executable
-    # image".
-    set(_IS_WSL FALSE)
-    if(NOT CMAKE_HOST_WIN32 AND EXISTS "/proc/sys/kernel/osrelease")
-        file(READ "/proc/sys/kernel/osrelease" _OSRELEASE)
-        if(_OSRELEASE MATCHES "[Mm]icrosoft|WSL")
-            set(_IS_WSL TRUE)
-            find_program(WSLPATH wslpath)
-        endif()
-    endif()
-
-    # Translate a CMake (Linux) path into the form dll2exe.exe expects
-    # in argv. On WSL:
-    #   • /mnt/<drive>/...   →   <DRIVE>:/...   (pure string rewrite)
-    #   • /home/..., /tmp/.. →   \\wsl$\<distro>\...  (via wslpath)
-    #
-    # The /mnt/ branch deliberately does NOT call wslpath. Several WSL
-    # builds have wslpath silently return an empty string for paths
-    # that don't yet exist on the Windows side — which is the case for
-    # `USM.exe` (the dll2exe output) at configure time. Translating
-    # the prefix with a regex avoids that pitfall entirely.
-    function(_to_dll2exe_path linux_path out_var)
-        set(_p "${linux_path}")
-        if(_IS_WSL)
-            if(_p MATCHES "^/mnt/([a-zA-Z])/(.*)$")
-                string(TOUPPER "${CMAKE_MATCH_1}" _drive)
-                set(_p "${_drive}:/${CMAKE_MATCH_2}")
-            elseif(_p MATCHES "^/mnt/([a-zA-Z])/?$")
-                string(TOUPPER "${CMAKE_MATCH_1}" _drive)
-                set(_p "${_drive}:/")
-            elseif(WSLPATH)
-                # Off /mnt/ — translate via wslpath (\\wsl$\<distro>\…).
-                execute_process(
-                    COMMAND "${WSLPATH}" -m "${linux_path}"
-                    OUTPUT_VARIABLE _w
-                    OUTPUT_STRIP_TRAILING_WHITESPACE
-                    RESULT_VARIABLE _r)
-                if(_r EQUAL 0 AND _w)
-                    set(_p "${_w}")
-                endif()
-            endif()
-        endif()
-        set(${out_var} "${_p}" PARENT_SCOPE)
-    endfunction()
-
-    _to_dll2exe_path("${_OUT_USM}"                                _OUT_USM_ARG)
-    _to_dll2exe_path("${CMAKE_BINARY_DIR}/USM_stripped.dll"   _STRIPPED_ARG)
-    _to_dll2exe_path("${CMAKE_BINARY_DIR}/USM.exe"                _USM_EXE_ARG)
-    _to_dll2exe_path("${_OUT_USMITA}"                             _OUT_USMITA_ARG)
-    _to_dll2exe_path("${CMAKE_BINARY_DIR}/USMITA.exe"             _USMITA_EXE_ARG)
-
-    # Belt-and-suspenders: refuse to configure if any argv slot is
-    # empty. dll2exe.exe will otherwise report
-    # `failed to create output file ()` or similar with the empty
-    # arg displayed as just `()`, which is hard to diagnose.
-    foreach(_v _OUT_USM_ARG _STRIPPED_ARG _USM_EXE_ARG _OUT_USMITA_ARG _USMITA_EXE_ARG)
-        if(NOT "${${_v}}")
-
-        endif()
-    endforeach()
-
-    # dll2exe.exe is a Windows PE binary. Pick a launcher:
-    #   • Native Windows / WSL: run directly (Win32 interop on WSL
-    #     handles the .exe extension automatically).
-    #   • Native Linux/macOS: drive it through wine. wine maps
-    #     Linux paths via Z:/ so no path translation is needed there.
-    if(CMAKE_HOST_WIN32 OR _IS_WSL)
-        set(_DLL2EXE_RUN "${DLL2EXE}")
-    else()
-        find_program(WINE_EXECUTABLE wine)
-        if(WINE_EXECUTABLE)
-            set(_DLL2EXE_RUN "${WINE_EXECUTABLE}" "${DLL2EXE}")
-        else()
-            # Configure-time: let it through. Build-time: will fail
-            # with a useful error pointing at the missing wine.
-            set(_DLL2EXE_RUN "${DLL2EXE}")
-        endif()
-    endif()
+    _to_dll2exe_path("${_OUT_USM}"                          _OUT_USM_ARG)
+    _to_dll2exe_path("${CMAKE_BINARY_DIR}/USM_stripped.dll" _STRIPPED_ARG)
+    _to_dll2exe_path("${CMAKE_BINARY_DIR}/USM.exe"          _USM_EXE_ARG)
+    _to_dll2exe_path("${_OUT_USMITA}"                       _OUT_USMITA_ARG)
+    _to_dll2exe_path("${CMAKE_BINARY_DIR}/USMITA.exe"       _USMITA_EXE_ARG)
 
     if(EXISTS "${DLL2EXE}")
         if(TARGET binkw32)
             add_custom_command(TARGET USM POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy
-                        "${CMAKE_BINARY_DIR}/USM.dll"
-                        "${CMAKE_BINARY_DIR}/USM_stripped.dll"
-                COMMAND "${CMAKE_STRIP}" --strip-all
-                        "${CMAKE_BINARY_DIR}/USM_stripped.dll"
+                COMMAND ${CMAKE_COMMAND}
+                        "-DSRC=${CMAKE_BINARY_DIR}/USM.dll"
+                        "-DOUT=${CMAKE_BINARY_DIR}/USM_stripped.dll"
+                        "-DSTRIP=${CMAKE_STRIP}"
+                        "-DDOSTRIP=${USM_STRIP_INJECTED_DLL}"
+                        -P "${_USM_MAKE_LOADER_SCRIPT}"
                 COMMAND ${_DLL2EXE_RUN} -efix -injimp
                         "${_OUT_USM_ARG}"
                         "${_STRIPPED_ARG}"
                         "${_USM_EXE_ARG}"
-                COMMENT "Stripping USM.dll and injecting into USM_original.exe → USM.exe"
+                COMMENT "Preparing USM loader (strip=${USM_STRIP_INJECTED_DLL}) and injecting into USM_original.exe → USM.exe"
                 VERBATIM)
+            usm_pack_exe(USM "${CMAKE_BINARY_DIR}/USM.exe")
             message(STATUS "USM.exe: dll2exe injector  : ${DLL2EXE}")
-            message(STATUS "USM.exe: strip             : ${CMAKE_STRIP}")
+            message(STATUS "USM.exe: inject strip      : ${USM_STRIP_INJECTED_DLL} (${CMAKE_STRIP})")
             if(_IS_WSL)
                 message(STATUS "USM.exe: WSL detected      : translating argv paths via ${WSLPATH}")
-                message(STATUS "USM.exe:   USM_original.exe : ${_OUT_USM_ARG}")
-                message(STATUS "USM.exe:   USM_stripped: ${_STRIPPED_ARG}")
-                message(STATUS "USM.exe:   USM.exe (out)   : ${_USM_EXE_ARG}")
             endif()
 
-            # ─────────────────────────────────────────────────────────
-            #   USMITA.exe — same injection, Italian variant
-            #
-            #   Reuses the openusm_stripped.dll produced by USM's
-            #   POST_BUILD above — no need to strip the loader DLL
-            #   twice. add_dependencies(USMITA USM) below guarantees
-            #   USM's POST_BUILD (which creates openusm_stripped.dll)
-            #   completes before USMITA's POST_BUILD reads it.
-            # ─────────────────────────────────────────────────────────
+            # USMITA.exe — same injection, reusing USM_stripped.dll.
             if(TARGET USMITA)
                 add_dependencies(USMITA USM)
                 add_custom_command(TARGET USMITA POST_BUILD
@@ -781,11 +1094,6 @@ if(TARGET USM)
                     COMMENT "Injecting USM_stripped.dll into USMITA_original.exe → USMITA.exe"
                     VERBATIM)
                 message(STATUS "USMITA.exe: dll2exe injector  : ${DLL2EXE}")
-                if(_IS_WSL)
-                    message(STATUS "USMITA.exe:   USMITA_original.exe : ${_OUT_USMITA_ARG}")
-                    message(STATUS "USMITA.exe:   USM_stripped    : ${_STRIPPED_ARG}")
-                    message(STATUS "USMITA.exe:   USMITA.exe (out)    : ${_USMITA_EXE_ARG}")
-                endif()
             endif()
         endif()
     else()
@@ -793,22 +1101,153 @@ if(TARGET USM)
             "dll2exe.exe not found at ${DLL2EXE} — USM.exe will not be "
             "produced. Place dll2exe.exe in tools/ at the project root.")
     endif()
+endif()
 
-    # Ditto for debug_menu — ensure it's up to date next to USM_original.exe.
 
-    # Auto-deploy the built artifacts into ../Ultimate Spider-Man/ if
-    # that folder exists. The user's existing stock DLLs in that
-    # folder are left untouched.
-    set(_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Ultimate Spider-Man")
-    if(EXISTS "${_GAME_DIR}/")
+# ─────────────────────────────────────────────────────────────────────────
+#   Ultimate_prerelease.exe — inject the PRERELEASE loader (binkw32_prelib)
+#
+#   Mirrors the USM.exe pipeline, but for the prerelease and using its own
+#   binkw32_prelib-derived DLLs (no openusm.dll / openusm_stripped.dll):
+#
+#     1. binkw32_prelib.dll → USM_prelib.dll          (deployable loader —
+#                                                       the requested rename)
+#     2. binkw32_prelib.dll → USM_prelib_stripped.dll, then
+#        strip --strip-all USM_prelib_stripped.dll     (the dll2exe input)
+#     3. dll2exe -efix -injimp
+#            Ultimate_prerelease_original.exe
+#            USM_prelib_stripped.dll
+#            Ultimate_prerelease.exe
+# ─────────────────────────────────────────────────────────────────────────
+
+if(TARGET Ultimate_prerelease AND TARGET binkw32_prelib)
+    add_dependencies(Ultimate_prerelease binkw32_prelib)
+
+    # (1) deployable loader: binkw32_prelib.dll → USM_prelib.dll
+    add_custom_command(TARGET binkw32_prelib POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "$<TARGET_FILE:binkw32_prelib>"
+            "${CMAKE_BINARY_DIR}/USM_prelib.dll"
+        COMMENT "Renaming prerelease loader → USM_prelib.dll"
+        VERBATIM)
+
+    usm_pack_dll(binkw32_prelib "${CMAKE_BINARY_DIR}/USM_prelib.dll")
+
+    if(EXISTS "${DLL2EXE}")
+        _to_dll2exe_path("${_OUT_Ultimate_prerelease}"                 _OUT_PRE_ARG)
+        _to_dll2exe_path("${CMAKE_BINARY_DIR}/USM_prelib_stripped.dll" _PRE_STRIPPED_ARG)
+        _to_dll2exe_path("${CMAKE_BINARY_DIR}/Ultimate_prerelease.exe" _PRE_EXE_ARG)
+
+        # (2)+(3) strip a copy of binkw32_prelib.dll, then inject it.
+        add_custom_command(TARGET Ultimate_prerelease POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                    "-DSRC=$<TARGET_FILE:binkw32_prelib>"
+                    "-DOUT=${CMAKE_BINARY_DIR}/USM_prelib_stripped.dll"
+                    "-DSTRIP=${CMAKE_STRIP}"
+                    "-DDOSTRIP=${USM_STRIP_INJECTED_DLL}"
+                    -P "${_USM_MAKE_LOADER_SCRIPT}"
+            COMMAND ${_DLL2EXE_RUN} -efix -injimp
+                    "${_OUT_PRE_ARG}"
+                    "${_PRE_STRIPPED_ARG}"
+                    "${_PRE_EXE_ARG}"
+            COMMENT "Preparing prerelease loader (strip=${USM_STRIP_INJECTED_DLL}) and injecting into Ultimate_prerelease_original.exe → Ultimate_prerelease.exe"
+            VERBATIM)
+        usm_pack_exe(Ultimate_prerelease "${CMAKE_BINARY_DIR}/Ultimate_prerelease.exe")
+        usm_pack_dll(Ultimate_prerelease "${CMAKE_BINARY_DIR}/USM_prelib_stripped.dll")
+        usm_pack_dll(Ultimate_prerelease "$<TARGET_FILE:binkw32_prelib>")
+        message(STATUS "Ultimate_prerelease.exe: dll2exe injector : ${DLL2EXE}")
+        message(STATUS "Ultimate_prerelease.exe: inject strip     : ${USM_STRIP_INJECTED_DLL} (${CMAKE_STRIP})")
+        if(_IS_WSL)
+            message(STATUS "Ultimate_prerelease.exe: WSL argv paths translated via ${WSLPATH}")
+        endif()
+    else()
+        message(WARNING
+            "dll2exe.exe not found at ${DLL2EXE} — Ultimate_prerelease.exe "
+            "will not be produced (USM_prelib.dll is still built).")
+    endif()
+endif()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#   Ultimate_Build.exe — inject the BUILD loader (binkw32_build)
+#
+#   Mirrors the Ultimate_prerelease.exe pipeline, but for the ultimate_build
+#   variant and using its own binkw32_build-derived DLLs:
+#
+#     1. binkw32_build.dll → USM_build.dll                 (deployable loader)
+#     2. binkw32_build.dll → USM_build_stripped.dll, then
+#        strip --strip-all USM_build_stripped.dll          (the dll2exe input)
+#     3. dll2exe -efix -injimp
+#            Ultimate_Build_original.exe
+#            USM_build_stripped.dll
+#            Ultimate_Build.exe
+# ─────────────────────────────────────────────────────────────────────────
+
+if(TARGET ultimate_build AND TARGET binkw32_build)
+    add_dependencies(ultimate_build binkw32_build)
+
+    # (1) deployable loader: binkw32_build.dll → USM_build.dll
+    add_custom_command(TARGET binkw32_build POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "$<TARGET_FILE:binkw32_build>"
+            "${CMAKE_BINARY_DIR}/USM_build.dll"
+        COMMENT "Renaming build loader → USM_build.dll"
+        VERBATIM)
+
+    usm_pack_dll(binkw32_build "${CMAKE_BINARY_DIR}/USM_build.dll")
+
+    if(EXISTS "${DLL2EXE}")
+        _to_dll2exe_path("${_OUT_ultimate_build}"                     _OUT_BUILD_ARG)
+        _to_dll2exe_path("${CMAKE_BINARY_DIR}/USM_build_stripped.dll" _BUILD_STRIPPED_ARG)
+        _to_dll2exe_path("${CMAKE_BINARY_DIR}/Ultimate_Build.exe"     _BUILD_EXE_ARG)
+
+        # (2)+(3) strip a copy of binkw32_build.dll, then inject it.
+        add_custom_command(TARGET ultimate_build POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                    "-DSRC=$<TARGET_FILE:binkw32_build>"
+                    "-DOUT=${CMAKE_BINARY_DIR}/USM_build_stripped.dll"
+                    "-DSTRIP=${CMAKE_STRIP}"
+                    "-DDOSTRIP=${USM_STRIP_INJECTED_DLL}"
+                    -P "${_USM_MAKE_LOADER_SCRIPT}"
+            COMMAND ${_DLL2EXE_RUN} -efix -injimp
+                    "${_OUT_BUILD_ARG}"
+                    "${_BUILD_STRIPPED_ARG}"
+                    "${_BUILD_EXE_ARG}"
+            COMMENT "Preparing build loader (strip=${USM_STRIP_INJECTED_DLL}) and injecting into Ultimate_Build_original.exe → Ultimate_Build.exe"
+            VERBATIM)
+        usm_pack_exe(ultimate_build "${CMAKE_BINARY_DIR}/Ultimate_Build.exe")
+        usm_pack_dll(ultimate_build "${CMAKE_BINARY_DIR}/USM_build_stripped.dll")
+        usm_pack_dll(ultimate_build "$<TARGET_FILE:binkw32_build>")
+        message(STATUS "Ultimate_Build.exe: dll2exe injector : ${DLL2EXE}")
+        message(STATUS "Ultimate_Build.exe: inject strip    : ${USM_STRIP_INJECTED_DLL} (${CMAKE_STRIP})")
+        if(_IS_WSL)
+            message(STATUS "Ultimate_Build.exe: WSL argv paths translated via ${WSLPATH}")
+        endif()
+    else()
+        message(WARNING
+            "dll2exe.exe not found at ${DLL2EXE} — Ultimate_Build.exe "
+            "will not be produced (USM_build.dll is still built).")
+    endif()
+endif()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#   Auto-deploy built artifacts into ../Ultimate Spider-Man/ if present.
+#   Stock DLLs already in that folder are left untouched.
+# ─────────────────────────────────────────────────────────────────────────
+
+option(USM_AUTO_DEPLOY "Copy built artifacts into ../Ultimate Spider-Man when that folder exists" ON)
+
+set(_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Ultimate Spider-Man")
+if(USM_AUTO_DEPLOY AND EXISTS "${_GAME_DIR}/")
+
+    # --- USM ---
+    if(TARGET USM)
         add_custom_command(TARGET USM POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy
                 "${_OUT_USM}" "${_GAME_DIR}/USM_original.exe"
             COMMENT "Deploying USM_original.exe to ${_GAME_DIR}"
             VERBATIM)
-
-        # USM.exe is produced only when dll2exe.exe is present; guard
-        # the deploy with the same EXISTS check used above.
         if(EXISTS "${DLL2EXE}" AND TARGET binkw32)
             add_custom_command(TARGET USM POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy
@@ -816,100 +1255,110 @@ if(TARGET USM)
                 COMMENT "Deploying USM.exe to ${_GAME_DIR}"
                 VERBATIM)
         endif()
+    endif()
 
-        if(TARGET binkw32)
-            add_custom_command(TARGET binkw32 POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy
-                    "$<TARGET_FILE:binkw32>" "${_GAME_DIR}/binkw32.dll"
-                COMMENT "Deploying binkw32.dll to ${_GAME_DIR}"
-                VERBATIM)
-        endif()
+    # --- release loader binkw32.dll ---
+    if(TARGET binkw32)
+        add_custom_command(TARGET binkw32 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "$<TARGET_FILE:binkw32>" "${_GAME_DIR}/binkw32.dll"
+            COMMENT "Deploying binkw32.dll to ${_GAME_DIR}"
+            VERBATIM)
+    endif()
 
-        # USMITA.exe is built only when USMITA.c is present; guard the
-        # deploys on the USMITA target's existence so this block is a
-        # no-op for English-only setups.
-        #
-        # Two artifacts are deployed:
-        #   • USMITA_original.exe — clean Italian exe (from the writer)
-        #   • USMITA.exe          — with openusm_stripped.dll injected
-        #                           (only when dll2exe.exe is present —
-        #                           same EXISTS guard as USM.exe above)
-        if(TARGET USMITA)
+    # --- prerelease loader, deployed under the renamed USM_prelib.dll ---
+    if(TARGET binkw32_prelib)
+        add_custom_command(TARGET binkw32_prelib POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "$<TARGET_FILE:binkw32_prelib>" "${_GAME_DIR}/USM_prelib.dll"
+            COMMENT "Deploying USM_prelib.dll to ${_GAME_DIR}"
+            VERBATIM)
+    endif()
+
+    # --- USMITA ---
+    if(TARGET USMITA)
+        add_custom_command(TARGET USMITA POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "${_OUT_USMITA}" "${_GAME_DIR}/USMITA_original.exe"
+            COMMENT "Deploying USMITA_original.exe to ${_GAME_DIR}"
+            VERBATIM)
+        if(EXISTS "${DLL2EXE}" AND TARGET binkw32)
             add_custom_command(TARGET USMITA POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy
-                    "${_OUT_USMITA}" "${_GAME_DIR}/USMITA_original.exe"
-                COMMENT "Deploying USMITA_original.exe to ${_GAME_DIR}"
+                    "${CMAKE_BINARY_DIR}/USMITA.exe" "${_GAME_DIR}/USMITA.exe"
+                COMMENT "Deploying USMITA.exe to ${_GAME_DIR}"
                 VERBATIM)
-
-            if(EXISTS "${DLL2EXE}" AND TARGET binkw32)
-                add_custom_command(TARGET USMITA POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy
-                        "${CMAKE_BINARY_DIR}/USMITA.exe" "${_GAME_DIR}/USMITA.exe"
-                    COMMENT "Deploying USMITA.exe to ${_GAME_DIR}"
-                    VERBATIM)
-            endif()
         endif()
-endif()
-# ─────────────────────────────────────────────────────────────────────────
-#   Final link lines for binkw32 and debug_menu
-# ─────────────────────────────────────────────────────────────────────────
-
-target_link_libraries(ngl_dx PUBLIC d3dx9)
-
-target_link_directories(binkw32 PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
-target_link_directories(binkw32 PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
-target_link_libraries  (binkw32 PUBLIC physics
-                                       charanimtype mash chuck nfl ngl nal nsl utility
-                                       winmm psapi d3d9 dinput8 dxguid dsound assimp z)
-
-
-
-if(USE_GLM)
-    target_link_libraries(binkw32 PUBLIC glm::glm)
     endif()
+
+    # --- Ultimate_prerelease ---
+    if(TARGET Ultimate_prerelease)
+        add_custom_command(TARGET Ultimate_prerelease POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "${_OUT_Ultimate_prerelease}" "${_GAME_DIR}/Ultimate_prerelease_original.exe"
+            COMMENT "Deploying Ultimate_prerelease_original.exe to ${_GAME_DIR}"
+            VERBATIM)
+        if(EXISTS "${DLL2EXE}" AND TARGET binkw32_prelib)
+            add_custom_command(TARGET Ultimate_prerelease POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy
+                    "${CMAKE_BINARY_DIR}/Ultimate_prerelease.exe" "${_GAME_DIR}/Ultimate_prerelease.exe"
+                COMMENT "Deploying Ultimate_prerelease.exe to ${_GAME_DIR}"
+                VERBATIM)
+        endif()
+    endif()
+
+    # --- ultimate_build ---
+    if(TARGET ultimate_build)
+        add_custom_command(TARGET ultimate_build POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "${_OUT_ultimate_build}" "${_GAME_DIR}/Ultimate_Build_original.exe"
+            COMMENT "Deploying Ultimate_Build_original.exe to ${_GAME_DIR}"
+            VERBATIM)
+        if(EXISTS "${DLL2EXE}" AND TARGET binkw32_build)
+            add_custom_command(TARGET ultimate_build POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy
+                    "${CMAKE_BINARY_DIR}/Ultimate_Build.exe" "${_GAME_DIR}/Ultimate_Build.exe"
+                COMMENT "Deploying Ultimate_Build.exe to ${_GAME_DIR}"
+                VERBATIM)
+        endif()
+    endif()
+
+    # --- build loader, deployed under the renamed USM_build.dll ---
+    if(TARGET binkw32_build)
+        add_custom_command(TARGET binkw32_build POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "$<TARGET_FILE:binkw32_build>" "${_GAME_DIR}/USM_build.dll"
+            COMMENT "Deploying USM_build.dll to ${_GAME_DIR}"
+            VERBATIM)
+    endif()
+
 endif()
 
-# Pin binkw32's output directory so the USM target can embed it later
-# and downstream deploy steps know exactly where to find it.
-set_target_properties(binkw32 PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # ═══════════════════════════════════════════════════════════════════════
 #   Final build-tree cleanup — keep only the shipping artifacts
 #
-#   After USM.exe (and USMITA.exe when present) have been built, deployed
-#   to ../Ultimate Spider-Man/, and dll2exe.exe has consumed
-#   USM_stripped.dll, the intermediate loader DLLs are no longer needed
-#   in the build tree:
+#   After USM.exe (and USMITA.exe when present) are built and dll2exe has
+#   consumed USM_stripped.dll, the intermediate loader DLLs are no longer
+#   needed in the build tree:
 #
-#     • binkw32.dll      — already injected into USM.exe via dll2exe and
-#                          already deployed to the game folder by the
-#                          binkw32 POST_BUILD step above.
-#     • USM.dll          — debug-symbol-laden copy of binkw32.dll; was
-#                          only kept around as the input to `strip`.
-#     • USM_stripped.dll — renamed to USM.dll so the final, stripped,
-#                          shippable DLL sits next to USM.exe under the
-#                          user-facing name.
+#     • binkw32.dll      — already injected into USM.exe and already
+#                          deployed to the game folder.
+#     • USM.dll          — debug-laden copy of binkw32.dll, kept only as
+#                          the input to strip.
+#     • USM_stripped.dll — renamed to USM.dll so the final stripped,
+#                          shippable DLL sits next to USM.exe.
 #
 #   Attached to the LAST target in the dll2exe chain (USMITA when it
-#   exists, otherwise USM) so it runs strictly after every step that
-#   still reads any of these files — in particular USMITA's POST_BUILD,
-#   which reads USM_stripped.dll for the Italian-variant injection
-#   (lines 776–782) and which we must NOT pull the rug out from under.
+#   exists, else USM) so it runs strictly after every step that reads
+#   these files (in particular USMITA's POST_BUILD, which reads
+#   USM_stripped.dll). The prerelease's USM_prelib*.dll files are left
+#   untouched.
 #
-#   POST_BUILD commands attached to a single target execute in the order
-#   they are added, so appending this block at the very end of the file
-#   also guarantees it runs after the ../Ultimate Spider-Man/ deploys
-#   (lines 803–852), which still reference $<TARGET_FILE:binkw32> and
-#   ${CMAKE_BINARY_DIR}/USM.exe.
-#
-#   `cmake -E remove -f` is used instead of `rm` so the build remains
-#   compatible with the cmake_minimum_required(3.12) declared at the top
-#   of this file (`cmake -E rm` was introduced in CMake 3.17). The -f
-#   flag makes the step idempotent on a re-run where binkw32.dll or
-#   USM.dll has already been cleaned away.
+#   `cmake -E remove -f` (not `rm`) keeps this compatible with
+#   cmake_minimum_required(3.12); `-f` makes the step idempotent on re-runs.
 # ═══════════════════════════════════════════════════════════════════════
+
 if(EXISTS "${DLL2EXE}" AND TARGET USM AND TARGET binkw32)
     if(TARGET USMITA)
         set(_USM_CLEANUP_TARGET USMITA)
@@ -926,6 +1375,8 @@ if(EXISTS "${DLL2EXE}" AND TARGET USM AND TARGET binkw32)
                 "${CMAKE_BINARY_DIR}/USM.dll"
         COMMENT "Cleanup: removing binkw32.dll & USM.dll, renaming USM_stripped.dll → USM.dll"
         VERBATIM)
+
+    usm_pack_dll(${_USM_CLEANUP_TARGET} "${CMAKE_BINARY_DIR}/USM.dll")
 
     message(STATUS "USM.exe: build-tree cleanup attached to target '${_USM_CLEANUP_TARGET}'")
 

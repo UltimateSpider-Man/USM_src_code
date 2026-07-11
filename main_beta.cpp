@@ -2,6 +2,7 @@
 
 #include "mod_gif.h"  // GIF texture mods (mods/*.gif -> animated textures)
 #include "mod_png.h"  // PNG texture mods (mods/*.png)
+#include "main_menu_start_prelib.h"
 #include <unordered_map>
 #include "resource_versions.h"
 #include "main.h"
@@ -226,7 +227,7 @@
 #include "sound_manager.h"
 #include "spawnable.h"
 #include "spiderman_camera.h"
-#include "spider_monkey.h"
+#include "spider_monkey_prelib.h"
 #include "spidey_base_state.h"
 #include "spline.h"
 #include "state_machine.h"
@@ -284,6 +285,7 @@
 #include "debug_menu.h"
 #include "debug_menu2.h"
 #include "debug_menu_extra.h"
+#include "debug_menu_extra_prelib.h"
 
 //
 #include <list.hpp>
@@ -2673,6 +2675,7 @@ void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
 }
 
 
+
 DWORD modulo(int num, DWORD mod) {
     if (mod == 0) {
         return 0;   
@@ -2741,25 +2744,11 @@ void menu_go_up() {
 
 
 
-// ----------------------------------------------------------------------
-// Scroll auto-repeat acceleration for MENU_UP / MENU_DOWN.
-//
-// key_val is the number of frames the key has been held (keys[i] is
-// ++'d every frame the key is down, reset to 0 on release - see
-// GetDeviceStateHandleKeyboardInput). The base repeat fires one step
-// every SCROLL_SPEED frames. After the key has been held for
-// kScrollAccelHoldFrames frames (2 s at 60 fps = 120), the repeat
-// period is shortened by kScrollAccelFactor (1.5x), so the cursor
-// scrolls faster the longer up/down is held.
-//
-//   base period   = SCROLL_SPEED            (e.g. 5 frames/step)
-//   fast period   = SCROLL_SPEED / 1.5      (e.g. 3 frames/step)
-// ----------------------------------------------------------------------
+
 static constexpr int   kScrollAccelHoldFrames = 120;   // 2 s @ 60 fps
 static constexpr float kScrollAccelFactor     = 1.5f;  // speed multiplier
 
-// Returns true on the frames a held-key repeat step should fire.
-// key_val == 1 (the initial press) is handled by the caller, not here.
+
 static bool scroll_repeat_should_step(int key_val, int scroll_speed)
 {
     if (scroll_speed <= 0) {
@@ -2777,24 +2766,6 @@ static bool scroll_repeat_should_step(int key_val, int scroll_speed)
 
     return (key_val >= period) && (key_val % period == 0);
 }
-
-
-
-
-// ----------------------------------------------------------------------
-// Scroll auto-repeat acceleration for MENU_UP / MENU_DOWN.
-//
-// key_val is the number of frames the key has been held (keys[i] is
-// ++'d every frame the key is down, reset to 0 on release - see
-// GetDeviceStateHandleKeyboardInput). The base repeat fires one step
-// every SCROLL_SPEED frames. After the key has been held for
-// kScrollAccelHoldFrames frames (2 s at 60 fps = 120), the repeat
-// period is shortened by kScrollAccelFactor (1.5x), so the cursor
-// scrolls faster the longer up/down is held.
-//
-//   base period   = SCROLL_SPEED            (e.g. 5 frames/step)
-//   fast period   = SCROLL_SPEED / 1.5      (e.g. 3 frames/step)
-// ----------------------------------------------------------------------
 void menu_input_handler(int keyboard, int SCROLL_SPEED) {
     if (is_menu_key_clicked(MENU_DOWN, keyboard)) {
 
@@ -2846,7 +2817,7 @@ else if (is_menu_key_clicked(MENU_LEFT, keyboard)) { // Use is_menu_key_clicked 
     }
 
     debug_menu_entry* highlighted = &current_menu->entries[current_menu->window_start + current_menu->cur_index];
- //   assert(highlighted->frame_advance_callback != nullptr);
+    assert(highlighted->frame_advance_callback != nullptr);
     highlighted->frame_advance_callback(highlighted);
 }
 
@@ -3330,7 +3301,7 @@ void vm_debug_menu_entry_garbage_collection_callback(void* a1, list* lst) {
     for (list* cur = end->next; cur != end; cur = cur->next) {
 
         debug_menu_entry* entry = ((debug_menu_entry*)cur->data);
-        printf("Will delete %s %08X\n", entry->text, entry);
+        //printf("Will delete %s %08X\n", entry->text, entry);
         remove_debug_menu_entry(entry);
     }
 }
@@ -3489,8 +3460,10 @@ void populate_param_block(debug_menu_entry* a2)
         for (auto& v22 : v25->field_0)
         {
             auto data_hash = v22->m_name;
-            auto* v2 = data_hash.to_string();
-            mString a1{ 0, "%s", v2 };
+			
+										char label[32];
+                sprintf(label, "0x%08x", data_hash.get_hash());
+            mString a1{ 0, "%s", label };
 
             debug_menu_entry v27{ a1 };
 
@@ -3567,9 +3540,10 @@ void ai_core_menu_handler(debug_menu_entry* a2)
         for (auto& v16 : (*v19))
         {
             auto v5 = v16->field_4;
-            auto* v3 = v5.to_string();
+							char label[32];
+                sprintf(label, "0x%08x", v5.get_hash());
 
-            debug_menu_entry v20{ mString {0, "%s inode params", v3} };
+            debug_menu_entry v20{ mString {0, "%s inode params", label} };
             v20.set_submenu(nullptr);
             v20.set_game_flags_handler(populate_param_block);
             auto& v4 = v16->field_10;
@@ -3597,8 +3571,9 @@ void populate_ai_root(debug_menu_entry* arg0)
             if (!v3->is_flagged(0x800u))
             {
                 auto id = v3->get_id();
-                auto* v7 = id.to_string();
-                debug_menu_entry v16{ mString {v7} };
+				char label[32];
+                sprintf(label, "0x%08x", id.get_hash());
+                debug_menu_entry v16{ mString {label} };
 
                 v16.set_data(v17);
                 v16.set_submenu(nullptr);
@@ -3824,7 +3799,11 @@ void apply_variant_handler(debug_menu_entry* entry)
 {
     if (auto c = static_cast<conglomerate*>(entry->m_data)) {
         if (auto ifc = c->m_variant_interface) {
-            string_hash hash{ entry->text };
+            // The label may be an unresolved hex hash (ped0, ped1, ped2, ...
+            // variants aren't always in the reverse hash table), so the real
+            // hash code is carried in m_value.ival rather than re-derived
+            // from the display string.
+            string_hash hash{ entry->m_value.ival };
             ifc->apply_variant(hash);
         }
     }
@@ -3842,11 +3821,17 @@ void populate_variants_menu(debug_menu_entry* entry)
     auto vi = c->m_variant_interface;
     for (int i = 0; i < vi->variants.size(); ++i) {
         string_hash sss(vi->variants.m_data[i].hash);
+        // to_string() falls back to "0x%08x" for names missing from the
+        // reverse table (ped0, ped1, ped2, ...); keep it only as a label.
         auto variant_name = sss.to_string();
+		
+				char label[32];
+        sprintf(label, "0x%08x", sss.get_hash());
 
-        auto variant_menu = create_menu_entry(variant_name);
+        auto variant_menu = create_menu_entry(label);
         variant_menu->set_game_flags_handler(apply_variant_handler);
         variant_menu->set_data(entry->m_data);
+        variant_menu->m_value.ival = int(sss.get_hash());
         menu->add_entry(variant_menu);
     }
 }
@@ -3862,8 +3847,9 @@ void populate_entity_variants_menu(debug_menu_entry* entry) {
 
     _std::list<entity*> entities = *entity::found_entities;
     for (auto& entity : entities) {
-        auto entityName = entity->get_id().to_string();
-        auto entityEntry = create_menu_entry(entityName);
+		char label[32];
+        sprintf(label, "0x%08x", entity->get_id().get_hash());
+        auto entityEntry = create_menu_entry(label);
         entityEntry->set_game_flags_handler(populate_variants_menu);
         entityEntry->set_data(entity);
         entityEntry->set_submenu(nullptr);
@@ -5035,13 +5021,14 @@ void devopt_flags_handler(debug_menu_entry *a1)
     }
 }
 
+#include "os_developer_options_build.h"
+#include "devopt_build.h"
 
-
-void create_devopt_menu(debug_menu* parent)
+void create_devopt_flags_menu(debug_menu* parent)
 {
     assert(parent != nullptr);
  
-    auto* game_menu = create_menu("Devopts");
+    auto* game_menu = create_menu("Devopt Flags");
     auto* v92       = game_menu;
     auto* v4        = create_menu_entry(game_menu);
  
@@ -5950,28 +5937,47 @@ void create_devopt_menu(debug_menu* parent)
     v89.set_id(149);
     v92->add_entry(&v89);
 
+    }
+	
 
-    
-		    for (auto idx = 0u; idx < NUM_OPTIONS; ++idx)
+
+void create_devopt_ints_menu(debug_menu* parent)
+{
+    assert(parent != nullptr);
+
+    auto* v22 = create_menu("Devopt Ints", handle_game_entry, 300);
+
+    for (auto idx = 0u; idx < NUM_OPTIONS; ++idx)
     {
         auto* v21 = get_option(idx);
         switch (v21->m_type)
         {
         case game_option_t::INT_OPTION:
         {
-            v89 = debug_menu_entry(mString{ v21->m_name });
-            v89.set_p_ival(v21->m_value.p_ival);
-            v89.set_min_value(-1000.0);
-            v89.set_max_value(1000.0);
-            v92->add_entry(&v89);
+            auto v20 = debug_menu_entry(mString{ v21->m_name });
+            v20.set_p_ival(v21->m_value.p_ival);
+            v20.set_min_value(-1000.0);
+            v20.set_max_value(1000.0);
+            v22->add_entry(&v20);
+            break;
+        }
+        case game_option_t::FLOAT_OPTION:
+        {
+            auto v18 = debug_menu_entry(mString{ v21->m_name });
+            v18.set_pt_fval(v21->m_value.p_fval);
+            v18.set_min_value(-1000.0);
+            v18.set_max_value(1000.0);
+            v22->add_entry(&v18);
             break;
         }
         default:
             break;
         }
     }
-}
-		
+
+    auto v5 = debug_menu_entry(v22);
+    parent->add_entry(&v5);
+}		
 
 	
 	
@@ -6001,6 +6007,21 @@ void create_game_flags_menu(debug_menu* parent);
 
 
 
+
+		
+
+	
+	
+#include "timer.h"
+
+
+		
+		
+
+void create_game_flags_menu(debug_menu* parent);
+
+
+
 void create_game_flags_menu(debug_menu *parent)
 {
     assert(parent != nullptr);
@@ -6019,7 +6040,9 @@ void create_game_flags_menu(debug_menu *parent)
 
     debug_menu_entry v89;
 
-
+    create_devopt_ints_menu(v92);
+	create_devopt_flags_menu(v92);
+    create_gamefile_menu_prelib(v92);
 
 
     v89 = debug_menu_entry(mString{ "Report SLF Recall Timeouts" });
@@ -6047,7 +6070,7 @@ void create_game_flags_menu(debug_menu *parent)
 
     v89 = debug_menu_entry{ mString{"Monkey Enabled"} };
 
-    auto v1 = spider_monkey::is_running();
+    auto v1 = spider_monkey_prelib::is_running2();
     v89.set_bval(v1);
     v89.set_game_flags_handler(game_flags_handler);
     v89.set_id(3);
@@ -6085,6 +6108,12 @@ void create_game_flags_menu(debug_menu *parent)
     v89.set_game_flags_handler(game_flags_handler);
     v89.set_id(8);
     v92->add_entry(&v89);
+	
+	v89 = debug_menu_entry(mString{ "Invert Camera Look" });
+    v89.set_game_flags_handler(game_flags_handler_prelib);
+    v89.set_id(10);
+    v89.set_bval(false);
+    v92->add_entry(&v89);
 
     v89 = debug_menu_entry(mString{ "User Camera on Controller 2" });
     v89.set_bval(os_developer_options::instance->get_flag(mString{ "USERCAM_ON_CONTROLLER2" }));
@@ -6098,45 +6127,39 @@ void create_game_flags_menu(debug_menu *parent)
     v92->add_entry(&v89);
 
     {
-        auto* v88 = create_menu("Save/Load", handle_game_entry, 10);
-        auto v18 = debug_menu_entry(v88);
-        v92->add_entry(&v18);
+
 
         v89 = debug_menu_entry(mString{ "Save Game" });
         v89.set_game_flags_handler(game_flags_handler);
         v89.set_id(14);
-        v88->add_entry(&v89);
+        v92->add_entry(&v89);
 
         v89 = debug_menu_entry(mString{ "Load Game" });
         v89.set_game_flags_handler(game_flags_handler);
         v89.set_id(15);
-        v88->add_entry(&v89);
+        v92->add_entry(&v89);
 
         v89 = debug_menu_entry(mString{ "Attemp Auto Load" });
         v89.set_game_flags_handler(game_flags_handler);
         v89.set_id(16);
-        v88->add_entry(&v89);
+        v92->add_entry(&v89);
     }
 
     {
-        auto* v87 = create_menu("Screenshot", handle_game_entry, 10);
-        auto v23 = debug_menu_entry(v87);
-        v92->add_entry(&v23);
+
 
         v89 = debug_menu_entry(mString{ "Hires Screenshot" });
         v89.set_game_flags_handler(game_flags_handler);
         v89.set_id(11);
-        v87->add_entry(&v89);
+        v92->add_entry(&v89);
 
         v89 = debug_menu_entry(mString{ "Lores Screenshot" });
         v89.set_game_flags_handler(game_flags_handler);
         v89.set_id(12);
-        v87->add_entry(&v89);
+        v92->add_entry(&v89);
     }
 
 
-	create_devopt_menu(v92);
-    create_gamefile_menu(v92);
 }
 
 
@@ -6445,11 +6468,11 @@ void debug_menu::init() {
    
 
 	
-	    create_dvars_menu(root_menu);
+//	    create_dvars_menu(root_menu);
     create_warp_menu(root_menu);
 	create_game_flags_menu(root_menu);
     create_missions_menu(root_menu);
-	create_debug_render_menu(root_menu);
+	create_debug_render_menu_prelib(root_menu);
     create_debug_district_variants_menu(root_menu);
 #   ifdef TARGET_XBOX
         create_replay_menu(root_menu);
@@ -6457,7 +6480,7 @@ void debug_menu::init() {
 	create_ai_root_menu(root_menu);
 	create_memory_menu(root_menu);
     create_entity_variants_menu(root_menu);
-	create_entity_animation_menu(root_menu);
+//	create_entity_animation_menu(root_menu);
 	add_debug_menu_entry(root_menu, &level_select_entry);
 	create_script_menu();
     add_debug_menu_entry(root_menu, &progression_entry);
@@ -7055,6 +7078,14 @@ constexpr std::array<const char*, 10> kLevelList{
     restart(extraArgs);                              // will not return
 }
 
+	
+	constexpr auto HERO_PACKLIST = 22;
+
+	
+	
+	static bool hero_select_list[HERO_PACKLIST] = {
+true, false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false
+};
 
 
 void level_select_handler(debug_menu_entry* entry)
@@ -7076,38 +7107,8 @@ void reboot_handler(debug_menu_entry* a1)
 {
 }
 
-void handle_hero_select_menu(debug_menu_entry* entry, custom_key_type)
-{
-    entry->m_game_flags_handler(entry);
-}
 
-void hero_entry_callback(debug_menu_entry*);
-
-void hero_toggle_handler(debug_menu_entry* entry);
-
-bool is_hero_available(const char* hero_name) {
-        try {
-            resource_key hero_key;
-            string_hash hero_hash{hero_name};
-            hero_key.set(hero_hash, RESOURCE_KEY_TYPE_PACK);
-            return resource_manager::get_pack_file_stats(hero_key, nullptr, nullptr, nullptr);
-        }
-        catch (const std::exception&) {
-            return false;
-        }
-    }
-	
-	
-	constexpr auto HERO_PACKLIST = 22;
-
-	
-	
-	static bool hero_select_list[HERO_PACKLIST] = {
-true, false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false
-};
-
-
-
+bool g_hero_flags[NUM_HEROES] {};
 
 void create_level_select_menu(debug_menu* level_select_menu)
 {
@@ -7118,6 +7119,9 @@ void create_level_select_menu(debug_menu* level_select_menu)
     debug_menu_entry v28{ hero_select_menu };
 
     level_select_menu->add_entry(&v28);
+	
+	    mString current{ *os_developer_options::instance->get_hero_name() };
+
     for (auto i = 0u; i < NUM_HEROES; ++i)
     {
         string_hash v5{ hero_list[i] };
@@ -7132,6 +7136,8 @@ void create_level_select_menu(debug_menu* level_select_menu)
             v37.set_game_flags_handler(hero_toggle_handler);
             v37.m_id = i;
             v37.set_frame_advance_cb(hero_entry_callback);
+		    v37.set_pt_bval(&hero_select_list[i]);              
+            hero_select_list[i] = (_stricmp(current.c_str(), hero_list[i]) == 0);
             hero_select_menu->add_entry(&v37);
 		        }
     }	
@@ -7149,7 +7155,6 @@ void create_level_select_menu(debug_menu* level_select_menu)
         {
             mString v22{ level_descriptors[i].field_60.to_string() };
             debug_menu_entry v39{ v22.c_str() };
-
             v39.set_game_flags_handler(level_select_handler);
             v39.m_id = i;
             level_select_menu->add_entry(&v39);
@@ -7197,30 +7202,13 @@ void hero_toggle_handler(debug_menu_entry* entry)
     printf("hero_toggle_handler\n");
     assert(entry->get_id() < NUM_HEROES);
     hero_selected = entry->get_id();
-	    int hero_index = -1;
-    if (hero_select_list[0] != 0) hero_index = 0;
-    if (hero_select_list[1] != 0) hero_index = 1;
-	    if (hero_select_list[2] != 0) hero_index = 2;
-		    if (hero_select_list[3] != 0) hero_index = 3;
-			    if (hero_select_list[4] != 0) hero_index = 4;
-				    if (hero_select_list[5] != 0) hero_index = 5;
-					    if (hero_select_list[6] != 0) hero_index = 6;
-						    if (hero_select_list[7] != 0) hero_index = 7;
-							    if (hero_select_list[0] != 0) hero_index = 0;
-    if (hero_select_list[8] != 0) hero_index = 8;
-	    if (hero_select_list[9] != 0) hero_index = 9;
-		    if (hero_select_list[10] != 0) hero_index = 10;
+	    // Clear every hero's flag, then mark the selected one.
+    for (auto &flag : hero_select_list)
+        flag = false;
 
-
-
-    // Get hero name
-    mString* default_hero = os_developer_options::instance->get_hero_name();
-    mString hero_name(*default_hero);
-    
-    if (hero_index != -1) {
-        hero_name = hero_list[hero_index];
-    }
     hero_status = hero_status_e::REMOVE_PLAYER;
+    hero_select_list[entry->get_id()] = true;
+
 }
 
 void hero_entry_callback(debug_menu_entry*)
@@ -7552,7 +7540,6 @@ string_hash names[120] = {
 
 
 
-
 bool __fastcall slf__create_debug_menu_entry(script_library_class::function* func, void*, vm_stack* stack, void* unk)
 {
     stack->pop(4);
@@ -7574,32 +7561,6 @@ bool __fastcall slf__create_debug_menu_entry(script_library_class::function* fun
     script_executable* se = stack->my_thread->ex->owner->parent;
     printf("total_script_objects = %d\n", se->total_script_objects);
     
-    for (auto i = 0; i < se->total_script_objects; ++i) {
-        auto* so = se->script_objects[i];
-        printf("Name of script_object = %s\n", so->name.to_string());
-
-        auto* so_menu = create_menu(so->name.to_string(), debug_menu::sort_mode_t::ascending);
-        auto* so_entry = create_menu_entry(so->name.to_string());
-        so_entry->set_data(so);
-        so_entry->set_submenu(so_menu);
-        script_menu->add_entry(so_entry);
-
-        for (auto j = 0; j < so->total_funcs; ++j) {
-            auto* fn = so->funcs[j];
-            printf("Func name: %s\n", fn->fullname.to_string());
-
-            debug_menu_entry fn_entry{ fn->fullname.to_string() };
-            script_instance* instance = stack->my_thread->inst;
-
-            fn_entry.set_data(nullptr);
-            fn_entry.set_submenu(nullptr);
-            fn_entry.m_id = j;
-            fn_entry.set_script_handler_from_char(instance, fn->fullname.to_string());
-            add_debug_menu_entry(so_menu, &fn_entry);
-        }
-
-        printf("\n");
-    }
 
     se->add_allocated_stuff_for_debug_menu(vm_debug_menu_entry_garbage_collection_id, (int)res, 0);
 
@@ -7609,8 +7570,6 @@ bool __fastcall slf__create_debug_menu_entry(script_library_class::function* fun
     stack->SP += sz;
     return 1;
 }
-
-
 
 
 
@@ -7640,19 +7599,26 @@ BOOL install_redirects()
 	
 	FEMultiLineText_patch();
 	
-	    
+	    main_menu_start_build_patch();
 		
-		    //    fe_mini_map_widget_patch();
+		
+		        fe_mini_map_widget_patch();
+		
+					main_menu_start_prelib_patch();
 	
 	resource_amalgapak_header_patch();
 	
 	        cursor_patch();
 	
-	       FrontEndMenuSystem_patch();
+	        FrontEndMenuSystem_beta_patch();
+	   
+	//   FrontEndMenuSystem_build_patch();
+	   
+	   resource_directory_patch();
 			
 			script_file_loader_patch();
 			
-		//	pause_menu_root_patch();
+			pause_menu_root_patch();
 			
 			PauseMenuSystem_patch();
 			
@@ -7736,7 +7702,7 @@ BOOL install_redirects()
     // @todo: debug menu
     if constexpr (DEBUG_MENU_REIMPL)
     {
-        REDIRECT(0x0052B4BF, spider_monkey::render);
+        REDIRECT(0x0052B4BF, spider_monkey_prelib::render2);
 
         HookFunc(0x004EACF0, (DWORD)aeps_RenderAll, 0, "Patching call to aeps::RenderAll");
         HookFunc(0x0052B5D7, (DWORD)debug_nglListEndScene_hook, 0, "Hooking nglListEndScene to inject debug menu");
@@ -7755,7 +7721,7 @@ BOOL install_redirects()
     }
 	
 
-    //SET_JUMP(0x0077A870, nglLoadTextureTM2);
+    SET_JUMP(0x0077A870, nglLoadTextureTM2);
 		
 
     return true;
@@ -7953,7 +7919,7 @@ BOOL install_redirects()
 
         IGOFrontEnd_patch();
 
-        spider_monkey_patch();
+        spider_monkey_prelib_patch();
 
         FEManager_patch();
 
@@ -8429,6 +8395,7 @@ BOOL install_redirects()
 
 
 
+
 #include "mod.h"  // Updated mod.h with GIF support
 #include <fstream>
 
@@ -8569,7 +8536,6 @@ void enumerate_mods() {
 		dbgReplaceMesh = getMod(0xCB5B8BA9, TLRESOURCE_TYPE_MESH_FILE);
 #   endif
 }
-
 
 
 
