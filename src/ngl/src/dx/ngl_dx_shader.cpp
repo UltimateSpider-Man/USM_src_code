@@ -1290,4 +1290,4 @@ void ngl_dx_shader_patch()
     {
         REDIRECT(0x007E6FC6, CAssembler_DecodeRegister);
     }
-}
+} 
