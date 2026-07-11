@@ -82,7 +82,7 @@ Var<IDirect3DDevice9 *> g_Direct3DDevice = (0x00971F94);
 
 Var<char> byte_965C21 = {0x00965C21};
 
-Var<char> byte_965BF8 = {0x00965BF8};
+Var<bool> byte_965BF8 = {0x00965BF8};
 
 Var<int> g_cx = {0x00965978};
 Var<int> g_cy = {0x00965968};

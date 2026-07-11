@@ -16,6 +16,8 @@ struct GameConfig {
 	bool WindowedMode = false;
 
 	bool NoLoadScreen = false;
+	
+		bool HeroName = false;
 
 	bool EnableFpuExceptionHandling = false;
 
@@ -159,7 +161,7 @@ extern Var<bool> byte_922994;
 
 extern Var<char> byte_965C21;
 
-extern Var<char> byte_965BF8;
+extern Var<bool> byte_965BF8;
 
 extern Var<int> g_cx;
 extern Var<int> g_cy;
