@@ -15,10 +15,13 @@ VALIDATE_SIZE(motion_compensator, 0x14);
 
 void motion_compensator::activate(animation_logic_system *a2)
 {
+    TRACE("als::motion_compensator::activate");
+
+    // Converted from 0x004A0F30.
     this->field_4 = a2;
     this->field_8 = (als::state_machine *)this->field_4->get_als_layer_internal(static_cast<als::layer_types>(0));
     this->the_actor = this->field_4->get_actor();
-    this->field_10 = 10.0;
+    this->field_10 = 10.0f;
 }
 
 void motion_compensator::pre_anim_action(Float a3)
@@ -123,6 +126,19 @@ double motion_compensator::get_anim_movement_scale_param()
     }
 }
 
+
+double motion_compensator::get_anim_playback_speed_param()
+{
+    TRACE("als::motion_compensator::get_anim_playback_speed_param");
+
+    // Converted from 0x004A0F90.
+    if ( this->field_8->has_ext_param_been_set(0x10u) ) {
+        return this->field_8->get_param(this->field_4, 0x10u);
+    }
+
+    return 1.0;
+}
+
 }
 
 void als_motion_compensator_patch()
@@ -131,12 +147,22 @@ void als_motion_compensator_patch()
     //set_vfunc(0x0087860C, address);
 
     {
+        FUNC_ADDRESS(address, &als::motion_compensator::activate);
+        SET_JUMP(0x004A0F30, address);
+    }
+
+    {
         FUNC_ADDRESS(address, &als::motion_compensator::set_anim_playback_speed);
         SET_JUMP(0x004A0FC0, address);
     }
 
     {
         FUNC_ADDRESS(address, &als::motion_compensator::get_anim_movement_scale_param);
-        //SET_JUMP(0x004A0F60, address);
+        SET_JUMP(0x004A0F60, address);
+    }
+
+    {
+        FUNC_ADDRESS(address, &als::motion_compensator::get_anim_playback_speed_param);
+        SET_JUMP(0x004A0F90, address);
     }
 }

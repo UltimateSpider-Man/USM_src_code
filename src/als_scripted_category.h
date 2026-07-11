@@ -34,6 +34,16 @@ namespace als
         request_data do_implicit_trans(
             animation_logic_system *a4,
             state_machine *a5);
+
+        //virtual
+        request_data do_incoming_trans(
+            animation_logic_system *a3,
+            state_machine *a4);
+
+        request_data do_explicit_trans(
+            animation_logic_system *a3,
+            state_machine *a4,
+            string_hash a5);
     };
 }
 

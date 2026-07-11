@@ -1,8 +1,12 @@
 #include "slc_manager.h"
 
 #include "debugutil.h"
+#include "entity_tracker_manager.h"
+#include "femanager.h"
 #include "func_wrapper.h"
+#include "igofrontend.h"
 #include "memory.h"
+#include "mini_map_dot_type.h"
 #include "mission_manager.h"
 #include "mission_stack_manager.h"
 #include "open_city_neighborhoods.h"
@@ -24,6 +28,9 @@
 #include "vm_stack.h"
 #include "vm_thread.h"
 #include "wds.h"
+
+#include <cstring>
+#include <type_traits>
 
 #if !STANDALONE_SYSTEM
 _std::vector<script_library_class *> *& slc_manager_class_array = var<_std::vector<script_library_class *> *>(0x00965EC8);
@@ -11305,13 +11312,75 @@ DECLARE_SLF_END()
 #undef DECLARE_SLF_BEGIN
 #undef DECLARE_SLF_END
 
+// ---------------------------------------------------------------------------
+// openusm: entity_tracker.set_enemy_icon(num) -- NEW script function, not
+// present in the stock library. Marks the tracked entity on the minimap with
+// the dedicated enemy dot (kEnemyDotType) or, for num >= 1, the boss dot
+// (kBossDotType, highlight ring). It routes through the stock per-tracker dot
+// helper at 0x00641120 -- the same one set_poi_icon's impl (0x00677480) uses
+// -- so the new dot self-registers via fe_mini_map_widget::AddMapPOIWidget,
+// which plays FE_MINIMAP_BLIP for these two ids only. set_poi_icon and
+// token_def dots stay silent.
+//
+// Unlike the stock-vtbl trampolines above, this SLF has no stock
+// implementation, so it carries its own vtable: the shared stock finalize
+// (0x0067ADE0, same slot as set_poi_icon's vtbl 0x0089C574) plus our own
+// operator().
+struct slf__entity_tracker__set_enemy_icon__num__t : script_library_class::function {
+    struct parms_t {
+        uint32_t me;    // entity_tracker pool id (entity_tracker_manager::id_to_ptr)
+        float num;      // 0 = enemy, >= 1 = boss (highlight ring)
+    };
+
+    slf__entity_tracker__set_enemy_icon__num__t(script_library_class *slc, const char *a3)
+        : function(slc, a3)
+    {
+        using vtbl_t = std::remove_pointer_t<decltype(this->m_vtbl)>;
+
+        static vtbl_t s_vtbl {};
+        if (s_vtbl.__cl == nullptr) {
+            s_vtbl.finalize = CAST(s_vtbl.finalize, 0x0067ADE0);
+
+            FUNC_ADDRESS(address, &slf__entity_tracker__set_enemy_icon__num__t::operator());
+            s_vtbl.__cl = CAST(s_vtbl.__cl, address);
+        }
+
+        this->m_vtbl = &s_vtbl;
+    }
+
+    bool operator()(vm_stack &stack, [[maybe_unused]] script_library_class::function::entry_t entry) const
+    {
+        TRACE("slf__entity_tracker__set_enemy_icon__num__t::operator()");
+
+        SLF_PARMS;
+
+        auto *igo = g_femanager.IGO;
+        entity_tracker_manager *mgr = (igo != nullptr) ? igo->field_54 : nullptr;
+
+        if (mgr != nullptr) {
+            if (auto *tracker = mgr->id_to_ptr(parms->me)) {
+                const int icon = (parms->num >= 1.0f) ? kBossDotType : kEnemyDotType;
+
+                // entity_tracker dot helper: creates / recreates the
+                // fe_mini_map_dot only when the icon actually changes, so
+                // repeated script calls do not re-blip.
+                THISCALL(0x00641120, tracker, icon);
+            }
+        }
+
+        SLF_DONE;
+    }
+};
+
 void chuck_register_script_libs()
 {
     TRACE("chuck_register_script_libs");
 
     if constexpr (1)
     {
-        std::vector<script_library_class *> classes(39u);
+        // 40 classes are registered below (38 CREATE_SLC + slc_anim +
+        // slc_entity); sized 39u this overflowed on classes[39].
+        std::vector<script_library_class *> classes(40u);
         auto class_idx = 0u;
 
 #define CREATE_SLC(TYPE) \
@@ -11938,6 +12007,25 @@ void chuck_register_script_libs()
             CREATE_SLF(entity_list_iterator, operator_equals_equals__entity_list_iterator, "operator==(entity_list_iterator)");
 
             slc = classes[9];
+
+            // openusm: grow the mashed function table before registering --
+            // all_slc_functions_mac carries exactly the 8 stock entity_tracker
+            // slots, and neither the stock appender (0x0058EDE0) nor
+            // add_function() bounds-checks the final store. The extra slot
+            // goes LAST so the stock functions keep their mashed indices
+            // (compiled SLBs resolve by index); set_enemy_icon lands in
+            // slot 8. Skipped outside mash mode, where the sorted-order
+            // packer path applies and the feature is debug-only anyway.
+            if (slc->are_funcs_from_mash()) {
+                const int stock_funcs = slc->total_funcs;
+                auto **grown = bit_cast<script_library_class::function **>(
+                    mem_alloc(sizeof(void *) * (stock_funcs + 1)));
+                memcpy(grown, slc->funcs, sizeof(void *) * stock_funcs);
+                grown[stock_funcs] = grown[stock_funcs - 1];  // non-null sentinel; replaced below
+                slc->funcs = grown;
+                slc->total_funcs = stock_funcs + 1;
+            }
+
             CREATE_SLF(entity_tracker, get_entity, "get_entity()");
             CREATE_SLF(entity_tracker, get_mini_map_active, "get_mini_map_active()");
             CREATE_SLF(entity_tracker, get_poi_active, "get_poi_active()");
@@ -11946,6 +12034,10 @@ void chuck_register_script_libs()
             CREATE_SLF(entity_tracker, set_mini_map_active__num, "set_mini_map_active(num)");
             CREATE_SLF(entity_tracker, set_poi_active__num, "set_poi_active(num)");
             CREATE_SLF(entity_tracker, set_poi_icon__num, "set_poi_icon(num)");
+            if (slc->are_funcs_from_mash()) {
+                // openusm: new SLF, registered last -> mash slot 8.
+                CREATE_SLF(entity_tracker, set_enemy_icon__num, "set_enemy_icon(num)");
+            }
 
             slc = classes[10];
             CREATE_SLF(glamour_cam, set_angle__num__num__num__num, "set_angle(num,num,num,num)");

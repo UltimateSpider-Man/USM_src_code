@@ -13,6 +13,11 @@
 // g_config.EnableHighFPS so it can still be toggled without a rebuild.
 #define FPS_UNLOCK_60       1
 
+// Draws a POI marker over every living, on-screen enemy / boss (e.g. Rhino) on
+// top of the stock objective reticles, and gates the enemy health-widget
+// overlays. Set to 0 to compile out (binary identical to stock).
+#define SHOW_ENEMY_HEALTH_WIDGETS 1
+
 #include "color32.h"
 #include "float.hpp"
 #include "game_button.h"

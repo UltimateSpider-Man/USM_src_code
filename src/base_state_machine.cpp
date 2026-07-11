@@ -6,6 +6,8 @@
 #include "state_machine_shared.h"
 #include "trace.h"
 
+#include <algorithm>
+
 namespace als {
 
 base_state_machine::base_state_machine()

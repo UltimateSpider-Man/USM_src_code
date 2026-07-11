@@ -12,6 +12,8 @@ struct PanelAnimFile;
 struct PanelFile;
 struct matrix4x4;
 
+
+
 struct fe_mini_map_widget {
     std::intptr_t m_vtbl{0x00895A00};
     PCUV_ShaderMaterial field_4[12];
@@ -47,6 +49,8 @@ struct fe_mini_map_widget {
 
     //0x00638C30
     void RenderMeshes(matrix4x4 *a2, float &a4);
+	
+	void AddMapPOIWidget(fe_mini_map_dot *a2);
 
     //0x0063AEC0
     void UpdatePOIs(matrix4x4 *a2, Float a3, Float a4, Float a5, Float a6, Float a7);

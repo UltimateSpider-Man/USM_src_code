@@ -227,7 +227,6 @@ const char* get_name() const {
             if (v4 == BOOLEAN_NUM) {
                 this->m_value.bval = a2;
             } else {
-
                 assert(0);
             }
 
@@ -375,7 +374,7 @@ const char* get_name() const {
         this->m_value.bval = a2;
 		
     }
-    bool set_bval2(bool a2)
+        void set_bval2(bool a2)
     {
         this->entry_type = BOOLEAN_NUM;
         this->m_value.bval = a2;

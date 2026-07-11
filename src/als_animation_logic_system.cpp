@@ -314,7 +314,8 @@ void animation_logic_system::frame_advance_update_pending_params(Float a2)
 {
     TRACE("animation_logic_system::frame_advance_update_pending_params");
 
-    if constexpr (0)
+    // Converted from 0x004A65C0.
+    if constexpr (1)
     {
         if ( !this->field_7C )
         {
@@ -388,7 +389,8 @@ void animation_logic_system::frame_advance_post_controller(Float arg0)
 {
     TRACE("animation_logic_system::frame_advance_post_controller");
 
-    if constexpr (0) {
+    // Converted from 0x004AB700.
+    if constexpr (1) {
         double v4;
         if ( this->field_6C->has_time_ifc() )
         {
@@ -432,7 +434,8 @@ void animation_logic_system::frame_advance_main_als_advance(Float a2)
 {
     TRACE("animation_logic_system::frame_advance_main_als_advance");
 
-    if constexpr (0)
+    // Converted from 0x004A90B0.
+    if constexpr (1)
     {
         if ( !this->field_7C )
         {
@@ -443,7 +446,8 @@ void animation_logic_system::frame_advance_main_als_advance(Float a2)
 
             sp_log("%d", this->field_8.size());
 
-            for ( int i = -1; i < this->field_8.size(); ++i )
+            const int num_layers = static_cast<int>(this->field_8.size());
+            for ( int i = -1; i < num_layers; ++i )
             {
                 state_machine &the_machine = (i == -1 ? this->field_18 : *this->field_8[i]);
 

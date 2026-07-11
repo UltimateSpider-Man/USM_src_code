@@ -7,17 +7,56 @@
 
 #include "panelfile.h"
 
+struct PanelQuad;
+
 struct zoom_map_ui {
-    int field_0[144];
+    // Each legend slot holds two quads: ".freeroam" is shown while no mission
+    // is active, ".mission" is the variant swapped in for a specific mission
+    // type. The no-mission loops walk .freeroam across all 7 slots; the
+    // per-mission switch touches .mission of one slot (index 0 = default).
+    struct legend_slot {
+        PanelQuad *freeroam;  // shown when not in a mission
+        PanelQuad *mission;   // shown for the matching mission type
+    };
+
+    /* 0x000 */ char field_0[0x20];
+    /* 0x020 */ PanelQuad *m_icons[7];       // always-on legend icons
+    /* 0x03C */ char field_3C[0x3C];
+    /* 0x078 */ PanelQuad *m_labels[6];      // always-on legend labels
+    /* 0x090 */ legend_slot m_icon_slots[7]; // 0x090..0x0C7
+    /* 0x0C8 */ char field_C8[0x20];
+    /* 0x0E8 */ PanelQuad *m_hidden_icon;    // hidden each frame
+    /* 0x0EC */ PanelQuad *m_hidden_labels[6];
+    /* 0x104 */ legend_slot m_label_slots[7];// 0x104..0x13B
+    /* 0x13C */ char field_13C[0xDC];
+    /* 0x218 */ int m_render_ctx;            // arg passed to every SetShown
+    /* 0x21C */ char field_21C[0x24];
+    /* 0x240 */
+
+    //0x003D2194 (PS2) — ported below
+    void UpdateSpideyLegend();
 	
+	void UpdateSpideyLegend_build();
+
+    void UpdateSpideyLegend_beta();
+
+
 		char Draw();
 
 
 void Update(Float a2);
 
 
+void SetUpNormalNavBar();
 
-PanelFile Init();
+
+
+
+void Init();
+
+void Init_beta();
+
+void  Init_build();
 
 
 void OnSquare();
@@ -31,6 +70,12 @@ int sub_612820();
 void __thiscall sub_621A80(Float a7);
 
 int  sub_6222A0();
+
+// 0x00621410 — set icon graphics + label pointers, non-mode==2 path.
+int sub_621410();
+
+// 0x00621860 — set icon graphics + label pointers, mode==2 path.
+int sub_621860();
 
 
 
@@ -110,3 +155,7 @@ struct IGOZoomOutMap {
 };
 
 extern void IGOZoomOutMap_patch();
+
+extern void IGOZoomOutMap_beta_patch();
+
+extern void IGOZoomOutMap_build_patch();

@@ -48,6 +48,11 @@ namespace als
             animation_logic_system *a4,
             state_machine *a5);
 
+        request_data do_explicit_trans(
+            animation_logic_system *a4,
+            state_machine *a5,
+            string_hash a6);
+
         //virtual
         void do_post_trans(
             animation_logic_system *a1,

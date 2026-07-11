@@ -9,8 +9,10 @@
 #include "osassert.h"
 #include "tl_system.h"
 #include "tlresource_directory.h"
+#include "tlresource_location.h"
 #include "trace.h"
 #include "utility.h"
+#include "utility/mod.h"
 #include "vtbl.h"
 
 #include <nal_list.h>
@@ -169,10 +171,150 @@ bool nalLoadSceneAnimInternal(nalSceneAnim *a1) {
     return (bool) CDECL_CALL(0x0078D8D0, a1);
 }
 
+// ---------------------------------------------------------------------------
+// mods/*.PCSKEL and mods/*.PCANIM overrides.
+//
+// Keys come from the file's own EMBEDDED resource name, not the filename:
+// analysis of the extracted corpus shows the two can differ (BLACK_SUIT.PCSKEL
+// is internally named "ultimate_spiderman"), and the lookup side only ever
+// sees the embedded name. A skeleton's tlFixedString sits at +0x8, an anim
+// file's at +0x10 - so a mod file can be called anything. The scan is lazy
+// and idempotent, and skips anything the main mod enumeration already
+// registered under the same key and type.
+// ---------------------------------------------------------------------------
+void modScanNalOverrides()
+{
+    static bool scanned = false;
+    if (scanned)
+        return;
+    scanned = true;
+
+    std::error_code ec;
+    std::filesystem::directory_iterator it("mods", ec);
+    if (ec)
+        return;
+
+    for (const auto &e : it)
+    {
+        std::error_code fec;
+        if (!e.is_regular_file(fec))
+            continue;
+
+        const std::string ext = transformToLower(e.path().extension().string());
+        int type = 0;
+        size_t nameOffs = 0;
+        if (ext == ".pcskel")
+        {
+            type = TLRESOURCE_TYPE_SKELETON;
+            nameOffs = 0x8;
+        }
+        else if (ext == ".pcanim")
+        {
+            type = TLRESOURCE_TYPE_ANIM_FILE;
+            nameOffs = 0x10;
+        }
+        else
+        {
+            continue;
+        }
+
+        Mod mod;
+        mod.Path = e.path();
+        mod.Type = type;
+
+        std::ifstream f(e.path(), std::ios::binary);
+        mod.Data.assign(std::istreambuf_iterator<char>(f),
+                        std::istreambuf_iterator<char>());
+        if (mod.Data.size() < 0x68)
+            continue;   // too small to be either format
+
+        const auto *name = bit_cast<const tlFixedString *>(mod.Data.data() + nameOffs);
+        const uint32_t key = name->m_hash;
+        if (getMod(key, type) != nullptr)
+            continue;   // the main mod enumeration got here first
+
+        sp_log("[mod] registered %s override \"%s\" -> \"%s\" (%u bytes, key 0x%08X)",
+               (type == TLRESOURCE_TYPE_SKELETON) ? "skeleton" : "anim-file",
+               e.path().filename().string().c_str(),
+               name->to_string(),
+               (unsigned)mod.Data.size(),
+               key);
+
+        Mods.emplace(key, std::move(mod));
+    }
+}
+
 bool nalLoadAnimFileInternal(nalAnimFile *anim_file)
 {
     TRACE("nalLoadAnimFileInternal", anim_file->field_10.to_string(), 
             anim_file->field_48.to_string());
+
+    // mods/*.PCANIM, deferred. Every retail anim file is internally named
+    // "allanims" (verified across the extracted corpus), so name-matching
+    // can't select an override. Instead, each mod anim file loads exactly
+    // once, on the first call where EVERY skeleton it references resolves
+    // through nalGetSkeleton - which is during the load of the pack that
+    // brought those skeletons in, BEFORE that pack's own anims register.
+    // nalAnimDirectory keeps the first registration and logs later ones as
+    // "Duplicate anim", so same-named retail anims lose the race and the
+    // mod's clips win globally.
+    static bool s_overrideActive = false;
+    if (!s_overrideActive)
+    {
+        modScanNalOverrides();
+
+        static std::set<Mod *> s_loaded;
+        for (auto &entry : Mods)
+        {
+            Mod &mod = entry.second;
+            if (mod.Type != TLRESOURCE_TYPE_ANIM_FILE ||
+                mod.Data.size() < 0x68 ||
+                s_loaded.count(&mod) != 0)
+                continue;
+
+            const uint8_t *raw = mod.Data.data();
+            const int numSkel = *bit_cast<const int *>(raw + 0xC);
+            const uint32_t firstAnim = *bit_cast<const uint32_t *>(raw + 0x34);
+            if (numSkel <= 0 || numSkel >= 64 ||
+                firstAnim == 0 || firstAnim >= mod.Data.size() ||
+                mod.Data.size() < 0x48 + (size_t)numSkel * 0x20)
+            {
+                s_loaded.insert(&mod);   // malformed, don't retry
+                sp_log("[mod] anim file \"%s\": malformed header, ignored",
+                       mod.Path.filename().string().c_str());
+                continue;
+            }
+
+            bool ready = true;
+            for (int i = 0; i < numSkel && ready; ++i)
+            {
+                const auto *skelName =
+                    bit_cast<const tlFixedString *>(raw + 0x48 + (size_t)i * 0x20);
+                if (nalGetSkeleton(*skelName) == nullptr)
+                    ready = false;
+            }
+            if (!ready)
+                continue;   // its pack hasn't loaded yet, stays pending
+
+            auto *copy = static_cast<nalAnimFile *>(
+                tlMemAlloc((uint32_t)mod.Data.size(), 16u, 0x2000000u));
+            if (copy == nullptr)
+                continue;
+
+            std::memcpy(copy, mod.Data.data(), mod.Data.size());
+            copy->field_4  |= 4u;
+            copy->field_44  = 1;
+
+            sp_log("[mod] loading anim overrides from \"%s\" (%u bytes, %d skeleton(s))",
+                   mod.Path.filename().string().c_str(),
+                   (unsigned)mod.Data.size(), numSkel);
+
+            s_loaded.insert(&mod);
+            s_overrideActive = true;
+            nalLoadAnimFileInternal(copy);
+            s_overrideActive = false;
+        }
+    }
 
     if (anim_file->field_0 != 0x10101)
     {
@@ -215,8 +357,15 @@ bool nalLoadAnimFileInternal(nalAnimFile *anim_file)
 
         while (anim_class != nullptr)
         {
+            // field_4 is the byte offset of the next anim in the file image;
+            // convert it to an absolute pointer WITHOUT pointer-arithmetic
+            // scaling, and remember it - the loop advances on it below.
+            nalAnimClass<nalAnyPose> *next = nullptr;
             if (anim_class->field_4) {
-                anim_class->field_4 += (unsigned int) anim_class;
+                next = bit_cast<nalAnimClass<nalAnyPose> *>(
+                    bit_cast<uint32_t>(anim_class->field_4) +
+                    bit_cast<uint32_t>(anim_class));
+                anim_class->field_4 = next;
             }
 
             auto *v7 = skeletons[anim_class->field_28];
@@ -248,6 +397,8 @@ bool nalLoadAnimFileInternal(nalAnimFile *anim_file)
                 auto *v6 = anim_class->field_8.to_string();
                 sp_log("Duplicate anim %s found.\n", v6);
             }
+
+            anim_class = next;
         }
 
         tlMemFree(skeletons);
@@ -285,6 +436,13 @@ void nalStreamInstance_patch()
     REDIRECT(0x005AD21F, nalInit);
 
     REDIRECT(0x0055F8F4, nalConstructSkeleton);
+
+    // The retail anim_resource_handler (0x0055F930) calls the anim-file
+    // loader at 0x0078D540 internally; detouring the function entry routes
+    // every caller through nalLoadAnimFileInternal above, which is where the
+    // mods/*.PCANIM override lives. The reimplementation is complete (no
+    // fallback into 0x0078D540), so the detour cannot recurse.
+    SET_JUMP(0x0078D540, nalLoadAnimFileInternal);
     return;
 
 

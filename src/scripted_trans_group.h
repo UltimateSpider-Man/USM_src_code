@@ -17,6 +17,7 @@ namespace als {
             IMPLICIT = 0,
             EXPLICIT = 1,
             LAYER = 2,
+            INCOMING = 3,
         };
 
         mVectorBasic<int> field_4;

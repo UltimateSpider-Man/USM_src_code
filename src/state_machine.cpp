@@ -264,22 +264,20 @@ bool state_machine::did_do_transition() const
 
 void state_machine::request_category_transition(string_hash a2)
 {
-    if constexpr (0) {
-        if ( !this->field_8.field_2 )
-        {
-            this->field_8.field_1 = true;
-            this->field_8.m_cat_id = a2;
-        }
-    } else {
-        void (__fastcall *func)(void *, void *, string_hash) = CAST(func, get_vfunc(m_vtbl, 0x10));
-        func(this, nullptr, a2);
+    TRACE("als::state_machine::request_category_transition");
+
+    // Converted from 0x004934B0.  Forced transitions leave field_8.field_2
+    // set, so a normal category request must not overwrite them.
+    if ( !this->field_8.field_2 )
+    {
+        this->field_8.field_1 = true;
+        this->field_8.m_cat_id = a2;
     }
 }
 
 bool state_machine::is_interruptable() const {
-    bool (__fastcall *func)(const void *) = CAST(func, get_vfunc(m_vtbl, 0x14));
-
-    return func(this);
+    // Converted from 0x004934D0.
+    return this->field_14.m_curr_state_interruptable || !this->field_14.m_active;
 }
 
 bool state_machine::did_transition_succeed() const
@@ -303,12 +301,8 @@ bool state_machine::is_request_satisfied() const
 
 bool state_machine::is_active() const
 {
-    if constexpr (0) {
-        return this->field_14.m_active;
-    } else {
-        bool (__fastcall *func)(const void *) = CAST(func, get_vfunc(m_vtbl, 0x20));
-        return func(this);
-    }
+    // Converted from 0x00493510.
+    return this->field_14.m_active;
 }
 
 void state_machine::force_als_state(string_hash a2, int )
@@ -363,8 +357,8 @@ variance_variable<float> * state_machine::get_pb_float_variance(string_hash a2) 
 
 bool state_machine::does_parameter_exist(string_hash a1) const
 {
-    bool (__fastcall *func)(const void *, void *, string_hash) = CAST(func, get_vfunc(m_vtbl, 0x48));
-    return func(this, nullptr, a1);
+    // Converted from 0x004A6A00.
+    return this->find_param_block_with_param(a1) != nullptr;
 }
 
 int state_machine::get_parameter_data_type(string_hash a2) const
@@ -577,8 +571,17 @@ int state_machine::get_optional_pb_int(
         const string_hash &a2,
         int a3,
         bool *a4) {
-    int (__fastcall *func)(state_machine *, void *, const string_hash *, int, bool *) = CAST(func, get_vfunc(m_vtbl, 0x68));
-    return func(this, nullptr, &a2, a3, a4);
+    // Converted from 0x004A6860.
+    auto *the_param_block = this->find_param_block_with_param(a2, ai::PT_INTEGER);
+    if ( a4 != nullptr ) {
+        *a4 = (the_param_block != nullptr);
+    }
+
+    if ( the_param_block != nullptr ) {
+        return the_param_block->get_pb_int(a2);
+    }
+
+    return a3;
 }
 
 layer_types state_machine::get_layer_id() {
@@ -872,6 +875,10 @@ void als_state_machine_patch()
 
     REPLACE(0x0049F9B0, &als::state_machine::set_active);
 
+    REPLACE(0x004934B0, &als::state_machine::request_category_transition);
+
+    REPLACE(0x004934D0, &als::state_machine::is_interruptable);
+
     REPLACE(0x004934F0, &als::state_machine::did_transition_succeed);
 
     if constexpr (0)
@@ -881,6 +888,12 @@ void als_state_machine_patch()
     }
 
     REPLACE(0x00493500, &als::state_machine::is_request_satisfied);
+
+    REPLACE(0x00493510, &als::state_machine::is_active);
+
+    REPLACE(0x004A6A00, &als::state_machine::does_parameter_exist);
+
+    REPLACE(0x004A6860, &als::state_machine::get_optional_pb_int);
 
     {
         FUNC_ADDRESS(address, &als::state_machine::find_external_param);

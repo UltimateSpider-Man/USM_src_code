@@ -2340,6 +2340,13 @@ camera *game::get_current_view_camera(int a2)
     }
 }
 
+// Xbox debug build correspondence (symbol-named): sub_00A24890.
+// Identical logic; the debug game struct uses boolx wrappers at
+// field_175/field_174 and a plain byte at field_17F, mapping to
+// retail PC field_15D/field_15C/field_167. g_scene_name confirmed
+// by the debug symbols. Overloads: 0x00A24910 (mString, vector3d --
+// stores level.field_1C on Xbox debug = level.field_24 here) and
+// 0x00A24960 (mString, int) = retail 0x00514C40 / 0x00514C70.
 void game::_load_new_level(const mString &a2)
 {
     if (!a2.empty()) {
@@ -2382,12 +2389,24 @@ void game::advance_state_load_level(Float a2)
 {
     TRACE("game::advance_state_load_level");
 
-    if constexpr (0)
+    // Reimplemented from the Xbox debug build's symbol-named source
+    // (game::advance_state_load_level, debug XBE decomp) and verified
+    // instruction-by-instruction against retail PC 0x0055D3A0. The
+    // call-site REDIRECT at 0x0055D55D routes the retail dispatcher
+    // here; with the body live, the inner REDIRECTs at 0x0055D3DE
+    // (look_up_level_descriptor) and 0x0055D409 (load_this_level)
+    // become moot on this path since we call the reimpls directly.
+    if constexpr (1)
     {
-        static bool & loading_a_level = var<bool>(0x00960CB5);
+        static bool &loading_a_level = var<bool>(0x00960CB5);
 
         this->level.name_mission_table = g_scene_name;
+
+        // Retail clears this up front; the Xbox debug build clears the
+        // equivalent (input_mgr boolx field_2A) inside the completion
+        // branch instead. We follow retail.
         input_mgr::instance->field_26 = false;
+
         if (!loading_a_level)
         {
             this->level.reset_level_load_data();
@@ -2405,14 +2424,18 @@ void game::advance_state_load_level(Float a2)
         }
 
         this->the_world->the_terrain->frame_advance(a2);
+
         if (this->level.load_completed && !this->level.wait_for_mem_check())
         {
             this->level.destroy_loading_widgets();
             sub_405CC0();
 
-            int TOD = os_developer_options::instance->get_int(mString {"TIME_OF_DAY"});
+            // Retail: get_int(0x42) on the ints table = TIME_OF_DAY.
+            // The Xbox debug build instead reads a debugger-pokeable
+            // global `int TOD = -1;` -- same -1 => g_TOD fallback.
+            int TOD = os_developer_options::instance->get_int(os_developer_options::ints_t::TIME_OF_DAY);
             if (TOD == -1) {
-                TOD= g_TOD();
+                TOD = g_TOD();
             }
 
             us_lighting_switch_time_of_day(TOD);
@@ -2420,6 +2443,9 @@ void game::advance_state_load_level(Float a2)
             this->flag.level_is_loaded = true;
             this->field_167 = false;
             loading_a_level = false;
+
+            // Retail inlines this as index++ on the process stack's
+            // last element (go_next_state on the active game_process).
             this->go_next_state();
         }
 

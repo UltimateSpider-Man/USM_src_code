@@ -185,7 +185,7 @@ void FrontEndMenuSystem::RenderLoadMeter(bool a1) {
     }
 }
 
-void FrontEndMenuSystem::GoNextState() {
+void FrontEndMenuSystem::GoNextState_beta() {
     if (this->field_30 == 10) {
         return;
     }
@@ -299,6 +299,8 @@ void FrontEndMenuSystem::GoNextState() {
             } else {
 
 										movie_manager::load_and_play_movie("company", nullptr, false);
+										
+										movie_manager::load_and_play_movie("ATVI spin logo 640 none", nullptr, false);
 
 
                 if (this->field_30 != 10) {
@@ -347,7 +349,365 @@ void FrontEndMenuSystem::GoNextState() {
             break;
         case 10: {
             if (this->m_index != 5) {
-                mission_manager::s_inst->sub_5BACA0(0.0);
+                mission_manager::s_inst->blackscreen_off(0.0);
+				g_game_ptr->freeze_hero(true);
+            }
+
+            this->sub_60C290();
+            break;
+        }
+        default:
+            return;
+        }
+        break;
+    }
+}
+
+
+
+
+void FrontEndMenuSystem::GoNextState_build() {
+    if (this->field_30 == 10) {
+        return;
+    }
+
+    int v3;
+    while (2) {
+        auto v2 = this->field_30;
+        switch (v2) {
+        case 5:
+            this->field_50 = 1;
+            this->field_30 = 6;
+            v3 = this->field_30;
+            goto LABEL_28;
+        case 0:
+            this->field_50 = 1;
+            this->field_30 = 1;
+            v3 = 1;
+            goto LABEL_28;
+        case 4:
+            this->field_52 = 1;
+            this->field_30 = 5;
+            v3 = 5;
+            goto LABEL_28;
+        case 6: {
+            switch (this->field_4[this->m_index][5].field_28) {
+            case 0: {
+                g_game_ptr->gamefile->load_most_recent_game();													
+                this->BringUpDialogBox(10, fe_state{10}, fe_state{10});
+                goto LABEL_27;
+            }
+            case 1:
+                this->field_30 = 7;
+                v3 = this->field_30;
+                break;
+            case 2:
+                this->field_30 = 9;
+                v3 = this->field_30;
+                break;
+            case 3:
+                this->field_30 = 8;
+                v3 = this->field_30;
+                break;
+            case 4:
+                sub_5A6D70();
+                goto LABEL_27;
+            case 5: {
+                bExit() = true;
+                goto LABEL_27;
+            }
+            default:
+                goto LABEL_27;
+            }
+
+            goto LABEL_28;
+        }
+        case 7: {
+            this->field_30 = 10;
+            v3 = 10;
+            goto LABEL_28;
+        }
+        case 11:
+            if (bit_cast<main_menu_memcard_check *>(this->field_4[2])->field_100) {
+                this->field_30 = this->field_58;
+            } else {
+                this->field_30 = this->field_54;
+            }
+
+            if (this->field_5C.m_size > 0) {
+                int v5;
+                this->field_54 = *(uint32_t *) *this->field_5C.sub_64A090(&v5);
+
+                int v6;
+                this->field_58 = *(uint32_t *) *this->field_6C.sub_64A090(&v6);
+                this->field_5C.sub_64A2B0();
+                this->field_6C.sub_64A2B0();
+            }
+
+            break;
+        case 3:
+            this->field_30 = 4;
+            v3 = 4;
+						
+            goto LABEL_28;
+        default:
+            this->field_30 = v2 + 1;
+            break;
+        }
+
+    LABEL_27:
+        v3 = this->field_30;
+    LABEL_28:
+        switch (v3) {
+        case 0:
+        case 11: {
+            if (this->field_34 != 2) {
+                goto LABEL_42;
+            }
+
+            auto v4 = this->field_30;
+            this->sub_6342D0();
+            this->field_30 = v4;
+            break;
+        }
+        case 1: {
+            this->MakeActive(false);
+            break;
+        }
+        case 2: {
+            if (nglCurScene() != nullptr) {
+                --this->field_30;
+            } else {
+
+										movie_manager::load_and_play_movie("Marvel_Logo", nullptr, false);
+										movie_manager::load_and_play_movie("mlogonosound", nullptr, false);
+										movie_manager::load_and_play_movie("ATVI spin logo 640 none", nullptr, false);
+                                        movie_manager::load_and_play_movie("beenox_short", nullptr, false);
+										
+				     static string_hash sfx_id_hash{"FE_MUSIC_MAINMENU"};
+				        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
+                if (this->field_30 != 10) {
+                    continue;
+				//	Sleep(10000);
+
+                }
+            }
+
+            break;
+        }
+        case 3: {
+            this->MakeActive(true);
+            this->sub_60C240();
+            break;
+        }
+        case 4:
+            if (this->m_index != 1) {
+                this->MakeActive(true);
+            }
+															   
+
+                
+            this->field_52 = true;
+            break;
+        case 5: {						
+        LABEL_42:
+            this->MakeActive(2);
+            break;
+        }
+        case 6:
+            this->MakeActive(3);
+            break;
+        case 7:
+            this->MakeActive(5);
+            break;
+        case 8:
+            this->MakeActive(6);
+            break;
+        case 9:
+            this->MakeActive(4);
+            break;
+        case 10: {
+						                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
+                sounds_paused2() = true;
+            if (this->m_index != 5) {
+                mission_manager::s_inst->blackscreen_on(0.0);
+            }
+
+            this->sub_60C290();
+            break;
+        }
+        default:
+            return;
+        }
+        break;
+    }
+}
+
+void FrontEndMenuSystem::GoNextState() {
+    if (this->field_30 == 10) {
+        return;
+    }
+
+    int v3;
+    while (2) {
+        auto v2 = this->field_30;
+        switch (v2) {
+        case 5:
+            this->field_50 = 1;
+            this->field_30 = 6;
+            v3 = this->field_30;
+            goto LABEL_28;
+        case 0:
+            this->field_50 = 1;
+            this->field_30 = 1;
+            v3 = 1;
+            goto LABEL_28;
+        case 4:
+            this->field_52 = 1;
+            this->field_30 = 5;
+            v3 = 5;
+            goto LABEL_28;
+        case 6: {
+            switch (this->field_4[this->m_index][5].field_28) {
+            case 0: {
+                g_game_ptr->gamefile->load_most_recent_game();													
+                this->BringUpDialogBox(10, fe_state{10}, fe_state{10});
+                goto LABEL_27;
+            }
+            case 1:
+                this->field_30 = 7;
+                v3 = this->field_30;
+                break;
+            case 2:
+                this->field_30 = 9;
+                v3 = this->field_30;
+                break;
+            case 3:
+                this->field_30 = 8;
+                v3 = this->field_30;
+                break;
+            case 4:
+                sub_5A6D70();
+                goto LABEL_27;
+            case 5: {
+                bExit() = true;
+                goto LABEL_27;
+            }
+            default:
+                goto LABEL_27;
+            }
+
+            goto LABEL_28;
+        }
+        case 7: {
+            this->field_30 = 10;
+            v3 = 10;
+            goto LABEL_28;
+        }
+        case 11:
+            if (bit_cast<main_menu_memcard_check *>(this->field_4[2])->field_100) {
+                this->field_30 = this->field_58;
+            } else {
+                this->field_30 = this->field_54;
+            }
+
+            if (this->field_5C.m_size > 0) {
+                int v5;
+                this->field_54 = *(uint32_t *) *this->field_5C.sub_64A090(&v5);
+
+                int v6;
+                this->field_58 = *(uint32_t *) *this->field_6C.sub_64A090(&v6);
+                this->field_5C.sub_64A2B0();
+                this->field_6C.sub_64A2B0();
+            }
+
+            break;
+        case 3:
+            this->field_30 = 4;
+            v3 = 4;
+						
+            goto LABEL_28;
+        default:
+            this->field_30 = v2 + 1;
+            break;
+        }
+
+    LABEL_27:
+        v3 = this->field_30;
+    LABEL_28:
+        switch (v3) {
+        case 0:
+        case 11: {
+            if (this->field_34 != 2) {
+                goto LABEL_42;
+            }
+
+            auto v4 = this->field_30;
+            this->sub_6342D0();
+            this->field_30 = v4;
+            break;
+        }
+        case 1: {
+            this->MakeActive(false);
+            break;
+        }
+        case 2: {
+            if (nglCurScene() != nullptr) {
+                --this->field_30;
+            } else {
+
+										movie_manager::load_and_play_movie("Marvel_Logo", nullptr, false);
+										movie_manager::load_and_play_movie("mlogonosound", nullptr, false);
+										movie_manager::load_and_play_movie("ATVI spin logo 640 none", nullptr, false);
+                                        movie_manager::load_and_play_movie("beenox_short", nullptr, false);
+										
+				     static string_hash sfx_id_hash{"FE_MUSIC_MAINMENU"};
+				        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
+                if (this->field_30 != 10) {
+                    continue;
+				//	Sleep(10000);
+
+                }
+            }
+
+            break;
+        }
+        case 3: {
+            this->MakeActive(true);
+            this->sub_60C240();
+            break;
+        }
+        case 4:
+            if (this->m_index != 1) {
+                this->MakeActive(true);
+            }
+															   
+
+                
+            this->field_52 = true;
+            break;
+        case 5: {						
+        LABEL_42:
+            this->MakeActive(2);
+            break;
+        }
+        case 6:
+            this->MakeActive(3);
+            break;
+        case 7:
+            this->MakeActive(5);
+            break;
+        case 8:
+            this->MakeActive(6);
+            break;
+        case 9:
+            this->MakeActive(4);
+            break;
+        case 10: {
+						                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
+                sounds_paused2() = true;
+            if (this->m_index != 5) {
+                mission_manager::s_inst->blackscreen_on(0.0);
             }
 
             this->sub_60C290();
@@ -385,6 +745,37 @@ void FrontEndMenuSystem_patch() {
 
     {
         FUNC_ADDRESS(address, &FrontEndMenuSystem::GoNextState);
+        SET_JUMP(0x00635BC0, address);
+    }
+	
+    {
+        FUNC_ADDRESS(address, &FrontEndMenuSystem::Update);
+       // set_vfunc(0x0089A284, address);
+    }
+}
+
+
+void FrontEndMenuSystem_build_patch() {
+    FUNC_ADDRESS(address, &FrontEndMenuSystem::MakeActive);
+    set_vfunc(0x0089A27C, address);
+
+    {
+        FUNC_ADDRESS(address, &FrontEndMenuSystem::GoNextState_build);
+        SET_JUMP(0x00635BC0, address);
+    }
+	
+    {
+        FUNC_ADDRESS(address, &FrontEndMenuSystem::Update);
+       // set_vfunc(0x0089A284, address);
+    }
+}
+
+void FrontEndMenuSystem_beta_patch() {
+    FUNC_ADDRESS(address, &FrontEndMenuSystem::MakeActive);
+    set_vfunc(0x0089A27C, address);
+
+    {
+        FUNC_ADDRESS(address, &FrontEndMenuSystem::GoNextState_beta);
         SET_JUMP(0x00635BC0, address);
     }
 	

@@ -203,6 +203,72 @@ app::app()
     }
 }
 
+
+void app::app1()
+{
+    TRACE("app::app");
+    this->m_vtbl = 0x00891634;
+
+    unit_tests();
+    mem_print_stats("after unit tests");
+    g_platform = NL_PLATFORM_PC;
+    if (link_system::use_link_system())
+    {
+        /*
+        link_system::init();
+        link_system::add_recipient(spider_monkey::link_receive);
+        link_system::add_recipient(game::link_receive);
+        */
+        mem_print_stats("after link_system::init()");
+    }
+
+#if defined(ENABLE_DEBUG_MENU) && !DEBUG_MENU_REIMPL
+    //debug_menu::init();
+#endif
+
+    init_shadow_targets();
+    mem_print_stats("after init_shadow_targets()");
+
+    this->field_34.reset();
+    this->field_38 = 0;
+    geometry_manager::create_inst();
+    string_hash_dictionary::create_inst();
+    event_manager::create_inst();
+
+    trigger_manager::create_inst();
+    pc_input_mgr::create_inst();
+    input_mgr::create_inst();
+    sound_manager::create_inst();
+    script_sound_manager::create_inst();
+    ambient_audio_manager::create_inst();
+    if (!os_developer_options::instance->get_flag(mString {"DISABLE_AUDIO_BOXES"})) {
+        audio_box_manager::create_inst();
+    }
+
+    gab_manager::create_inst();
+
+    set_god_mode(os_developer_options::instance->get_int(mString {"GOD_MODE"}));
+
+    colgeom_init_lists();
+    physics_system_init();
+
+    this->m_game = new game{};
+    g_game_ptr = this->m_game;
+
+    resource_manager::create_inst();
+    if (os_developer_options::instance->get_int(mString {"MONKEY_MODE"}) > 0) {
+        spider_monkey::start();
+    }
+
+    damage_morphs::init_memory_pools();
+
+    {
+        auto *inst = mission_stack_manager::get_instance();
+        inst->start_streaming();
+    }
+}
+
+
 app::~app()
 {
     this->m_vtbl = 0x00891634;
@@ -459,5 +525,18 @@ void app_patch()
     }
 
     REDIRECT(0x005E10EE, init_shadow_targets);
+
+}
+
+void app1_patch()
+{
+
+
+    {
+        FUNC_ADDRESS(address, &app::app1);
+        REDIRECT(0x005AD495, address);
+    }
+
+
 
 }

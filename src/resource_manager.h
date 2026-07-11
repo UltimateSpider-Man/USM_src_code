@@ -10,6 +10,20 @@ namespace resource_manager {
 //0x0050DD70
 nflFileID open_pack(const char *a2);
 
+// openusm: standalone-pack open with platform fallback.
+// Tries the Xbox pack folder/extension first (packs\xbox\<name>.XBPACK),
+// then the host platform's (e.g. packs\pc\<name>.PCPACK), and reports the
+// chosen file's on-disk size in bytes via out_data_size (may be null).
+// Returns NFL_FILE_ID_INVALID if no candidate file exists in any folder.
+nflFileID open_pack_ex(const char *name, int *out_data_size);
+
+// openusm: choose which amalga index to load. Prefers packs\amalga_XB.PAK
+// (beta), then the host platform's index (e.g. packs\amalga_PC.PAK / final),
+// based on which file is actually present next to the game. Falls back to the
+// native-platform name when neither is found so the existing error path is
+// meaningful.
+mString resolve_amalgapak_filename();
+
 //0x0050DF70
 resource_key *get_prerequisiste(int prereq_idx);
 

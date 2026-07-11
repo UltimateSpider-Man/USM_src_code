@@ -58,9 +58,9 @@ void localized_string_table::load_localizer()
     if constexpr (1)
     {
         [[maybe_unused]] auto a3 = os_developer_options::instance->get_string(os_developer_options::strings_t::SKU);
-        globalTextLanguage() = 0;
+        globalTextLanguage() = 5;
 
-        switch (g_settings()->sub_81D010("Settings\\Language", 0)) {
+        switch (g_settings()->sub_81D010("Settings\\Language", 5)) {
         case 1:
             globalTextLanguage() = 1;
             break;
@@ -70,11 +70,14 @@ void localized_string_table::load_localizer()
         case 3:
             globalTextLanguage() = 3;
             break;
+        case 5:
+            globalTextLanguage() = 0;
+            break;
         case 4:
             globalTextLanguage() = 4;
             break;
         default:
-            globalTextLanguage() = 0;
+            globalTextLanguage() = 5;
             break;
         }
 
@@ -92,11 +95,12 @@ void localized_string_table::load_localizer()
                                                         "globaltext_FRENCH",
                                                         "globaltext_GERMAN",
                                                         "globaltext_SPANISH",
-                                                        "globaltext_ITALIAN" };
+                                                        "globaltext_ITALIAN"
+"globaltext_ENGLISH_PRELIB"														};
 
         const auto *textLangFileName = globalTextLangFileNames[globalTextLanguage()];
 
-        my_streamer->load(textLangFileName, 0, nullptr, nullptr);
+        my_streamer->load(textLangFileName, 5, nullptr, nullptr);
         my_streamer->flush(RenderLoadMeter);
 
         mString v5{textLangFileName};
@@ -169,7 +173,7 @@ const char *localized_string_table::lookup_scripttext_string(int num) {
 
 const char *localized_string_table::lookup_localized_string(global_text_enum num)
 {
-    static constexpr auto GT_LAST = 479;
+    static constexpr auto GT_LAST = 478;
 
     assert(num >= 0);
     assert(num < GT_LAST);

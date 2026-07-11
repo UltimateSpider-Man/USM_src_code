@@ -74,8 +74,17 @@ struct pause_menu_root : FEMenu {
     //virtual
 	
     void Update(Float a2);
+
+    //0x0061BF80
+    //virtual
+    void Draw();
+	
+	void handle_exit_mission_confirmation(int a2);
+
 	
 	void OnCross(int a2);
+	
+	void test(int a2);
 	
 	void sub_61C520();
 	

@@ -48,5 +48,7 @@ namespace als
         int field_28;
 
         void unmash(mash_info_struct *a1, void *a3);
+
+        bool can_transition(als_data &a2) const;
     };
 }

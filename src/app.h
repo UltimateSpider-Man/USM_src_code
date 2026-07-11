@@ -49,6 +49,8 @@ struct app : singleton {
 
     //0x005E1070
     app();
+	
+		void app1();
 
     //0x005D6FC0
     void tick();
@@ -65,6 +67,7 @@ struct app : singleton {
     //0x005E99D0 + 0x005DBC10
     //virtual
     ~app();
+	
 };
 
 //0x00544E90
@@ -74,3 +77,5 @@ extern void colgeom_init_lists();
 extern void set_god_mode(int a1);
 
 extern void app_patch();
+
+extern void app1_patch();

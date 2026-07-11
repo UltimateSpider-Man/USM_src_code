@@ -1,5 +1,9 @@
 #include "als_transition_rule.h"
 
+#include "als_data.h"
+#include "als_state.h"
+#include "state_machine.h"
+
 #include "func_wrapper.h"
 #include "mash_info_struct.h"
 
@@ -59,6 +63,33 @@ namespace als
     void incoming_transition_rule::unmash(mash_info_struct *a1, void *a3)
     {
         this->field_0.unmash(a1, a3);
+    }
+
+
+    bool incoming_transition_rule::can_transition(als_data &a2) const
+    {
+        TRACE("als::incoming_transition_rule::can_transition");
+
+        // Converted from 0x004A0000. field_24 is an optional source-state or
+        // source-category hash filter. field_28 selects category-id matching;
+        // when clear the filter is matched against the current state id.
+        if (this->field_24 != 0) {
+            auto *curr_state = a2.field_4->get_curr_state();
+            if (curr_state == nullptr) {
+                return false;
+            }
+
+            const string_hash required {this->field_24};
+            const string_hash current = this->field_28
+                ? curr_state->get_category_id()
+                : curr_state->get_state_id();
+
+            if (!(required == current)) {
+                return false;
+            }
+        }
+
+        return this->field_0.can_transition(a2);
     }
 
 }

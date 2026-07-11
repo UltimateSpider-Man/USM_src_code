@@ -9,6 +9,7 @@
 #include "mission_manager_script_data.h"
 #include "mission_table_container.h"
 #include "mstring.h"
+#include "ngl.h"
 #include "oldmath_po.h"
 #include "parse_generic_mash.h"
 #include "region.h"
@@ -23,6 +24,7 @@
 #include "wds.h"
 
 #include <cassert>
+#include <cfloat>
 
 VALIDATE_SIZE(mission_manager, 0x100u);
 
@@ -273,8 +275,87 @@ void mission_manager::render_fade() {
     THISCALL(0x005BAE20, this);
 }
 
-void mission_manager::sub_5BACA0(Float a2) {
-    THISCALL(0x005BACA0, this, a2);
+// Beta PS2 mission_manager::blackscreen_on reimplemented on the final PC build.
+// Fade state lives in three trailing fields (PS2 offsets in parentheses):
+//   field_F4 (+220) current alpha : 0 = clear, 1 = full black
+//   field_F8 (+224) rate per second (signed; +ve fades in, -ve fades out)
+//   field_FC (+228) state : 0 idle, 1 fading-in, 2 fading-out, 3 held-black
+// The PS2 beta stored a plain 0/1 direction at +228 plus an "active" flag at +52;
+// the final build folds both into the field_FC state machine that frame_advance()
+// and render_fade() already drive, and gates the request on it.
+void mission_manager::blackscreen_on(Float a2) {
+    TRACE("mission_manager::blackscreen_on");
+
+    if constexpr (1) {
+        // Already fully black / holding black: ignore, matching retail 0x005BACA0.
+        if (this->field_FC == 3 || this->field_FC == 4) {
+            return;
+        }
+
+        this->field_4 = 0;
+
+        if (a2 > 0.0f) {
+            // Fade in over a2 seconds: alpha climbs 0 -> 1 at 1/a2 per second.
+            this->field_F8 = 1.0f / a2;
+        } else {
+            // No duration: go black this frame. Flush a black full-screen clear
+            // through NGL twice so both buffers are covered before render_fade runs.
+            for (int i = 0; i < 2; ++i) {
+                nglListInit();
+                nglListBeginScene(static_cast<nglSceneParamType>(0));
+                nglSetClearFlags(1);
+                nglSetClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                nglListEndScene();
+                nglListSend(true);
+            }
+
+            this->field_F4 = 1.0f;      // full black now
+            this->field_F8 = FLT_MAX;   // 0x7F7FFFFF
+        }
+
+        this->field_FC = 1;                 // state: fading in
+        g_game_ptr->field_166 = true;       // "black screen active" flag (PS2: g_game+396)
+        this->sub_5BABB0();                 // freeze the hero (PS2: game::freeze_hero)
+    } else {
+        THISCALL(0x005BACA0, this, a2);
+    }
+}
+
+// Beta PS2 mission_manager::blackscreen_off reimplemented on the final PC build.
+void mission_manager::blackscreen_off(Float a2) {
+    TRACE("mission_manager::blackscreen_off");
+
+    if constexpr (1) {
+        // Nothing is showing (state 0): nothing to fade out, matching retail 0x005BAD80.
+        if (this->field_FC == 0) {
+            return;
+        }
+
+        if (a2 > 0.0f) {
+            // Fade out over a2 seconds: negative rate so alpha drops 1 -> 0.
+            this->field_F8 = (1.0f / a2) * -1.0f;
+        } else {
+            // No duration: clear immediately.
+            this->field_F4 = 0.0f;
+            this->field_F8 = -FLT_MAX;  // 0xFF7FFFFF
+        }
+
+        this->field_FC = 1;                 // state: fading out
+        g_game_ptr->field_166 = false;      // clear "black screen active" flag
+        this->sub_5BABB0();                 // release the hero freeze
+    } else {
+        THISCALL(0x005BAD80, this, a2);
+    }
+}
+
+// Hero freeze/unfreeze helpers used by the black screen. Not yet reimplemented;
+// they drive the player entity through its vtable, so route to retail for now.
+void mission_manager::sub_5BABB0() {
+    THISCALL(0x005BABB0, this);
+}
+
+void mission_manager::sub_5BAC00() {
+    THISCALL(0x005BAC00, this);
 }
 
 void mission_manager::frame_advance(Float a2)
@@ -704,7 +785,39 @@ void mission_manager_patch()
     }
 
     {
+
+        FUNC_ADDRESS(address, &mission_manager::blackscreen_on);
+        REDIRECT(0x05DA4F2, address);
+        REDIRECT(0x0634CD5, address);
+        REDIRECT(0x0635E99, address);
+        REDIRECT(0x067382B, address);
+        REDIRECT(0x067383D, address);
+        REDIRECT(0x0742177, address);
+
+    }
+
+    {
         FUNC_ADDRESS(address, &mission_manager::kill_braindead_script);
         SET_JUMP(0x005D7EF0, address);
     }
+}
+
+
+void mission_manager_patch2()
+{
+
+
+    {
+
+        FUNC_ADDRESS(address, &mission_manager::blackscreen_on);
+        REDIRECT(0x05DA4F2, address);
+        REDIRECT(0x0634CD5, address);
+        REDIRECT(0x0635E99, address);
+        REDIRECT(0x067382B, address);
+        REDIRECT(0x067383D, address);
+        REDIRECT(0x0742177, address);
+
+    }
+
+
 }

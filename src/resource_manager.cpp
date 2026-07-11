@@ -149,7 +149,7 @@ void load_amalgapak()
         os_file file;
 
         {
-            amalgapak_name = get_amalgapak_filename(g_platform);
+            amalgapak_name = resolve_amalgapak_filename();
             sp_log("Loading amalgapak...");
 
             mString a1 {amalgapak_name.c_str()};
@@ -995,42 +995,125 @@ resource_partition *get_partition_pointer(resource_partition_enum which_type)
     return partitions->at(which_type);
 }
 
-nflFileID open_pack(const char *name) {
-    TRACE("resource_manager::open_pack", name);
-    const char *ext = packfile_ext()[g_platform];
+// openusm: ordered list of platform asset folders to try when opening a
+// standalone pack. Priority = array order. On PC we prefer the Xbox/beta
+// assets and fall back to the native (PC/final) assets per-pack; an Xbox
+// build only ever resolves to its own assets, so behaviour there is
+// unchanged.
+static int get_pack_search_order(_nlPlatformEnum out[2]) {
+    int n = 0;
+    out[n++] = NL_PLATFORM_XBOX;            // beta / Xbox set first
+    if (g_platform != NL_PLATFORM_XBOX) {
+        out[n++] = g_platform;              // native (e.g. PC final) fallback
+    }
+    return n;
+}
 
-    //sp_log("open pack %s%s", name, ext);
-    if constexpr (1)
-    {
-        mString v9{ext};
-        mString v8{name};
+// openusm: build "data\packs\<dir>\<name><ext>" for a given platform slot,
+// using the same packfile_dir()/packfile_ext() tables the stock open_pack
+// used (so the on-disk layout is exactly what the game already expects:
+// packs\xbox\NAME.XBPACK, packs\pc\NAME.PCPACK, ...).
+static mString make_pack_path(const char *name, _nlPlatformEnum plat) {
+    mString dir = mString{"data\\"} + mString{packfile_dir()[plat]};
+    filespec spec{dir, mString{name}, mString{packfile_ext()[plat]}};
+    return spec.fullname();
+}
 
-        mString v11{"data\\"};
+nflFileID open_pack_ex(const char *name, int *out_data_size) {
+    TRACE("resource_manager::open_pack_ex", name);
 
-        const char *dir = packfile_dir()[g_platform];
+    if (out_data_size != nullptr) {
+        *out_data_size = 0;
+    }
 
-        mString a1 = v11 + dir;
+    _nlPlatformEnum order[2];
+    int order_count = get_pack_search_order(order);
 
-        filespec fileSpec {a1, v8, v9};
+    for (int i = 0; i < order_count; ++i) {
+        mString path = make_pack_path(name, order[i]);
 
-        mString v12 = fileSpec.fullname();
-
-        auto handle = nflOpenFile(1, v12.c_str());
-
+        // Mirror the original open_pack media-id behaviour: host (1)
+        // first, then CD (2).
+        nflFileID handle = nflOpenFile(1, path.c_str());
         if (handle == NFL_FILE_ID_INVALID) {
-            mString v13 = fileSpec.fullname();
+            handle = nflOpenFile(2, path.c_str());
+        }
 
-            handle = nflOpenFile(2, v13.c_str());
+        if (handle != NFL_FILE_ID_INVALID) {
+            // Report the actual on-disk size so the streamer reads the
+            // real file length. Every standalone pack location in the
+            // amalga index has offset 0, so the index size is not needed
+            // to position the read -- and reading the file's own length
+            // is what lets an Xbox-indexed run fall back to a
+            // differently sized .PCPACK without truncating it.
+            if (out_data_size != nullptr) {
+                os_file probe;
+                probe.open(mString{path.c_str()}, os_file::FILE_READ);
+                if (probe.is_open()) {
+                    int sz = probe.get_size();
+                    if (sz > 0) {
+                        *out_data_size = sz;
+                    }
+                    probe.close();
+                }
+            }
+            return handle;
+        }
+    }
 
-            if (handle == NFL_FILE_ID_INVALID) {
-                sp_log("Could not open packfile %s", name);
+    sp_log("Could not open packfile %s in any pack folder", name);
+    return NFL_FILE_ID_INVALID;
+}
+
+nflFileID open_pack(const char *name) {
+    return open_pack_ex(name, nullptr);
+}
+
+mString resolve_amalgapak_filename() {
+#ifdef TARGET_XBOX
+    // On real Xbox hardware keep the stock behaviour (always _XB.PAK).
+    return get_amalgapak_filename(g_platform);
+#else
+    // Suffixes indexed by platform, matching get_amalgapak_filename().
+    static const char *suffix[] = {".PAK", "_XB.PAK", "_GC.PAK", "_PC.PAK"};
+
+    _nlPlatformEnum order[2];
+    int order_count = get_pack_search_order(order);
+
+    for (int i = 0; i < order_count; ++i) {
+        mString candidate = mString{"packs\\amalga"} + mString{suffix[order[i]]};
+
+        bool present = false;
+        {
+            os_file probe;
+            probe.open(mString{candidate.c_str()}, os_file::FILE_READ);
+            present = probe.is_open();
+            if (present) {
+                probe.close();
+            }
+        }
+        if (!present) {
+            // Also try a data\-rooted copy, matching load_amalgapak's
+            // secondary "data\\" lookup.
+            os_file probe;
+            mString rooted = mString{"data\\"} + candidate;
+            probe.open(rooted, os_file::FILE_READ);
+            present = probe.is_open();
+            if (present) {
+                probe.close();
             }
         }
 
-        return handle;
-    } else {
-        return CDECL_CALL(0x0050DD70, name);
+        if (present) {
+            sp_log("Selected amalga index: %s", candidate.c_str());
+            return candidate;
+        }
     }
+
+    // Nothing present: return the native-platform name so the existing
+    // "Could not open amalgapak file ..." error reports something sane.
+    return mString{"packs\\amalga"} + mString{suffix[g_platform]};
+#endif
 }
 
 resource_pack_slot *get_resource_context()

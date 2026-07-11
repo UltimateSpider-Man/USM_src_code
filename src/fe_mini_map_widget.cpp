@@ -6,6 +6,7 @@
 #include "entity.h"
 #include "fe_mini_map_dot.h"
 #include "func_wrapper.h"
+#include "mini_map_dot_type.h"
 #include "ngl.h"
 #include "ngl_mesh.h"
 #include "ngl_scene.h"
@@ -15,6 +16,7 @@
 #include "panelfile.h"
 #include "region.h"
 #include "resource_manager.h"
+#include "sound_instance_id.h"
 #include "terrain.h"
 #include "trace.h"
 #include "utility.h"
@@ -295,12 +297,64 @@ void fe_mini_map_widget::UpdatePOIs(matrix4x4 *a2,
 
     if constexpr (0)
     {
+
     }
     else
     {
         THISCALL(0x0063AEC0, this, a2, a3, a4, a5, a6, a7);
     }
 }
+
+static Var<int> cur_z_value{0x00937B74};
+
+// ---------------------------------------------------------------------------
+// Minimap blip SFX gating
+// ---------------------------------------------------------------------------
+// Every dot registration funnels through here (the patch REDIRECTs all three
+// stock call sites: 0x0063AE3A ctor, 0x006410E5 / 0x006436C6 inlined ctors).
+// Dot-type provenance, verified against USM - Original.exe:
+//
+//   type 0   hero dot         fe_mini_map_widget::Update   (0x6418AE / 0x641959)
+//   type 2   arrow-target     ensure-dot helper 0x640F10   (inlined ctor @ 0x6410E5)
+//   type 3   token reveal     token_def::show_dot 0x5C9CE0 (push 3 @ 0x5C9D80)
+//   type 5   fixed marker     widget setup                 (inlined ctor @ 0x6436C6)
+//   type N   mission POIs     SLF "set_poi_icon(num)" 0x677480 -> 0x641120
+//                             (icon id chosen by mission scripts)
+//
+// The blip fires ONLY for the dedicated openusm enemy/boss ids
+// (mini_map_dot_type.h, 20 / 21), which are spawned exclusively by the new
+// entity_tracker.set_enemy_icon(num) script function (slc_manager.cpp).
+// Everything stock stays silent by design: mission set_poi_icon dots
+// (types 3 / 4), token_def::show_dot reveals (type 3), hero / arrow /
+// objective dots.
+//
+// Reference behaviour (bandicam capture 2026-06-10, combat-tour spawn wave):
+// every enemy dot added gets its own immediate blip, even back-to-back --
+// six enemies registering over ~0.2 s produced six chirps ~37 ms apart, and
+// a seventh enemy whose dot overlapped the cluster still got its own chirp.
+// So: no rate limiting, no coalescing, default volume/pitch.
+//
+// NOTE: if a per-frame enemy-reticle pass (place_enemy_poi_reticles) is ever
+// merged, it re-adds its dots continuously; the blip must then move to that
+// pass's spawn detection instead of firing here unconditionally.
+
+static bool is_enemy_poi_dot(const fe_mini_map_dot *dot)
+{
+    const int type = dot->field_20;
+    return type == 2;
+}
+
+void fe_mini_map_widget::AddMapPOIWidget(fe_mini_map_dot *a2)
+{
+    if (a2 != nullptr && is_enemy_poi_dot(a2))
+    {
+        static string_hash sfx_id_hash{"FE_MINIMAP_BLIP"};
+        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
+    }
+
+    THISCALL(0x006391F0, this, a2);
+}
+
 
 void fe_mini_map_widget::Draw()
 {
@@ -395,6 +449,13 @@ void fe_mini_map_widget_patch()
         FUNC_ADDRESS(address, &fe_mini_map_widget::UpdatePOIs);
         REDIRECT(0x00641B2E, address);
     }
+	{
+        FUNC_ADDRESS(address, &fe_mini_map_widget::AddMapPOIWidget);
+        REDIRECT(0x0063AE3A, address);
+		REDIRECT(0x006410E5, address);
+		REDIRECT(0x006436C6, address);
+    }
+	
 
     REDIRECT(0x0063B09C, sort__poi_sort_record_t);
 

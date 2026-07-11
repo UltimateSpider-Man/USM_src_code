@@ -8,6 +8,8 @@
 #include "trace.h"
 #include "utility.h"
 
+#include <cassert>
+
 namespace als
 {
 
@@ -15,8 +17,13 @@ VALIDATE_SIZE(scripted_trans_group, 0x40u);
 
 const char *to_string(scripted_trans_group::transition_type trans_type)
 {
-    const char *str[] = {"IMPLICIT", "EXPLICIT", "LAYER"};
-    return str[trans_type];
+    switch (trans_type) {
+    case scripted_trans_group::IMPLICIT: return "IMPLICIT";
+    case scripted_trans_group::EXPLICIT: return "EXPLICIT";
+    case scripted_trans_group::LAYER:    return "LAYER";
+    case scripted_trans_group::INCOMING: return "INCOMING";
+    default:                            return "UNKNOWN";
+    }
 }
 
 scripted_trans_group::scripted_trans_group()
@@ -60,78 +67,59 @@ bool scripted_trans_group::check_transition(
 {
     TRACE("scripted_trans_group::check_transition", to_string(trans_type));
 
-    if constexpr (0) {
-        if ( test_all_trans_groups(data, this->field_4, trans_type, a4, a5) ) {
-            return true;
-        }
+    // Converted from 0x004A0090.  A child transition group returning true
+    // short-circuits the caller; local rule hits process their action but this
+    // routine still returns false, matching the original control flow.
+    if ( test_all_trans_groups(data, this->field_4, trans_type, a4, a5) ) {
+        return true;
+    }
 
-        switch (trans_type) {
-        case IMPLICIT: {
-            auto begin = this->field_14.m_data;
-            auto end = begin + this->field_14.size();
-            auto it = std::find_if(begin, end, [&a4](auto &trans_rule)
-            {
-                return trans_rule->can_transition(a4);
-            });
-
-            if (it != end) {
-                (*it)->field_0.field_14.process_action(data);
-                if ( (*it)->field_0.has_post_action() )
-                {
+    switch (trans_type) {
+    case IMPLICIT:
+        for (int i = 0; i < this->field_14.size(); ++i) {
+            auto **slot = &this->field_14.m_data[i];
+            auto *rule = *slot;
+            if (rule != nullptr && rule->can_transition(a4)) {
+                rule->field_0.field_14.process_action(data);
+                if (rule->field_0.has_post_action()) {
                     data.field_10 = trans_type;
-                    data.field_C = int(&(*it));
+                    data.field_C = reinterpret_cast<int>(slot);
                 }
+                break;
             }
-
-            break;
         }
-        case EXPLICIT: {
-            auto begin = this->field_28.m_data;
-            auto end = begin + this->field_28.size();
-            auto it = std::find_if(begin, end, [&a4, &a5](auto &trans_rule)
-            {
-                return trans_rule->can_transition(a4, a5);
-            });
-
-            if (it != end)
-            {
-                (*it)->field_0.field_14.process_action(data);
-                if ( (*it)->field_0.has_post_action() )
-                {
-                    data.field_10 = trans_type;
-                    data.field_C = int(&(*it));
-                }
-            }
-
-            break;
-        }
-        case LAYER: {
-            if ( this->field_3C != nullptr ) {
-                auto begin = this->field_3C->m_data;
-                auto end = begin + this->field_3C->size();
-                std::for_each(begin, end, [&a4, &data](auto &trans_rule)
-                {
-                    if ( trans_rule->can_transition(a4) ) {
-                        trans_rule->field_8.process_action(data);
-                    }
-                });
-            }
-
-            break;
-        }
-        default:
-            assert(0 && "Unknown type specified for trans group.");
-            break;
-        }
-
         return false;
-    } else {
-        bool (__fastcall *func)(const void *, void *,
-                request_data *data,
-                scripted_trans_group::transition_type trans_type,
-                als_data a4,
-                string_hash a5 ) = CAST(func, 0x004A0090);
-        return func(this, nullptr, &data, trans_type, a4, a5);
+
+    case EXPLICIT:
+        for (int i = 0; i < this->field_28.size(); ++i) {
+            auto **slot = &this->field_28.m_data[i];
+            auto *rule = *slot;
+            if (rule != nullptr && rule->can_transition(a4, a5)) {
+                rule->field_0.field_14.process_action(data);
+                if (rule->field_0.has_post_action()) {
+                    data.field_10 = trans_type;
+                    data.field_C = reinterpret_cast<int>(slot);
+                }
+                break;
+            }
+        }
+        return false;
+
+    case LAYER:
+        if (this->field_3C != nullptr) {
+            for (int i = 0; i < this->field_3C->size(); ++i) {
+                auto *rule = this->field_3C->at(static_cast<uint16_t>(i));
+                if (rule != nullptr && rule->can_transition(a4)) {
+                    rule->field_8.process_action(data);
+                }
+            }
+        }
+        return false;
+
+    case INCOMING:
+    default:
+        assert(0 && "Unknown type specified for trans group.");
+        return false;
     }
 }
 

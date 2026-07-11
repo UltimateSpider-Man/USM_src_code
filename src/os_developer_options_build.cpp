@@ -1,4 +1,4 @@
-#include "os_developer_options.h"
+#include "os_developer_options_build.h"
 
 #include "common.h"
 #include "func_wrapper.h"
@@ -12,28 +12,28 @@
 #include <cstdio>
 #include <string.h>
 
-VALIDATE_OFFSET(os_developer_options, m_strings, 0x9C);
+VALIDATE_OFFSET(os_developer_options_build, m_strings, 0x9C);
 
-VALIDATE_SIZE(os_developer_options, 0x2BC);
+VALIDATE_SIZE(os_developer_options_build, 0x2BC);
 
 #ifndef TEST_CASE
-os_developer_options *& os_developer_options::instance = var<os_developer_options *>(0x0096858C);
+os_developer_options_build *& os_developer_options_build::instance = var<os_developer_options_build *>(0x0096858C);
 
-int_names_t & int_names = var<const char *[76]>(0x00936940);
+int_names_build_t & int_names_build = var<const char *[76]>(0x00936940);
 
-flag_names_t & flag_names = var<const char *[150]>(0x00936420);
+flag_names_build_t & flag_names_build = var<const char *[150]>(0x00936420);
 
-string_names_t & string_names = var<const char *[14]>(0x009368D0);
+string_names_build_t & string_names_build = var<const char *[14]>(0x009368D0);
 
-static auto & int_defaults = var<int[76]>(0x00936A70);
+static auto & int_defaults_build = var<int[76]>(0x00936A70);
 
-static auto & string_defaults = var<const char *[8]>(0x00936908);
+static auto & string_defaults_build = var<const char *[8]>(0x00936908);
 
 #else
-static os_developer_options *g_instance {};
-os_developer_options *& os_developer_options::instance {g_instance};
+static os_developer_options *g_instance_build {};
+os_developer_options_build *& os_developer_options_build::instance {g_instance_build};
 
-static const char *g_int_names[76]{"DIFFICULTY",
+static const char *g_int_names_build[76]{"DIFFICULTY",
                                    "CAMERA_STYLE",
                                    "CAMERA_STATE",
                                    "CAMERA_FOV",
@@ -99,7 +99,7 @@ static const char *g_int_names[76]{"DIFFICULTY",
                                    "TARGETING_RET ICLE_SCALE_MIN_PERCENT",
                                    "HIRES_SCREENSHOT_X",
                                    "HIRES_SCREENSHOT_Y",
-                                   "TIME_OF_DAY",
+                                   "TOD",
                                    "MINI_MAP_ZOOM",
                                    "RTDT_REPLAY_BUFFER_SIZE",
                                    "TIMER_WIDGET_TIME_DELTA_PERCENT",
@@ -109,9 +109,9 @@ static const char *g_int_names[76]{"DIFFICULTY",
                                    "MAX_AE PS_SPAWNERS",
                                    "MAX_AEPS_EMITTERS",
                                    "MAX_AEPS_PARTICLES"};
-int_names_t & int_names { g_int_names };
+int_names_build_t & int_names_build { g_int_names_build };
 
-static const char *g_flag_names[150]{"CD_ONLY",
+static const char *g_flag_names_build[150]{"CD_ONLY",
                                      "ENVMAP_TOOL",
                                      "NO_CD",
                                      "CHATTY_LOAD",
@@ -261,7 +261,7 @@ static const char *g_flag_names[150]{"CD_ONLY",
                                      "DISPLAY_ALS_USAGE_PROFILE",
                                      "ENABLE_FPU_EXCEPTION_HANDLING",
                                      "UNLOCK_ALL_UNLOCKABLES"};
-flag_names_t & flag_names { g_flag_names };
+flag_names_build_t & flag_names_build { g_flag_names_build };
 
 static const char *g_string_names[14]{};
 string_names_t & string_names { g_string_names };
@@ -274,18 +274,18 @@ static const int g_flag_defaults[150]{0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 
                                       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
                                       0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
                                       0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0};
-static flag_defaults_t & flag_defaults {g_flag_defaults};
+static flag_defaults_build_t & flag_defaults_build {g_flag_defaults_build};
 
-static int g_int_defaults[76] {2,    9,    0,   90,  128, 128, 128,   0,   16,   0,    0,
+static int g_int_defaults_build[76] {2,    9,    0,   90,  128, 128, 128,   0,   16,   0,    0,
                               0,    2,    0,   1,   0,   0,   10000, 2,   0,    0,    -1,
                               -1,   -1,   640, 480, 0,   5,   0,     0,   8192, 1024, 65535,
                               2048, 1024, 15,  2,   100, 100, 100,   100, 100,  100,  100,
                               100,  -1,   0,   0,   0,   0,   0,     20,  20,   20,   20,
                               1,    11,   50,  1,   11,  25,  1,     11,  25,   1920, 1440,
                               -1,   200,  5,   100, 0,   0,   0,     0,   0,    0};
-static auto & int_defaults{g_int_defaults};
+static auto & int_defaults_build{g_int_defaults_build};
 
-static const char *g_string_defaults[8]{"spidey.snd",
+static const char *g_string_defaults_build[8]{"spidey.snd",
                                         "city_arena",
                                         "ultimate_spiderman",
                                         "Spider-Man",
@@ -295,242 +295,6 @@ static const char *g_string_defaults[8]{"spidey.snd",
                                         "display"
 
 };
-static auto & string_defaults {g_string_defaults};
+static auto & string_defaults_build {g_string_defaults_build};
 
 #endif
-
-void os_developer_options::set_hero_name(const mString& hero_name) {
-    set_hero_name(hero_name.c_str());
-}
-
-void os_developer_options::toggle_flag(os_developer_options::flags_t a2)
-{
-  	this->m_flags[a2] = !this->m_flags[a2];
-}
-
-char os_developer_options::get_flag(os_developer_options::flags_t a2) const
-{
-    return this->m_flags[a2];
-}
-
-int os_developer_options::get_int(os_developer_options::ints_t a2) const
-{
-    return this->m_ints[a2];
-}
-
-void os_developer_options::set_int(int idx, int a3) {
-    this->m_ints[idx] = a3;
-}
-
-void os_developer_options::set_int(const mString &a2, int a3) {
-    this->m_ints[this->get_int_from_name(a2)] = a3;
-}
-
-void os_developer_options::set_flag(int a2, bool a3) {
-    this->m_flags[a2] = a3;
-}
-
-void os_developer_options::set_flag(const mString &a2, bool a3) {
-    if constexpr (1) {
-        this->m_flags[this->get_flag_from_name(a2)] = a3;
-    }
-    else
-    {
-        THISCALL(0x005C2F00, this, &a2, a3);
-    }
-}
-
-os_developer_options::os_developer_options()
-{
-    {
-        bool *v3 = this->m_flags;
-        const int *v4 = flag_defaults;
-#if 0
-        char v5;
-        do {
-            v5 = (*(uint32_t *) v4 != 0);
-            v4 += 4;
-            *v3++ = v5;
-        } while ((int) v4 < (int) string_names);
-#else
-        std::copy(v4, v4 + 150, v3);
-#endif
-    }
-
-    for (uint32_t i{0}; i < 76u; ++i) {
-        this->m_ints[i] = int_defaults[i];
-    }
-
-    {
-        mString *v2 = this->m_strings;
-        const char **v8 = string_defaults;
-        do {
-            *v2 = *v8;
-            ++v8;
-            ++v2;
-        } while ((int) v8 < (int) int_names);
-    }
-}
-
-os_developer_options::~os_developer_options() {
-    if constexpr (0) {
-    } else {
-        THISCALL(0x005E2CB0, this);
-    }
-}
-
-mString *os_developer_options::get_hero_name() const
-{
-    if constexpr (1)
-	{
-        static mString result {"HERO"};
-	
-
-        result = this->m_strings[2];
-        return &result;
-		
-		
-    } else {
-        return (mString *) THISCALL(0x005C3150, this);
-    }
-}
-
-bool os_developer_options::is_hero_selected(const char* name) const
-{
-    return this->m_strings[2] == name;
-}
-
-
-
-
-bool os_developer_options::get_hero_flag() const
-{
-
-    static bool result = false;
-    result = (this->m_strings[2] == "HERO");   // true when Venom, false otherwise
-    return result;
-}
-
-int os_developer_options::get_flag_from_name(const mString &a1) const
-{
-    auto func = [&a1](const char *v2) {
-        return (_strcmpi(v2, a1.c_str()) == 0);
-    };
-
-    auto it = std::find_if(std::begin(flag_names), std::end(flag_names), func);
-
-    size_t v3 = std::distance(std::begin(flag_names), it);
-    if (v3 == std::size(flag_names)) {
-        mString out = "Nonexistent option flag " + a1;
-        sp_log("%s", out.c_str());
-    }
-
-    return v3;
-}
-
-char os_developer_options::get_flag(const mString &a2) const
-{
-	TRACE("os_developer_options::get_flag");
-
-    if constexpr (1) {
-        return this->m_flags[this->get_flag_from_name(a2)];
-    } else {
-		char (__fastcall *func)(const void *, void *, const mString *) = CAST(func, 0x005C2F20);
-        return func(this, nullptr, &a2);
-    }
-}
-
-os_developer_options::strings_t os_developer_options::get_string_from_name(const mString &a1) const
-{
-    auto func = [&a1](const char *v2) {
-        return (_strcmpi(v2, a1.c_str()) == 0);
-    };
-
-    auto it = std::find_if(std::begin(string_names), std::end(string_names), func);
-
-    auto v3 = (strings_t) std::distance(std::begin(string_names), it);
-    if (v3 == std::size(string_names)) {
-        mString out = "Nonexistent string " + a1;
-    }
-
-    return v3;
-}
-
-void os_developer_options::set_string(const mString &a2, const mString &a3) {
-    strings_t v4 = this->get_string_from_name(a2);
-
-    this->set_string(v4, a3);
-}
-
-
-
-void os_developer_options::set_string(strings_t a2, const mString &a3) {
-    this->m_strings[a2] = a3;
-}
-
-std::optional<mString> os_developer_options::get_string(os_developer_options::strings_t a2) const
-{
-    if (a2 < strings_t::SOUND_LIST || a2 > strings_t::DEBUG_ENTITY_NAME) {
-        return {};
-    } else {
-        auto a3 = this->m_strings[a2];
-        return a3;
-    }
-}
-
-std::optional<mString> os_developer_options::get_string(const mString &a1) const
-{
-
-    auto v4 = this->get_string_from_name(a1);
-    if (v4 < strings_t::SOUND_LIST || v4 > strings_t::DEBUG_ENTITY_NAME) {
-        return {};
-    } else {
-        mString str = this->m_strings[v4];
-        return str;
-    }
-}
-
-int os_developer_options::get_int(const mString &a2) const
-{
-    return this->m_ints[os_developer_options::get_int_from_name(a2)];
-}
-
-int os_developer_options::get_int_from_name(const mString &a1) const
-{
-    auto func = [&a1](const char *v2) -> bool {
-        return (_strcmpi(v2, a1.c_str()) == 0);
-    };
-
-    auto it = std::find_if(std::begin(int_names), std::end(int_names), func);
-
-    size_t v3 = std::distance(std::begin(int_names), it);
-    if (v3 == std::size(int_names)) {
-        mString out = "Nonexistent int " + a1;
-        sp_log("%s", out.c_str());
-    }
-
-    return v3;
-}
-
-void os_developer_options::os_developer_init() {
-    instance = new os_developer_options{};
-}
-
-void os_developer_options_patch()
-{
-    int (os_developer_options::*func)(os_developer_options::ints_t ) const = &os_developer_options::get_int;
-
-    FUNC_ADDRESS(address, func);
-    REDIRECT(0x0052B5F1, address);
-
-    {
-        char (os_developer_options::*func)(os_developer_options::flags_t a2) const = &os_developer_options::get_flag;
-        FUNC_ADDRESS(address, func);
-        SET_JUMP(0x005B87E0, address);
-    }
-
-    {
-        FUNC_ADDRESS(address, &os_developer_options::get_flag_from_name);
-        SET_JUMP(0x005B88A0, address);
-    }
-}

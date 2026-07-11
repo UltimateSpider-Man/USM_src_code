@@ -205,7 +205,20 @@ bool animation_controller::anim_ctrl_handle::is_anim_active() const
 
 void *animation_controller::anim_ctrl_handle::get_anim_ptr() const
 {
-    return (void *) THISCALL(0x004AD230, this);
+    // Converted from 0x004AD230.
+    if ( this->field_8 == nullptr ) {
+        return nullptr;
+    }
+
+    if ( this->field_0 ) {
+        auto *func = bit_cast<void *(__fastcall *)(const animation_controller *, void *)>(
+            get_vfunc(this->field_8->m_vtbl, 0x64));
+        return func(this->field_8, nullptr);
+    }
+
+    auto *func = bit_cast<void *(__fastcall *)(const animation_controller *, void *, Float)>(
+        get_vfunc(this->field_8->m_vtbl, 0x68));
+    return func(this->field_8, nullptr, this->field_4);
 }
 
 double animation_controller::anim_ctrl_handle::get_anim_time_in_sec() const
@@ -232,8 +245,16 @@ double animation_controller::anim_ctrl_handle::get_anim_speed() const
 
 float animation_controller::anim_ctrl_handle::get_anim_norm_time() const
 {
-    float (__fastcall *func)(const void *) = CAST(func, 0x004AD210);
-    return func(this);
+    // Converted from 0x004AD210.
+    if ( this->field_0 ) {
+        auto *func = bit_cast<float (__fastcall *)(const animation_controller *, void *)>(
+            get_vfunc(this->field_8->m_vtbl, 0x40));
+        return func(this->field_8, nullptr);
+    }
+
+    auto *func = bit_cast<float (__fastcall *)(const animation_controller *, void *, Float)>(
+        get_vfunc(this->field_8->m_vtbl, 0x44));
+    return func(this->field_8, nullptr, this->field_4);
 }
 
 bool animation_controller::is_anim_active(Float a1) const
@@ -345,6 +366,16 @@ void animation_controller::reset()
 void animation_controller_patch() {
 
     REDIRECT(0x0049B9B5, get_anim_by_hash);
+
+    {
+        FUNC_ADDRESS(address, &animation_controller::anim_ctrl_handle::get_anim_ptr);
+        SET_JUMP(0x004AD230, address);
+    }
+
+    {
+        FUNC_ADDRESS(address, &animation_controller::anim_ctrl_handle::get_anim_norm_time);
+        SET_JUMP(0x004AD210, address);
+    }
 
     {
         animation_controller::anim_ctrl_handle * (animation_controller::*func)(

@@ -20,4 +20,7 @@ struct entity_tracker_manager {
     bool get_the_arrow_target_pos(vector3d *);
 
     void place_poi_reticles();
+
+    // openusm: per-frame POI markers over enemies/bosses (SHOW_ENEMY_HEALTH_WIDGETS).
+    void place_enemy_poi_reticles();
 };

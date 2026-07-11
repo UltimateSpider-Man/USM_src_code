@@ -257,3 +257,7 @@ extern tlResourceDirectory<nalAnimClass<nalAnyPose>, tlFixedString> *nalGetAnimD
 extern void nalSetSceneAnimDirectory(tlResourceDirectory<nalSceneAnim, tlFixedString> *a1);
 
 extern void nalStreamInstance_patch();
+
+// one-time scan of mods/ for *.PCSKEL / *.PCANIM overrides, registered into
+// the Mods multimap (see utility/mod.h); safe to call from any load path
+extern void modScanNalOverrides();

@@ -54,6 +54,44 @@ struct string_hash {
 
     [[nodiscard]] string_hash sub_501E80();
 	
+	
+static inline constexpr bool is_alpha2(unsigned char c) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    static inline constexpr unsigned char to_lower2(unsigned char c) {
+        constexpr auto delta = 'a' - 'A';
+
+        if (c >= 'A' && c <= 'Z') {
+            return (c + delta);
+        }
+
+        return c;
+    }
+
+    //0x00501BE0
+    static constexpr std::uint32_t to_hash2(const char *str) {
+        std::uint32_t res = 0;
+
+        for (int c = *str; c != '\0'; ++str, c = *str) {
+            int ch_lower = [](auto ch) -> int {
+                if (is_alpha2(ch)) {
+                    return to_lower2(ch);
+                }
+
+                return ch;
+            }(c);
+
+            res = ch_lower + 33 * res;
+        }
+
+        return res;
+    }
+	
 
 };
 

@@ -68,9 +68,7 @@
 #include <d3dx9shader.h>
 
 #if MOD_MESH_SUPPORT
-#   include <assimp/Importer.hpp>
-#   include <assimp/scene.h>
-#   include <assimp/postprocess.h>
+#   include "mod_mesh_import.h"
 Mod* dbgReplaceMesh = nullptr;
 #endif
 
@@ -2406,362 +2404,313 @@ const char *to_string(TypeDirectoryEntry type)
 constexpr bool nglLoadMeshFileInternal_hook = 1;
 
 #ifndef TARGET_XBOX
-// imports a mesh (by optional index) and creates buffers
-// returns number of meshes found within the mesh itself
+#if MOD_MESH_SUPPORT
+// ---------------------------------------------------------------------------
+// FBX/OBJ mesh replacement, native importer (mod_mesh_import.h).
+//
+// modBuildSectionsForMesh runs once per nglMesh right after nglRebaseMesh:
+// it snapshots the original (still-float) section vertex streams as donor
+// views, parses the mod file (cached across meshes and reloads) and lets the
+// three-tier mapper produce per-section replacements.
+//
+// modApplyBuiltSection swaps one section onto its replacement. Buffers are
+// created through the engine's own pool helpers (createVertexBufferAndWrite-
+// Data / createIndexBufferAndWriteData), so the retail unload path
+// (nglReleaseSection -> 0x77B5D0) recycles them exactly like vanilla section
+// buffers. Only >65535-vertex sections fall back to a raw D3DFMT_INDEX32
+// buffer (no engine path exists); the case is logged. CPU-side fields the
+// engine still reads (m_vertexData, m_indices, BonesIdx) point into the
+// per-section registry (modSectionRegistry), which outlives the mesh file
+// and also feeds the work-mesh mirroring in nglCopySection. Replaced
+// sections keep the full vanilla load tail (VertexDef bank init +
+// BindSection): the actor pipeline clones character meshes from the section
+// VertexDef, so it must be a real initialized def, not the raw in-file blob
+// and not null. On any failure the section is left untouched and the vanilla
+// path continues.
+// ---------------------------------------------------------------------------
 
-static inline float u32_as_float(uint32_t u)
-{
-    float f;
-    std::memcpy(&f, &u, sizeof(u));
-    return f;
-}
+namespace {
 
-static inline uint32_t pack_argb8(uint8_t a, uint8_t r, uint8_t g, uint8_t b)
-{
-    return (uint32_t(a) << 24) | (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
-}
+// Everything a replaced section needs to be (re)constructed, kept alive for
+// the whole session. The same snapshot is mirrored onto the actor's buffered
+// work-mesh clones (see nglCopySection): character meshes are copied into
+// those clones every frame by actor::swap_all_mesh_buffers, and the vanilla
+// fixed-size memcpy shreds any section whose counts differ from what the
+// clone was created with.
+struct ModSectionStorage {
+    std::vector<float>    vertices;    // padded to >= the vanilla vert count
+    std::vector<uint16_t> idx16;
+    std::vector<uint32_t> idx32;
+    // The palette is tlMemAlloc-owned, NOT vector storage: the engine's
+    // dynamic-section teardown (nglDestroySection / retail 0x775700)
+    // tlMemFree's BonesIdx on the actor work-mesh clones we mirror onto, so
+    // the pointer must be legal to hand to tlMemFree. File sections are
+    // never freed per-section, so on those it just leaks <=128 bytes per
+    // reload. Never freed from our side once installed in a section.
+    uint16_t *palette = nullptr;
+    uint16_t  nbones  = 0;
+    uint32_t nverts = 0;               // real (drawn) counts
+    uint32_t nidx = 0;
+    uint32_t paddedVerts = 0;
+    uint32_t weightClass = 2;
+    bool     wide = false;
+    uint32_t revision = 0;             // bumped per (re)build of the source
+    uint32_t mirroredRevision = 0;     // on clones: which revision they hold
 
-static inline uint8_t to_u8_sat(float v01)
-{
-    v01 = std::clamp(v01, 0.0f, 1.0f);
-    return (uint8_t)std::lround(v01 * 255.0f);
-}
-
-static inline uint32_t get_vertex_color_or_white(const aiMesh* mesh, unsigned i)
-{
-    if (mesh->HasVertexColors(0) && mesh->mColors[0])
+    void setPalette(const uint16_t *src, uint32_t n)
     {
-        const aiColor4D& c = mesh->mColors[0][i]; // usually 0..1 floats
-        return pack_argb8(to_u8_sat(c.a), to_u8_sat(c.r), to_u8_sat(c.g), to_u8_sat(c.b));
+        if (n == 0) { static const uint16_t zero = 0; src = &zero; n = 1; }
+        if (n > 64) n = 64;
+        palette = static_cast<uint16_t *>(tlMemAlloc(int(n * sizeof(uint16_t)), 8, 0x1000000u));
+        std::memcpy(palette, src, n * sizeof(uint16_t));
+        nbones = uint16_t(n);
     }
+};
+
+std::unordered_map<nglMeshSection *, ModSectionStorage> modSectionRegistry;
+uint32_t modSectionRevision = 0;
+
+// (re)creates the D3D buffers and points the section at `st`. Buffers go
+// through the engine pool helpers so the retail teardown recycles them like
+// vanilla ones. Returns false without touching the section on failure.
+bool modApplyStorageToSection(nglMeshSection *S, ModSectionStorage &st)
+{
+    const uint32_t vbytes = st.paddedVerts * 64;
+    const uint32_t ibytes = st.nidx * (st.wide ? 4u : 2u);
+
+    nglVertexBuffer newVB {};
+    if (!newVB.createVertexBufferAndWriteData(st.vertices.data(), vbytes, 1028))
+        return false;
+
+    IDirect3DIndexBuffer9 *ib = nullptr;
+    if (!st.wide) {
+        nglVertexBuffer newIB {};
+        if (!newIB.createIndexBufferAndWriteData(st.idx16.data(), int(ibytes))) {
+            if (newVB.m_vertexBuffer)
+                newVB.m_vertexBuffer->lpVtbl->Release(newVB.m_vertexBuffer);
+            return false;
+        }
+        ib = newIB.m_indexBuffer;
+    } else {
+        // no engine path creates 32-bit index buffers; raw MANAGED fallback
+        auto *dev = g_Direct3DDevice();
+        if (FAILED(dev->lpVtbl->CreateIndexBuffer(dev, ibytes, D3DUSAGE_WRITEONLY,
+                                                  D3DFMT_INDEX32,
+                                                  D3DPOOL_MANAGED, &ib, nullptr))) {
+            if (newVB.m_vertexBuffer)
+                newVB.m_vertexBuffer->lpVtbl->Release(newVB.m_vertexBuffer);
+            return false;
+        }
+        void *p = nullptr;
+        if (FAILED(ib->lpVtbl->Lock(ib, 0, ibytes, &p, 0))) {
+            ib->lpVtbl->Release(ib);
+            if (newVB.m_vertexBuffer)
+                newVB.m_vertexBuffer->lpVtbl->Release(newVB.m_vertexBuffer);
+            return false;
+        }
+        std::memcpy(p, st.idx32.data(), ibytes);
+        ib->lpVtbl->Unlock(ib);
+    }
+
+    // recycle whatever the section held (a clone's own buffers, or a
+    // previous replacement) through the engine pool
+    if (S->m_indexBuffer != nullptr) {
+        nglVertexBuffer::sub_77B5D0((nglVertexBuffer *) &S->m_indexBuffer,
+                                    ResourceType::IndexBuffer);
+        S->m_indexBuffer = nullptr;
+    }
+    if (S->field_3C.m_vertexBuffer != nullptr) {
+        nglVertexBuffer::sub_77B5D0(&S->field_3C, ResourceType::VertexBuffer);
+        S->field_3C.m_vertexBuffer = nullptr;
+    }
+
+    S->field_3C.m_vertexData   = (char *)st.vertices.data();
+    S->field_3C.Size           = vbytes;
+    S->field_3C.m_vertexBuffer = newVB.m_vertexBuffer;
+    S->m_indexBuffer   = ib;
+    S->m_indices       = st.wide ? nullptr : st.idx16.data();
+    S->NVertices       = int(st.nverts);
+    S->NIndices        = int(st.nidx);
+    S->m_stride        = 64;
+    S->m_primitiveType = D3DPT_TRIANGLELIST;
+    S->StartIndex      = 0;
+    S->field_4C        = 0;              // MinVertexIndex = field_4C / stride
+    S->field_5C        = st.weightClass; // 2/3/4-bone shader selector
+    S->BonesIdx        = st.palette;
+    S->NBones          = int(st.nbones);
+    return true;
 }
 
-// imports a mesh (by optional index) and creates buffers
-// returns number of meshes found within the mesh itself
-//
-// If `sect` is provided, the section's bone palette (BonesIdx[]) is rebuilt
-// as an identity mapping in Assimp bone declaration order. This makes the
-// vertex bone-index stream we emit (which uses Assimp's mBones[] order)
-// directly index the palette the GPU shader uses:
-//
-//      vertex bone idx i  ->  Section->BonesIdx[i]  ->  meshParams->field_8[skel_idx]
-//
-// For this to render correctly the FBX must have its bones in the same order
-// as the original PCMESH skeleton (which is what the Blender PCMESH addon
-// produces when it exports straight from a PCMESH/PCSKEL pair).
-int modImportMesh(IDirect3DDevice9* dev, modGenericMesh& data, char* buf, size_t size, std::string shaderName, int meshIndex = 0, nglMeshSection* sect = nullptr)
+} // namespace
+
+bool modIsReplacedSection(nglMeshSection *S)
 {
-    if (!buf || size == 0) return 0;
+    return modSectionRegistry.count(S) != 0;
+}
 
-    Assimp::Importer importer;
-    const aiScene* scene = nullptr;
+static bool modApplyBuiltSection(nglMeshSection *S, const modmesh::BuiltSection &B)
+{
+    if (B.vertices.empty() || B.indices.empty())
+        return false;
 
-    // Cap weights per vertex at 4 — that matches our packed vertex layout.
-    importer.SetPropertyInteger(AI_CONFIG_PP_LBW_MAX_WEIGHTS, 4);
+    const uint32_t nverts = uint32_t(B.vertices.size() / 16);
+    const uint32_t nidx   = uint32_t(B.indices.size());
+    const bool     wide   = nverts > 0xFFFF;
 
-    // NOTE: aiProcess_JoinIdenticalVertices is intentionally OFF for skinned
-    // meshes. It can renumber vertex IDs while we walk weights, which causes
-    // the per-vertex influences[] table to desync from the actual buffer
-    // ordering — that produces the floating "shrapnel" you see around skinned
-    // characters when an FBX replacement is loaded.
-    unsigned int loadFlags =
-        aiProcess_Triangulate |
-        aiProcess_GenSmoothNormals |
-        aiProcess_CalcTangentSpace |
-        aiProcess_LimitBoneWeights |
-        aiProcess_ImproveCacheLocality |
-        aiProcess_ConvertToLeftHanded |
-        aiProcess_PopulateArmatureData;
+    // retail morph playback indexes vertices by the VANILLA counts; padding
+    // the CPU array and the VB up to that count keeps those writes in bounds
+    // even when the replacement is smaller
+    const uint32_t origVerts  = uint32_t(S->NVertices > 0 ? S->NVertices : 0);
+    const uint32_t padded     = nverts > origVerts ? nverts : origVerts;
 
-    data.vertices.clear();
-    data.indices.clear();
-    data.vertexBuffer = nullptr;
-    data.indexBuffer = nullptr;
-    data.stride = 0;
-    data.numIndices = 0;
-    data.numVertices = 0;
+    ModSectionStorage next;
+    next.nverts      = nverts;
+    next.nidx        = nidx;
+    next.paddedVerts = padded;
+    next.wide        = wide;
+    next.weightClass = B.weightClass;
+    next.vertices    = B.vertices;
+    next.vertices.resize(size_t(padded) * 16, 0.f);
+    if (wide) {
+        next.idx32 = B.indices;
+        sp_log("[modmesh] section with %u verts uses a 32-bit index buffer\n",
+               nverts);
+    } else {
+        next.idx16.reserve(nidx);
+        for (uint32_t v : B.indices)
+            next.idx16.push_back(uint16_t(v));
+    }
 
-    std::string ext = transformToLower(data.mod->Path.extension().string());
-    if (ext != ".fbx")
-        scene = importer.ReadFileFromMemory(buf, size, loadFlags);
+    // final palette snapshot: either the rebuilt one or the section's own,
+    // so work-mesh mirrors always get a self-contained copy
+    if (!B.keepOriginalPalette && !B.palette.empty())
+        next.setPalette(B.palette.data(), uint32_t(B.palette.size()));
+    else if (S->BonesIdx != nullptr && S->NBones > 0)
+        next.setPalette(S->BonesIdx, uint32_t(S->NBones));
     else
-        scene = importer.ReadFile(data.mod->Path.string().c_str(), loadFlags);
+        next.setPalette(nullptr, 0);
+    next.revision = ++modSectionRevision;
 
-    if (!scene || !scene->HasMeshes()) return 0;
-
-    UINT stride = 16;
-    if (shaderName.find("uslod") != std::string::npos)
-    {
-        stride = 16;
+    ModSectionStorage &st = modSectionRegistry[S];
+    st = std::move(next);
+    if (!modApplyStorageToSection(S, st)) {
+        modSectionRegistry.erase(S);
+        return false;
     }
-    else if (shaderName.find("ussimpleprop") != std::string::npos)
-    {
-        stride = 24;
-    }
-    else if (shaderName.find("us_character") != std::string::npos ||
-        shaderName.find("usperson") != std::string::npos ||
-        shaderName.find("uspersonsolid") != std::string::npos)
-    {
-        stride = 64;
-    }
-
-    const bool hasFullVB = (stride == 64);
-    const aiMesh* mesh = scene->mMeshes[0];
-    if (hasFullVB && !meshIndex)
-    {
-        for (unsigned int idx = 0; idx < scene->mNumMeshes; ++idx)
-        {
-            const aiMesh* tmp = scene->mMeshes[idx];
-            if (tmp && tmp->mNumVertices && tmp->mNumBones)
-            {
-                mesh = tmp;
-                break;
-            }
-        }
-    }
-    else if (meshIndex != 0)
-    {
-        unsigned int pick = (meshIndex < (int)scene->mNumMeshes) ? (unsigned int)meshIndex : (scene->mNumMeshes - 1);
-        mesh = scene->mMeshes[pick];
-    }
-
-    if (!mesh || mesh->mNumVertices == 0) return 0;
-
-    // GPU constant table is sized for 64 bones (matches MAX_BONES in
-    // ngl_dx_shader.cpp and conglom.cpp). Anything beyond that has nowhere
-    // to go in the shader, so we ignore those bones rather than letting
-    // garbage indices reach the GPU.
-    constexpr unsigned int kMaxBones = 64u;
-    const unsigned int boneCount = (mesh->mNumBones < kMaxBones) ? mesh->mNumBones : kMaxBones;
-
-    struct Influence { uint16_t bone = 0; float w = 0.0f; };
-    std::vector<std::array<Influence, 4>> influences;
-    if (hasFullVB)
-    {
-        influences.resize(mesh->mNumVertices);
-        for (auto& arr : influences)
-            for (auto& inf : arr) inf = {};
-
-        auto try_insert = [&](unsigned int vtx, uint16_t boneIndex, float weight)
-            {
-                if (vtx >= influences.size() || weight <= 0.0f) return;
-                if (boneIndex >= kMaxBones) return; // never let an out-of-palette index reach the vertex buffer
-                auto& a = influences[vtx];
-                int weakest = 0;
-                for (int i = 1; i < 4; ++i)
-                    if (a[i].w < a[weakest].w) weakest = i;
-
-                if (weight > a[weakest].w)
-                    a[weakest] = { boneIndex, weight };
-            };
-
-        // Read all weights. The `boneIndex` we emit here is Assimp's mBones[]
-        // ordering — which (for FBX exported from a PCMESH/PCSKEL via the
-        // Blender addon) is the same ordering as the original skeleton.
-        // The per-section palette rebuild below makes BonesIdx[i] == i so that
-        // this index lands on the correct skeleton-bone matrix at draw time.
-        for (unsigned int boneIndex = 0; boneIndex < boneCount; ++boneIndex)
-        {
-            const aiBone* bone = mesh->mBones[boneIndex];
-            if (!bone) continue;
-
-            for (unsigned int w = 0; w < bone->mNumWeights; ++w)
-            {
-                const aiVertexWeight& vw = bone->mWeights[w];
-                try_insert(vw.mVertexId, (uint16_t)boneIndex, vw.mWeight);
-            }
-        }
-
-        for (unsigned int v = 0; v < influences.size(); ++v)
-        {
-            auto& a = influences[v];
-            std::sort(a.begin(), a.end(), [](const Influence& x, const Influence& y) { return x.w > y.w; });
-
-            float sum = a[0].w + a[1].w + a[2].w + a[3].w;
-            if (sum > 0.0f)
-            {
-                float inv = 1.0f / sum;
-                for (auto& inf : a) inf.w *= inv;
-            }
-            else
-            {
-                a[0] = { 0, 1.0f };
-                a[1] = { 0, 0.0f };
-                a[2] = { 0, 0.0f };
-                a[3] = { 0, 0.0f };
-            }
-        }
-
-        // -------- Section bone-palette rebuild (the actual fix) --------
-        // The shader reads vertex.bone_idx -> Section->BonesIdx[bone_idx]
-        // -> meshParams->field_8[skel_idx].
-        // We just wrote vertex bone indices in Assimp mBones[] order, so we
-        // make the palette an identity mapping over those same N bones. This
-        // means slot i resolves to skeleton bone i, which is what our FBX
-        // (exported from the original PCMESH) already lines up with.
-        if (sect && boneCount > 0)
-        {
-            uint16_t* newPalette = static_cast<uint16_t*>(tlMemAlloc(2u * boneCount, 16u, 0u));
-            if (newPalette)
-            {
-                for (unsigned int i = 0; i < boneCount; ++i)
-                    newPalette[i] = static_cast<uint16_t>(i);
-
-                if (sect->BonesIdx)
-                    tlMemFree(sect->BonesIdx);
-
-                sect->BonesIdx = newPalette;
-                sect->NBones   = static_cast<int>(boneCount);
-            }
-        }
-        // ---------------------------------------------------------------
-    }
-
-    std::vector<float> vertices;
-    std::vector<uint16_t> indices;
-
-    vertices.reserve(mesh->mNumVertices * (stride / sizeof(float)));
-
-    // fill vertex buffer
-    for (unsigned int i = 0; i < mesh->mNumVertices; ++i)
-    {
-        const aiVector3D& pos = mesh->mVertices[i];
-        vertices.push_back(pos.x);
-        vertices.push_back(pos.y);
-        vertices.push_back(pos.z);
-
-        // ussimpleprop
-        if (stride == 24)
-        {
-            // uv0
-            if (mesh->HasTextureCoords(0))
-            {
-                const aiVector3D& uv = mesh->mTextureCoords[0][i];
-                vertices.push_back(uv.x);
-                vertices.push_back(uv.y);
-            }
-            else
-            {
-                vertices.push_back(0.0f);
-                vertices.push_back(0.0f);
-            }
-
-            const uint32_t col = get_vertex_color_or_white(mesh, i);
-            vertices.push_back(u32_as_float(col));
-            continue;
-        }
-
-        if (!hasFullVB)
-        {
-            vertices.push_back(0.0f);
-            continue;
-        }
-
-        // normal
-        if (mesh->HasNormals())
-        {
-            const aiVector3D& n = mesh->mNormals[i];
-            vertices.push_back(n.x);
-            vertices.push_back(n.y);
-            vertices.push_back(n.z);
-        }
-        else
-        {
-            vertices.push_back(0.0f);
-            vertices.push_back(0.0f);
-            vertices.push_back(0.0f);
-        }
-
-        // uv0
-        if (mesh->HasTextureCoords(0))
-        {
-            const aiVector3D& uv = mesh->mTextureCoords[0][i];
-            vertices.push_back(uv.x);
-            vertices.push_back(uv.y);
-        }
-        else
-        {
-            vertices.push_back(0.0f);
-            vertices.push_back(0.0f);
-        }
-
-        if (mesh->mNumBones && i < influences.size())
-        {
-            const auto& a = influences[i];
-
-            // indices
-            vertices.push_back((float)a[0].bone);
-            vertices.push_back((float)a[1].bone);
-            vertices.push_back((float)a[2].bone);
-            vertices.push_back((float)a[3].bone);
-
-            // weights
-            vertices.push_back(a[0].w);
-            vertices.push_back(a[1].w);
-            vertices.push_back(a[2].w);
-            vertices.push_back(a[3].w);
-        }
-        else
-        {
-            vertices.push_back(0.0f);
-            vertices.push_back(0.0f);
-            vertices.push_back(0.0f);
-            vertices.push_back(0.0f);
-
-            vertices.push_back(1.0f);
-            vertices.push_back(0.0f);
-            vertices.push_back(0.0f);
-            vertices.push_back(0.0f);
-        }
-    }
-
-    indices.reserve(mesh->mNumFaces * 3);
-    for (unsigned int f = 0; f < mesh->mNumFaces; ++f)
-    {
-        const aiFace& face = mesh->mFaces[f];
-        if (face.mNumIndices == 3)
-        {
-            indices.push_back((uint16_t)face.mIndices[0]);
-            indices.push_back((uint16_t)face.mIndices[1]);
-            indices.push_back((uint16_t)face.mIndices[2]);
-        }
-    }
-
-    // create vertex buffer
-    UINT vertexSize = (UINT)(vertices.size() * sizeof(float));
-    auto device = g_Direct3DDevice()->lpVtbl;
-
-    if (FAILED(device->CreateVertexBuffer(g_Direct3DDevice(), vertexSize, 0, 0, D3DPOOL_DEFAULT, &data.vertexBuffer, nullptr)))
-        return 0;
-
-    void* vbData = nullptr;
-    if (FAILED(data.vertexBuffer->lpVtbl->Lock(data.vertexBuffer, 0, vertexSize, &vbData, 0)))
-        return 0;
-
-    memcpy(vbData, vertices.data(), vertexSize);
-    data.vertexBuffer->lpVtbl->Unlock(data.vertexBuffer);
-
-    // create index buffer
-    UINT indexSize = (UINT)(indices.size() * sizeof(uint16_t));
-    if (FAILED(device->CreateIndexBuffer(g_Direct3DDevice(), indexSize, 0, D3DFMT_INDEX16, D3DPOOL_DEFAULT, &data.indexBuffer, nullptr)))
-        return 0;
-
-    void* ibData = nullptr;
-    if (FAILED(data.indexBuffer->lpVtbl->Lock(data.indexBuffer, 0, indexSize, &ibData, 0)))
-        return 0;
-
-    memcpy(ibData, indices.data(), indexSize);
-    data.indexBuffer->lpVtbl->Unlock(data.indexBuffer);
-
-    // update game meta
-    data.vertices = std::move(vertices);
-    data.indices = std::move(indices);
-    data.stride = stride;
-    data.numVertices = (UINT)(data.vertices.size() / (stride / sizeof(float)));
-    data.numIndices = (UINT)data.indices.size();
-
-    return (int)scene->mNumMeshes;
+    return true;
 }
+
+static std::vector<std::optional<modmesh::BuiltSection>>
+modBuildSectionsForMesh(Mod *mod, nglMesh *Mesh)
+{
+    static bool logWired = false;
+    if (!logWired) {
+        logWired = true;
+        modmesh::setLog(+[](const char *m) { sp_log("%s", m); });
+    }
+
+    auto scene = modmesh::loadScene(mod->Path.string(),
+                                    mod->Data.data(), mod->Data.size());
+    if (!scene)
+        return {};
+
+    std::vector<modmesh::OrigSectionView> views;
+    views.reserve(Mesh->NSections);
+    for (auto i = 0u; i < Mesh->NSections; ++i) {
+        nglMeshSection *S = Mesh->Sections[i].Section;
+        modmesh::OrigSectionView ov;
+        ov.strideBytes = uint32_t(S->m_stride);
+        ov.nverts      = uint32_t(S->NVertices);
+        ov.verts       = (const float *)S->field_3C.m_vertexData;
+        ov.palette     = S->BonesIdx;
+        ov.nbones      = S->NBones;
+        views.push_back(ov);
+    }
+
+    return modmesh::buildSectionsForMesh(*scene, Mesh->Name->to_string(), views);
+}
+#endif // MOD_MESH_SUPPORT
+
+
+// --------------------------------------------------------------------------
+// Raw .PCMESH overrides ("mods/VENOM.PCMESH").
+//
+// A drop-in mesh file is the same "PCM " 0x601 binary nglLoadMeshFileInternal
+// parses below, so the substitution point is the file buffer itself: rebind
+// MeshFile->FileBuf before the header is read and let the parser consume the
+// replacement exactly like the per-pack blob the retail loader feeds it.
+//
+// The parse rebases the buffer IN PLACE (PTR_OFFSET turns stored offsets into
+// live pointers, the usperson/us_character path even rewrites vertex floats
+// to packed ints), and the nglMesh/nglMaterialBase/nglMeshSection nodes keep
+// living inside the buffer for as long as the file is loaded. Binding the
+// Mods[] master bytes directly would therefore 1) corrupt the master on the
+// first parse and 2) alias every nglMeshFile that shares the name onto one
+// buffer. Instead each nglMeshFile gets a private copy, refreshed whenever
+// the previous copy has already been parsed (Header->field_10 != 0) - which
+// mirrors the retail blob lifetime: freed and re-read from disk per load.
+// Stale slots of destroyed nglMeshFiles are reclaimed on address reuse.
+// --------------------------------------------------------------------------
+#if MOD_MESH_SUPPORT
+
+bool modBindRawPCMesh(nglMeshFile *MeshFile, const char *ext)
+{
+    Mod *mod = getMod(MeshFile->FileName.m_hash, TLRESOURCE_TYPE_MESH_FILE);
+    if (mod == nullptr) {
+        return false;
+    }
+
+    constexpr uint32_t version = 0x601;
+
+    // Validate the master copy before touching FileBuf so a malformed drop-in
+    // falls back to the vanilla buffer instead of failing the whole load.
+    // field_10 must be 0: a from-disk file holds offsets, not live pointers.
+    auto *Header = bit_cast<const nglMeshFileHeader *>(mod->Data.data());
+    if (mod->Data.size() < sizeof(nglMeshFileHeader) ||
+        strncmp(Header->Tag, "PCM ", 4u) != 0 ||
+        Header->Version != version ||
+        Header->NDirectoryEntries == 0 ||
+        Header->field_10 != 0)
+    {
+        sp_log("[mod] \"%s%s\": rejecting replacement \"%s\" (not a from-disk PCM %x mesh file), keeping the original.",
+               MeshFile->FileName.to_string(),
+               ext,
+               mod->Path.filename().string().c_str(),
+               version);
+        return false;
+    }
+
+    struct raw_copy {
+        const Mod *source;
+        std::vector<char> bytes;
+    };
+
+    static std::unordered_map<nglMeshFile *, raw_copy> s_copies;
+
+    auto &copy = s_copies[MeshFile];
+
+    const bool parsed = !copy.bytes.empty() &&
+        bit_cast<const nglMeshFileHeader *>(copy.bytes.data())->field_10 != 0;
+
+    if (copy.bytes.empty() || parsed || copy.source != mod) {
+        copy.source = mod;
+        copy.bytes.assign(mod->Data.begin(), mod->Data.end());
+    }
+
+    MeshFile->FileBuf.Buf = copy.bytes.data();
+    MeshFile->FileBuf.Size = uint32_t(copy.bytes.size());
+
+    sp_log("[mod] meshfile \"%s%s\" <- \"%s\" (%u bytes, %u directory entries)",
+           MeshFile->FileName.to_string(),
+           ext,
+           mod->Path.filename().string().c_str(),
+           uint32_t(copy.bytes.size()),
+           Header->NDirectoryEntries);
+
+    return true;
+}
+
+#endif
 
 
 bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFile, const char *ext)
@@ -2771,17 +2720,17 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
     if constexpr (1)
     {
 #       if MOD_MESH_SUPPORT
-            Mod* replacementMesh = getMod(MeshFile->FileName.m_hash, TLRESOURCE_TYPE_MESH_FILE);
-
-            // @todo platform
-            if (replacementMesh)
-            {
-                MeshFile->FileBuf.Buf = (char*)replacementMesh->Data.data();
-                MeshFile->FileBuf.Size = replacementMesh->Data.size();
-            }
-            else
+            // Two separate replacement routes:
+            //   raw    - "VENOM.PCMESH" drop-in in native format: rebind FileBuf
+            //            here and let the parser below consume it untouched;
+            //   import - "VENOM.FBX"/.OBJ: parsed by the native importer
+            //            (mod_mesh_import.h) and applied per section further
+            //            down, the original buffer stays bound.
+            // Raw wins when both exist for one name; replacementMesh must stay
+            // null for raw mods so the import path is never fed PCM bytes.
+            Mod* replacementMesh = nullptr;
+            if (!modBindRawPCMesh(MeshFile, ext))
                 replacementMesh = getMod(MeshFile->FileName.m_hash, TLRESOURCE_TYPE_MESH);
-
 #       endif
 
         nglMeshFileHeader *Header = CAST(Header, MeshFile->FileBuf.Buf);
@@ -2945,17 +2894,16 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
                     nglRebaseMesh(Base, 0, Mesh);
                 }
 
-                // @todo: custom submeshes
-
-                modGenericMesh modMesh;
-                auto numCustomSubmeshes = 0;
-                if (replacementMesh) {
-                    modMesh.mod = replacementMesh;
-                    numCustomSubmeshes = modImportMesh(g_Direct3DDevice(), modMesh, (char*)replacementMesh->Data.data(), replacementMesh->Data.size(), "", 0);
-
-                    if (Mesh->NSections != numCustomSubmeshes)
-                        printf("there are %d sections in the original mesh, but we have %d.\n", Mesh->NSections, numCustomSubmeshes);
-                }
+#               if MOD_MESH_SUPPORT
+#                   if MOD_MESH_DBG_REPLACE_ALL
+                        if (!replacementMesh && dbgReplaceMesh)
+                            replacementMesh = dbgReplaceMesh;
+#                   endif
+                    // one importer pass per nglMesh; sections apply below
+                    std::vector<std::optional<modmesh::BuiltSection>> builtSections;
+                    if (replacementMesh)
+                        builtSections = modBuildSectionsForMesh(replacementMesh, Mesh);
+#               endif
 
 
                 for (auto idx_Section = 0u; idx_Section < Mesh->NSections; ++idx_Section)
@@ -2979,8 +2927,31 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
                         MeshSection->Material->m_shader = &gEmptyShader();
                     }
 
+#                   if MOD_MESH_SUPPORT
+                        // Apply the imported replacement (if any) BEFORE the
+                        // vanilla index-buffer creation. Replaced sections
+                        // then flow through the FULL vanilla tail: the
+                        // VertexDef bank init (the actor pipeline clones
+                        // character work meshes from the section VertexDef,
+                        // and the retail teardown destroys it - both need a
+                        // real initialized def) and BindSection. Only the
+                        // vanilla index-buffer creation and the float->int
+                        // packing lambda are bypassed, because the applier's
+                        // buffers and float-blend-index layout are final.
+                        const bool sectionReplaced =
+                            idx_Section < builtSections.size()
+                            && builtSections[idx_Section]
+                            && modApplyBuiltSection(MeshSection, *builtSections[idx_Section]);
+#                   endif
+
                     auto *v27 = MeshSection->m_indices;
-                    if (v27 != nullptr) {
+                    if (v27 != nullptr
+#                       if MOD_MESH_SUPPORT
+                            // a replaced section already owns its (possibly
+                            // 32-bit) index buffer
+                            && !sectionReplaced
+#                       endif
+                        ) {
                         bit_cast<nglVertexBuffer *>(&MeshSection->m_indexBuffer)
                             ->createIndexBufferAndWriteData(v27, 2 * MeshSection->NIndices);
                     }
@@ -2992,29 +2963,12 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
                     tlFixedString v112 = v28->m_shader->GetName();
                     auto* v29 = v112.to_string();
 
-#                   if MOD_MESH_DBG_REPLACE_ALL
-                        if (!replacementMesh && dbgReplaceMesh)
-                            replacementMesh = dbgReplaceMesh;
-#                   endif
 #                   if MOD_MESH_SUPPORT
-                        if (replacementMesh && numCustomSubmeshes) 
-                        {
-                            if (modImportMesh(g_Direct3DDevice(), modMesh, (char*)replacementMesh->Data.data(), replacementMesh->Data.size(), v29, idx_Section, MeshSection)) {
-                                nglVertexBuffer* vb = &MeshSection->field_3C;
-                                vb->createVertexBufferAndWriteData(modMesh.vertices.data(), modMesh.vertices.size() * sizeof(float), 1028);
-                                bit_cast<nglVertexBuffer*>(&MeshSection->m_indexBuffer)
-                                    ->createIndexBufferAndWriteData(modMesh.indices.data(), modMesh.indices.size() * sizeof(uint16_t));
-
-                                MeshSection->NVertices = modMesh.numVertices;
-                                MeshSection->NIndices = modMesh.numIndices;
-                                MeshSection->m_stride = modMesh.stride;
-                                MeshSection->m_primitiveType = D3DPT_TRIANGLELIST;
-                               // Mesh->NSections = idx_Section; // @todo: custom submeshes
-                                continue; // skip
-                            }
-                        }
+                    if (!sectionReplaced)   // the packing lambda would
+                                            // truncate the float blend
+                                            // indices and rebuild the
+                                            // final buffer over them
 #                   endif
-
                     [&v29](auto *MeshSection) -> void {
                         auto func = [](auto *MeshSection)
                         {
@@ -3757,6 +3711,44 @@ void nglCopySection(nglMesh *DstMesh, int a2, nglMesh *SrcMesh, int a4)
     {
         auto *SrcSection = SrcMesh->Sections[a4].Section;
         auto *DstSection = DstMesh->Sections[a2].Section;
+
+#if MOD_MESH_SUPPORT
+        // Importer-replaced sections can differ in vertex/index count from
+        // what the destination (an actor's buffered work-mesh clone) was
+        // created with, and the fixed-size memcpy below would shred them.
+        // Mirror the stored replacement onto the destination instead; the
+        // mirror is idempotent per source revision, so the per-frame
+        // actor::swap_all_mesh_buffers copy costs a map lookup after the
+        // first application.
+        if (auto src = modSectionRegistry.find(SrcSection);
+            src != modSectionRegistry.end())
+        {
+            ModSectionStorage &dst = modSectionRegistry[DstSection];
+            if (dst.mirroredRevision != src->second.revision) {
+                ModSectionStorage next;                 // self-contained copy
+                next.vertices    = src->second.vertices;
+                next.idx16       = src->second.idx16;
+                next.idx32       = src->second.idx32;
+                next.nverts      = src->second.nverts;
+                next.nidx        = src->second.nidx;
+                next.paddedVerts = src->second.paddedVerts;
+                next.weightClass = src->second.weightClass;
+                next.wide        = src->second.wide;
+                // fresh engine-ownable palette: the clone teardown
+                // tlMemFree's it, so it must never be shared with the source
+                next.setPalette(src->second.palette, src->second.nbones);
+                next.mirroredRevision = src->second.revision;
+                dst = std::move(next);
+                if (!modApplyStorageToSection(DstSection, dst)) {
+                    modSectionRegistry.erase(DstSection);
+                    return;             // leave the clone as-is this frame
+                }
+                sp_log("[modmesh] mirrored replaced section onto work mesh "
+                       "(%u verts, %u idx)\n", dst.nverts, dst.nidx);
+            }
+            return;
+        }
+#endif
 
         assert(SrcSection->field_3C.Size == DstSection->field_3C.Size
                 && "Section VB sizes do not match !");

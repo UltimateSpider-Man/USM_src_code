@@ -143,9 +143,10 @@ void resource_pack_streamer::load_internal(const char *a2,
         this->curr_loc = pack_location;
         this->field_78 = nullptr;
 
+        int standalone_data_size = 0;
         auto v12 = (resource_manager::using_amalgapak()
                 ? resource_manager::amalgapak_id
-                : resource_manager::open_pack(a2));
+                : resource_manager::open_pack_ex(a2, &standalone_data_size));
 
         this->curr_file_id = v12;
 
@@ -183,7 +184,21 @@ void resource_pack_streamer::load_internal(const char *a2,
         params.field_18 = this->curr_slot->get_header_mem_addr();
 
         assert(pack_location.field_28 == 0);
-        params.dataSize = pack_location.loc.m_size - pack_location.field_28;
+
+        // openusm: for standalone packs the amalga index always stores
+        // offset 0, so the read is positioned at the start of the file and
+        // the read length should be the file's own size. Using the actual
+        // on-disk length (rounded up to the 2048-byte sector) keeps the
+        // read correct when a pack is served from a different platform
+        // folder than the active amalga index -- e.g. an .XBPACK-indexed
+        // run that falls back to a differently sized .PCPACK. Falls back to
+        // the index size when streaming from the amalga itself or when the
+        // file size could not be determined.
+        int data_size = pack_location.loc.m_size - pack_location.field_28;
+        if (!resource_manager::using_amalgapak() && standalone_data_size > 0) {
+            data_size = (standalone_data_size + 2047) & ~2047;
+        }
+        params.dataSize = data_size;
 
         assert((params.dataSize % 2048) == 0);
 

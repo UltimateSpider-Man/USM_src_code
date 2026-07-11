@@ -103,7 +103,7 @@ void pause_menu_root::_Load()
         this->field_74 = v2->GetPQ("pm_splash_back_venom");
 		
 		
-		this->field_78[7] = v2->GetTextPointer("pm_splash_text_08");
+        // Slot widgets bound top-to-bottom: field_78[i] -> pm_splash_text_(i+1).
         this->field_78[0] = v2->GetTextPointer("pm_splash_text_01");
         this->field_78[1] = v2->GetTextPointer("pm_splash_text_02");
         this->field_78[2] = v2->GetTextPointer("pm_splash_text_03");
@@ -111,7 +111,8 @@ void pause_menu_root::_Load()
         this->field_78[4] = v2->GetTextPointer("pm_splash_text_05");
         this->field_78[5] = v2->GetTextPointer("pm_splash_text_06");
         this->field_78[6] = v2->GetTextPointer("pm_splash_text_07");
-		this->field_78[8] = v2->GetTextPointer("pm_splash_text_09");
+        this->field_78[7] = v2->GetTextPointer("pm_splash_text_08");
+        this->field_78[8] = v2->GetTextPointer("pm_splash_text_09");
        
 
         this->field_9C = v2->GetTextPointer("pm_splash_text_GAMEPAUSED");
@@ -152,15 +153,17 @@ void pause_menu_root::_Load()
         this->field_A8->SetText(static_cast<global_text_enum>(255));
         this->field_A8->SetNoFlash(color32 {0xFFC87238});
 
-		this->field_78[8]->SetText(static_cast<global_text_enum>(263));
-        this->field_78[7]->SetText(static_cast<global_text_enum>(265));
-        this->field_78[0]->SetText(static_cast<global_text_enum>(275));
-        this->field_78[1]->SetText(static_cast<global_text_enum>(91));
-        this->field_78[2]->SetText(static_cast<global_text_enum>(92));
-        this->field_78[3]->SetText(static_cast<global_text_enum>(260));
-        this->field_78[4]->SetText(static_cast<global_text_enum>(258));
-        this->field_78[5]->SetText(static_cast<global_text_enum>(259));
-        this->field_78[6]->SetText(static_cast<global_text_enum>(273));
+		// Labels in menu order (must match OnCross field_B0 dispatch).
+        this->field_78[0]->SetText(static_cast<global_text_enum>(506));  // 1 EXIT MISSION
+        this->field_78[1]->SetText(static_cast<global_text_enum>(275));  // 2 CITY GOALS
+        this->field_78[2]->SetText(static_cast<global_text_enum>(91));   // 3 AWARDS
+        this->field_78[3]->SetText(static_cast<global_text_enum>(92));   // 4 GAME STATS
+        this->field_78[4]->SetText(static_cast<global_text_enum>(260));  // 5 SAVE GAME
+        this->field_78[5]->SetText(static_cast<global_text_enum>(258));  // 6 LOAD GAME
+        this->field_78[6]->SetText(static_cast<global_text_enum>(259));  // 7 OPTIONS
+        this->field_78[7]->SetText(static_cast<global_text_enum>(265));  // 8 MESSAGE LOG
+        this->field_78[8]->SetText(static_cast<global_text_enum>(263));  // 9 UNLOCKABLES
+
 
         auto v8 = this->field_78[0]->GetX();
         auto v9 = this->field_78[0]->GetY();
@@ -183,6 +186,190 @@ void pause_menu_root::_Load()
     }
 }
 
+
+void pause_menu_root::Draw()
+{
+    if constexpr (1)
+    {
+        auto *mm = mission_manager::s_inst;
+
+        // True while a sub-widget (confirmation prompt, etc.) owns the screen.
+        const bool dialog_active =
+            reinterpret_cast<char *>(get_current_widget())[0x2D] != 0;
+
+        // Grow whichever of the OKAY/NOWAY dialog buttons is highlighted.
+        if (!dialog_active && this->field_F8)
+        {
+            if (this->field_F9)
+            {
+                this->field_A8->SetScale(1.2f, 1.2f);
+                this->field_A4->SetScale(1.0f, 1.0f);
+            }
+            else
+            {
+                this->field_A8->SetScale(1.0f, 1.0f);
+                this->field_A4->SetScale(1.2f, 1.2f);
+            }
+        }
+
+        // Selected entry grows; the two hilite boxes snap around it.
+        FEText *selected = this->field_78[this->field_B0];
+        selected->SetScale(1.2f, 1.2f);
+        const float ox = selected->GetX();
+        const float oy = selected->GetY();
+
+        float xs[4];
+        float ys[4];
+        for (auto i = 0; i < 4; ++i)
+        {
+            xs[i] = ox + this->field_B8[i];
+            ys[i] = oy + this->field_C8[i];
+        }
+        this->field_60->SetPos(xs, ys);
+        for (auto i = 0; i < 4; ++i)
+        {
+            xs[i] = ox + this->field_D8[i];
+            ys[i] = oy + this->field_E8[i];
+        }
+        this->field_64->SetPos(xs, ys);
+
+        // EXIT entry (slot 0): "EXIT MISSION" in a mission, "EXIT GAME" otherwise.
+        if (mm->is_mission_active() && !mm->is_quittable_story_mission() && mm->sub_5C58D0())
+        {
+            this->field_78[0]->SetText(static_cast<global_text_enum>(265));
+        }
+        else
+        {
+            this->field_78[0]->SetText(static_cast<global_text_enum>(266));
+        }
+
+        // Per-entry colour: disabled (grey) / selected (gold) / normal (orange).
+        auto colorize = [](FEText *w, bool is_selected, bool is_disabled)
+        {
+            if (is_disabled)
+            {
+                w->SetNoFlash(color32 {0xFF808080});
+                w->SetScale(1.0f, 1.0f);
+            }
+            else if (is_selected)
+            {
+                w->SetNoFlash(color32 {0xFFE6D03F});
+                w->SetScale(1.2f, 1.2f);
+            }
+            else
+            {
+                w->SetNoFlash(color32 {0xFFC87238});
+                w->SetScale(1.0f, 1.0f);
+            }
+        };
+
+        const bool resume_disabled = mm->sub_5C5920();
+        const bool quit_disabled = resume_disabled && !mm->sub_5C58D0();
+
+        colorize(this->field_78[0], this->field_B0 == 0, resume_disabled);
+        colorize(this->field_78[5], this->field_B0 == 5, quit_disabled);
+        colorize(this->field_78[1], this->field_B0 == 1, quit_disabled);
+
+        // Japanese needs a squashed scale on the restart entry.
+        if (globalTextLanguage() == 2)
+        {
+            if (this->field_B0 == 7)
+            {
+                this->field_78[7]->SetScale(1.1f, 1.2f);
+            }
+            else
+            {
+                this->field_78[7]->SetScale(0.9f, 1.0f);
+            }
+        }
+
+        // Static backgrounds.
+        for (auto i = 0; i < 9; ++i)
+        {
+            this->field_3C[i]->Draw();
+        }
+
+        // Normal vs venom back-plate.
+        bool use_venom;
+        if (this->field_30)
+        {
+            use_venom = (this->field_34 == 1);
+        }
+        else
+        {
+            use_venom = *reinterpret_cast<int *>(
+                            *reinterpret_cast<int *>(
+                                *reinterpret_cast<int *>(reinterpret_cast<char *>(g_world_ptr) + 0x230) + 0x8C)
+                            + 0x420)
+                        == 2;
+        }
+        if (use_venom)
+        {
+            this->field_74->Draw();
+        }
+        else
+        {
+            this->field_70->Draw();
+        }
+
+        // Menu entries (entry 8 is hidden mid story-mission).
+        const bool is_story_active = mm->is_story_active();
+        for (auto i = 0; i < 9; ++i)
+        {
+            if (i != 8 || !is_story_active)
+            {
+                this->field_78[i]->Draw();
+            }
+        }
+
+        if (this->field_B0 != 9)
+        {
+            this->field_60->Draw();
+            this->field_64->Draw();
+        }
+
+        this->field_9C->Draw();
+
+        // Confirmation dialog overlay.
+        if (this->field_F8 || dialog_active)
+        {
+            this->field_68->Draw();
+            this->field_6C->Draw();
+            this->field_A0->Draw();
+            if (!this->field_2D)
+            {
+                this->field_A4->Draw();
+                this->field_A8->Draw();
+            }
+        }
+
+        // Navigation bar (menu_nav_bar::Draw, inlined).
+        auto *nav = *reinterpret_cast<menu_nav_bar **>(
+            reinterpret_cast<char *>(this->field_AC) + 0x30);
+        if (nav->field_28)
+        {
+            nav->text_box->SetScale(0.8f, 1.0f);
+        }
+        nav->text_box->Draw();
+        nav->background_a->Draw();
+        if (nav->field_1C)
+        {
+            nav->field_1C->Draw();
+        }
+        if (nav->field_20)
+        {
+            reinterpret_cast<PanelQuad *>(nav->field_20)->Draw();
+        }
+        if (nav->field_24)
+        {
+            reinterpret_cast<PanelQuad *>(nav->field_24)->Draw();
+        }
+    }
+    else
+    {
+        THISCALL(0x0061BF80, this);
+    }
+}
 
 
 void pause_menu_root2::Draw()
@@ -690,43 +877,66 @@ void ExitHACKROMAndBootToUSMPC()
     ExitProcess(0);
 }
 
+void pause_menu_root::test(int a2)
+{
+    if (!this->field_F9)
+    {
+        // "Yes" selected
+        int selection = this->field_B0;
+ 
+
+        if (selection == 0)
+        {
+
+			THISCALL(0x00630460, this ,a2);
+
+
+ 
+    }    }    }
+
+
 void pause_menu_root::OnCross(int a2)
 {
     const int type = this->field_B0;
  
     switch (type) {
-        case 0:  // EXIT MISSION
-            this->transition_to_submenu(3);
-            return;
+        case 0: 
+		    static string_hash s_toggle{"progression_mission_aborted()"};
+            script::sub_5028B0(s_toggle, script::gsoi());
+            script::exec_thread(0);
+		   // pause_menu_system_ptr->Deactivate();
+            THISCALL(0x00630460, this ,a2);
+             return;
+
  
         case 1:  // CITY GOALS
 
-            this->transition_to_submenu(1);
+            this->transition_to_submenu(3);
             return;
  
         case 2:  // AWARDS  
-            this->transition_to_submenu(2);
+            this->transition_to_submenu(1);
             return;
  
         case 3:  // GAME STATS  
-            this->transition_to_submenu(4);
+            this->transition_to_submenu(2);
             return;
  
         case 4:  // SAVE GAME
-            this->transition_to_submenu(5);
+            this->transition_to_submenu(4);
             return;
  
         case 5:  // LOAD GAME
-            this->transition_to_submenu(6);
+            this->transition_to_submenu(5);
             return;
  
         case 6:  // OPTIONS
-            this->transition_to_submenu(7);
+            this->transition_to_submenu(6);
             return;
  
         case 7:  // MESSAGE LOG  -- engine fallback
 
-            THISCALL(0x00630460, this, a2);
+			this->transition_to_submenu(7);
             return;
  
         case 8:  // UNLOCKABLES
@@ -787,12 +997,16 @@ void pause_menu_root::handle_restart_mission(Float a2) {
     [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0f, 1.0f);
 }
 
+
+
 void pause_menu_root::handle_skip_cutscene(Float a2) {
     bool can_skip = mission_manager::s_inst->is_mission_active() &&
                     !mission_manager::s_inst->is_story_mission_active() &&
                     mission_manager::s_inst->is_story_active();
     
     if (can_skip) {
+        // In-mission EXIT MISSION path: mark the mission script for unload.
+
         setup_confirmation_dialog();
         
         this->field_F8 = 1;
@@ -807,6 +1021,8 @@ void pause_menu_root::handle_skip_cutscene(Float a2) {
     }
 
     if (can_skip) {
+		
+	
 
 		this->field_A0->SetText(static_cast<global_text_enum>(267));
         
@@ -824,28 +1040,40 @@ void pause_menu_root::handle_skip_cutscene(Float a2) {
 }
 
 void pause_menu_root::handle_switch_hero(Float a2) {
-    if (mission_manager::s_inst->is_story_active()) {
-        return;
-    }
 
-    setup_confirmation_dialog();
-    
-    this->field_F8 = 1;
-    sub_61C610();
-    this->field_F9 = 1;
-    
-    this->field_A8->SetNoFlash(color32{0xFFE6871F});
-    this->field_A8->SetScale(1.157f, 1.157f);
-    
-    this->field_A4->SetNoFlash(color32{0xFFC87238});
-    this->field_A4->SetScale(1.0f, 1.0f);
-    
+            if (!mission_manager::s_inst->is_story_active())
+            {
+                // re-enable every list entry and rewind the cursor
+                auto *list = reinterpret_cast<menu_widget *>(get_current_widget());
+                for (unsigned i = 0; i < list->count; ++i)
+                    /* list_entry(list, i)->TurnOn(true);  // vt+0x20 */;
+                list->field_32 = list->field_20;
+                list->field_24 = 0;
+                list->field_28 = 0;
+                list->field_40 = 0;
+                list->field_44 = false;
+                list->field_45 = true;
+                list->field_36 = 0;
 
-	this->field_A0->SetText(static_cast<global_text_enum>(271));
-    
-    static string_hash sfx_id_hash{"FE_PS_ACCEPT"};
-    [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0f, 1.0f);
-}
+                const bool is_spidey = g_world_ptr->get_hero_ptr(0) != nullptr;
+                this->field_A0->SetText(static_cast<global_text_enum>(is_spidey ? 271 : 272));
+                this->field_F8 = true;
+                this->sub_61C610();
+                this->field_F9 = true;                 // dialog is now active
+
+                // highlight YES (OKAY), dim NO (NOWAY)
+                this->field_A8->SetNoFlash(color32{0xFFE6D03F});
+                this->field_A8->SetScale(1.2f, 1.2f);
+                this->field_A4->SetNoFlash(color32{0xFFC87238});
+                this->field_A4->SetScale(1.0f, 1.0f);
+
+                // prompt depends on who you're playing
+
+                static string_hash s_fe_ps_accept{"FE_PS_ACCEPT"};
+                [[maybe_unused]] sound_instance_id id = sub_60B960(s_fe_ps_accept, 1.0f, 1.0f);
+            }
+			      }
+
 
 void pause_menu_root::handle_confirmation_state(Float a2, int a3) {
     int menu_index = this->field_B0;
@@ -864,57 +1092,40 @@ void pause_menu_root::handle_confirmation_state(Float a2, int a3) {
 }
 
 void pause_menu_root::handle_skip_confirmation() {
-    bool can_skip = mission_manager::s_inst->is_mission_active() &&
-                    !mission_manager::s_inst->is_story_active() &&
-                    mission_manager::s_inst->is_story_mission_active();
-    
-    if (can_skip) {
-	            string_hash s_progression_mission_aborted;
-            s_progression_mission_aborted.initialize(0, "progression_mission_aborted()", 0);
-		
-					    auto* v1 = script::gsoi()->parent;
-			int function = script::find_function(s_progression_mission_aborted, v1, 0);
-			script::new_thread(function, reinterpret_cast<script_instance*>(script::gsoi()));
-    
+            if (mission_manager::s_inst->is_mission_active() && !mission_manager::s_inst->is_story_active() && mission_manager::s_inst->is_story_mission_active())
+            {
 
-            script::sub_5028B0(s_progression_mission_aborted, script::gsoi());
+	
+            this->field_34 = (g_world_ptr->get_hero_ptr(0) != nullptr);
+
+            static string_hash s_toggle{"progression_mission_aborted()"};
+            script::sub_5028B0(s_toggle, script::gsoi());
             script::exec_thread(0);
-        
-        set_menu_state(21);
-        this->field_AC->MakeActive(1);
-        
-        if (!this->field_AC->field_10) {
-            comic_panels::game_play_panel()->field_67 = 0;
+
+            this->set_menu_state(21);
+            this->field_AC->MakeActive(1);
+            if (!this->field_AC->field_10)
+                comic_panels::game_play_panel()->field_67 = 0;
+            }
         }
-    } else {
-	    this->field_A0->SetText(static_cast<global_text_enum>(269));
-        
-        byte_965BF8() = 1;
-        byte_922994() = 1;
-        dword_922908() = 1;
-    }
-}
+
 
 void pause_menu_root::handle_hero_toggle() {
-    bool is_spidey = g_world_ptr->get_hero_ptr(0);
-    this->field_34 = is_spidey;
-    
-	            string_hash s_toggle_hero;
-            s_toggle_hero.initialize(0, "switch_to_venom()", 0);
-			    auto* v1 = script::gsoi()->parent;
-			int function = script::find_function(s_toggle_hero, v1, 0);
-			script::new_thread(function, reinterpret_cast<script_instance*>(script::gsoi()));
-    
+	
+	
+	handle_switch_hero(1);
+	
+            this->field_34 = (g_world_ptr->get_hero_ptr(0) != nullptr);
 
-            script::sub_5028B0(s_toggle_hero, script::gsoi());
+            static string_hash s_toggle{"toggle_hero()"};
+            script::sub_5028B0(s_toggle, script::gsoi());
             script::exec_thread(0);
+
+            this->set_menu_state(21);
+            this->field_AC->MakeActive(1);
+            if (!this->field_AC->field_10)
+                comic_panels::game_play_panel()->field_67 = 0;
     
-    set_menu_state(21);
-    this->field_AC->MakeActive(1);
-    
-    if (!this->field_AC->field_10) {
-        comic_panels::game_play_panel()->field_67 = 0;
-    }
 	//Sleep(500);
 	pause_menu_system_ptr->Deactivate();
 	
@@ -954,7 +1165,43 @@ int *pause_menu_root::get_current_widget() {
     );
 }
 
+void pause_menu_root::handle_exit_mission_confirmation(int a2) {
+   
+            if (!mission_manager::s_inst->is_story_active())
+            {
+                // re-enable every list entry and rewind the cursor
+				handle_skip_cutscene(a2);
+				mission_manager::s_inst->prepare_unload_script();
+				pause_menu_system_ptr->Deactivate();
+                auto *list = reinterpret_cast<menu_widget *>(get_current_widget());
+                for (unsigned i = 0; i < list->count; ++i)
+                    /* list_entry(list, i)->TurnOn(true);  // vt+0x20 */;
+                list->field_32 = list->field_20;
+                list->field_24 = 0;
+                list->field_28 = 0;
+                list->field_40 = 0;
+                list->field_44 = false;
+                list->field_45 = false;
+                list->field_36 = 0;
 
+                this->field_A0->SetText(static_cast<global_text_enum>(270));
+                this->field_F8 = 1;
+                this->sub_61C610();
+                this->field_F9 = 0;                 // dialog is now active
+
+                // highlight YES (OKAY), dim NO (NOWAY)
+                this->field_A8->SetNoFlash(color32{0xFFE6D03F});
+                this->field_A8->SetScale(1.2f, 1.2f);
+                this->field_A4->SetNoFlash(color32{0xFFC87238});
+                this->field_A4->SetScale(1.0f, 1.0f);
+
+                // prompt depends on who you're playing
+
+                static string_hash s_fe_ps_accept{"FE_PS_ACCEPT"};
+                [[maybe_unused]] sound_instance_id id = sub_60B960(s_fe_ps_accept, 1.0f, 1.0f);
+           
+			        }     
+}
 
 
 void pause_menu_root::handle_objectives(float* a2) {
@@ -996,13 +1243,14 @@ void pause_menu_root_patch() {
         set_vfunc(0x00893F84, address);
     }
 
+    {
+        FUNC_ADDRESS(address, &pause_menu_root::Draw);
+       // set_vfunc(0x00893F50, address);
+    }
+
 
     return;
 
-	    {
-        FUNC_ADDRESS(address, &pause_menu_root2::Draw);
-        set_vfunc(0x00893F50, address);
-    }
 	    {
         FUNC_ADDRESS(address, &pause_menu_root::Update);
         set_vfunc(0x00893F58, address);

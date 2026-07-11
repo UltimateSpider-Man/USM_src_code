@@ -54,6 +54,11 @@ struct FrontEndMenuSystem : FEMenuSystem {
 
     //0x00635BC0
     void GoNextState();
+	
+	    void GoNextState_build();
+		
+		
+			    void GoNextState_beta();
 
     //0x0060C1E0
     /* virtual */ void MakeActive(int a2);
@@ -70,5 +75,10 @@ struct FrontEndMenuSystem : FEMenuSystem {
 
 extern bool & already_drew_this_frame;
 
+
+extern void FrontEndMenuSystem_beta_patch();
+
+
+extern void FrontEndMenuSystem_build_patch();
 
 extern void FrontEndMenuSystem_patch();

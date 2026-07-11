@@ -176,14 +176,29 @@ void dump_info(debug_menu_entry *)
     }
 }
 
+// BETA: script_memtrack::create_debug_menu
+// The beta build carves the menu out of debug_menu::pool and the entry out of
+// debug_menu_entry::pool (the two chunk-grow loops in the decompilation are
+// just the pool refill path). We mirror that with an alloc_block prime, the
+// same pattern used by the other beta menus in main_beta.cpp.
 void create_debug_menu(debug_menu *arg0)
 {
+    // debug_menu::pool allocation -> debug_menu::debug_menu(v4, "Script Memtrack", 0)
     script_memtrack_debug_menu = create_menu("Script Memtrack", debug_menu::sort_mode_t::undefined);
+
+    debug_menu_entry v1;
+    debug_menu_entry *block = v1.alloc_block(script_memtrack_debug_menu, 4);
+    block[0] = debug_menu_entry { script_memtrack_debug_menu };
+
+    // debug_menu::add_entry(this, script_memtrack_debug_menu)
     arg0->add_entry(script_memtrack_debug_menu);
-    
-    auto *v7 = create_menu_entry(mString {"Dump Memtrack Info"});
-    v7->set_game_flags_handler(dump_info);
-    script_memtrack_debug_menu->add_entry(v7);
+
+    // debug_menu_entry::pool allocation -> debug_menu_entry(mString{0x7CB588 "Dump Memtrack Info"})
+    auto *entry = create_menu_entry(mString {"Dump Memtrack Info"});
+
+    // *(entry + 4) = 0x4114F4 -> game flags handler = script_memtrack::dump_info
+    entry->set_game_flags_handler(dump_info);
+    script_memtrack_debug_menu->add_entry(entry);
 }
 
 } // namespace script_memtrack

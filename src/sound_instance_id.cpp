@@ -15,6 +15,16 @@ void sound_instance::stop() {
 }
 
 sound_instance_id sub_60B960(string_hash a2, Float a3, Float a4) {
+    // WAV mod override (mod.h): a mods/*.wav whose stem hashes to this sound
+    // id replaces the engine 2D sound. This wrapper is only reached from
+    // openusm call sites (ltd_edition, fe_mini_map_widget, ...) while the
+    // global SET_JUMP below stays disabled; those callers all discard the
+    // returned id, so handing back the invalid marker is safe.
+    if (auto *snd = getWavMod(a2.get_hash())) {
+        modWavPlay(*snd, a3);
+        return sound_instance_id {0xFFFFFFFFu};
+    }
+
     sound_instance_id result;
     CDECL_CALL(0x0060B960, &result, a2, a3, a4);
 

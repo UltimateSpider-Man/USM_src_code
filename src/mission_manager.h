@@ -102,7 +102,17 @@ struct mission_manager {
  
 	bool  sub_5C5920();
 
-    void sub_5BACA0(Float a2);
+    //0x005BACA0  (beta PS2 ref: mission_manager::blackscreen_on)
+    void blackscreen_on(Float a2);
+
+    //0x005BAD80  (beta PS2 ref: mission_manager::blackscreen_off)
+    void blackscreen_off(Float a2);
+
+    //0x005BABB0  freeze the hero while the screen is black
+    void sub_5BABB0();
+
+    //0x005BAC00  release the hero freeze when the screen clears
+    void sub_5BAC00();
 
     void sub_5BB220(Float a2);
 
@@ -178,3 +188,5 @@ struct mission_manager {
 };
 
 extern void mission_manager_patch();
+
+extern void mission_manager_patch2();

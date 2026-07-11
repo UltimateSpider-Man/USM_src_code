@@ -7,6 +7,7 @@
 #include "trace.h"
 #include "utility.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 
