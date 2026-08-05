@@ -15,6 +15,7 @@
 #include "utility.h"
 
 #include <cassert>
+#include <cctype>
 
 VALIDATE_SIZE(script_object, 0x34);
 VALIDATE_SIZE(script_object::function, 0x10);
@@ -1164,6 +1165,300 @@ bool script_instance::has_threads() const
     TRACE("script_instance::has_threads");
 
     return (this->threads.size() != 0);
+}
+
+// ---------------------------------------------------------------------------
+// .PCSX mod overrides (see script_object.h for the contract)
+//
+// A .pcsx image is the same generic-mash blob a retail pack serves for
+// RESOURCE_KEY_TYPE_SCRIPT: 16-byte generic_mash_header, then the
+// script_executable object image, then the mashed data with the exec code
+// image embedded inside — the blob is fully self-contained (permanent
+// strings, script objects, vm_executables and bytecode all travel in it).
+// The override rides resource_manager::get_resource, the one funnel
+// script_manager::load fetches script blobs through, swapping the byte
+// pointer + size before parse_generic_object_mash consumes them.
+//
+// Retail re-streams a script's pack bytes on every load_world, so a retail
+// script image is always pristine when it is parsed. The override has to
+// reproduce that, because un_mash/link rewrite the image IN PLACE and bake
+// absolute addresses into it: OP_ARG_LFR bakes script_library_class function
+// pointers, OP_ARG_CLV bakes find_instance() results and case 17 bakes the
+// game/shared var addresses (vm_executable::link_un_mash), while
+// SCRIPT_EXECUTABLE_FLAG_LINKED lands in the image's own flags word. All of
+// those pointees die with the level (slc_manager::kill, destroy_game_var),
+// and script_manager::link() skips any exec whose is_linked() is already
+// set -- so re-serving a once-linked image on the next level would run
+// bytecode full of freed pointers.
+//
+// Hence: one buffer per hash, re-stamped from the pristine master bytes on
+// every fetch that is not for an already-loaded exec. That makes each load a
+// full un_mash + link over virgin bytes, exactly like a pack re-stream, and
+// keeps IN_USE clear at parse time so parse_generic_mash_init never takes
+// its clone branch (which would break script_manager::load's
+// assert(!allocated_mem)). A fetch for a script that IS currently loaded --
+// script_manager::is_loadable probing it, or a second load under a different
+// context key -- must NOT disturb the bytes the live exec is using, so it
+// gets the buffer as-is; that mirrors retail serving the same pack bytes.
+// ---------------------------------------------------------------------------
+
+// True while script_manager holds a loaded exec for this script name, i.e.
+// while the served image is in use and must not be re-stamped.
+static bool modPCSXIsLoaded(uint32_t nameHash)
+{
+    auto *execs = script_manager::get_exec_list();
+    if (execs == nullptr)
+        return false;
+
+    for (auto &entry : (*execs))
+    {
+        if (entry.first.field_0.m_hash.source_hash_code == nameHash)
+            return true;
+    }
+
+    return false;
+}
+
+bool modPCSXImageUsable(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr ||
+        size < sizeof(generic_mash_header) + sizeof(script_executable))
+        return false;
+
+    const auto *header = bit_cast<const generic_mash_header *>(bytes);
+
+    // the header authenticates itself; IN_USE (0x80000000) and the vtable
+    // flag (0x40000000) sit outside the checksummed low 28 bits
+    if (header->safety_key != header->generate_safety_key())
+        return false;
+
+    // script images are plain object mashes: no vtable word, class_id
+    // 0xFFFF. mash_was_allocated/release_generic_mash (entity_mash.cpp)
+    // demand exactly this shape on every un_load, so anything else would
+    // blow up later even if it parsed now.
+    if (header->is_flagged(0x40000000) || header->class_id != 0xFFFF)
+        return false;
+
+    // shared mash data lives at header + field_8, inside the image
+    if (header->field_8 < (int)sizeof(generic_mash_header) ||
+        (size_t)header->field_8 > size)
+        return false;
+
+    // The script_executable object image starts right after the header. Its
+    // flags word must be virgin: an image dumped out of a running process
+    // carries UN_MASHED (and LINKED), which would send the very first load
+    // down script_executable::quick_un_mash over pointer fields still
+    // holding the donor process's absolute addresses -- and the per-function
+    // VM_EXECUTABLE_FLAG_UN_MASHED bits buried in the mash data would
+    // likewise defeat vm_executable::un_mash. Only packer output is
+    // supportable, so reject the rest here rather than crash later.
+    const auto *exec = bit_cast<const script_executable *>(
+            bytes + sizeof(generic_mash_header));
+    if ((exec->flags & (script_executable::SCRIPT_EXECUTABLE_FLAG_UN_MASHED
+                        | script_executable::SCRIPT_EXECUTABLE_FLAG_LINKED)) != 0)
+        return false;
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Chunk-format .PCSX (the form a file on disk actually has)
+//
+// chunk_file derives from text_file, so a compiler-emitted .pcsx is a TEXT
+// file whose first whitespace-delimited token is "scrobjs"
+// (CHUNK_SCRIPT_OBJECTS). It is not self-contained: script_executable::load
+// also needs the string tables and the executable code image beside it --
+// <name>.pcsst, <name>.pcpst and <name>.pcsxl -- and asserts on any that are
+// missing. So all four are required before a drop is accepted, and the
+// engine's own loader does the parsing (see script_manager::load, which
+// routes these keys down the old-fashioned path with Mod::Path's directory).
+// ---------------------------------------------------------------------------
+
+bool modPCSXIsChunkImage(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr)
+        return false;
+
+    // First non-whitespace token, bounded by chunk_flavor's buffer.
+    size_t i = 0;
+    while (i < size && std::isspace((unsigned char)bytes[i]))
+        ++i;
+
+    size_t n = 0;
+    char token[CHUNK_FLAVOR_SIZE] {};
+    while (i < size && n < sizeof(token) - 1 &&
+           !std::isspace((unsigned char)bytes[i]))
+        token[n++] = (char)bytes[i++];
+
+    return chunk_flavor {token} == CHUNK_SCRIPT_OBJECTS;
+}
+
+// Where a chunk-format .pcsx for this script lives: the directory (with
+// trailing separator) script_executable::load must use instead of "scripts\",
+// and the file's stem. The stem matters because load() would otherwise derive
+// the filename from string_hash::to_string(), which falls back to a synthetic
+// 12-char rendering for any hash the engine's string table does not know --
+// exactly the case for a brand-new script that exists only as a mod drop.
+bool modPCSXGetChunkDir(uint32_t nameHash, std::string *dirOut,
+                        std::string *stemOut)
+{
+    const Mod *mod = getMod(nameHash, MOD_TYPE_PCSX_CHUNK);
+    if (mod == nullptr)
+        return false;
+
+    if (dirOut != nullptr)
+    {
+        std::string dir = mod->Path.parent_path().string();
+        if (!dir.empty() && dir.back() != '\\' && dir.back() != '/')
+            dir += '\\';
+        *dirOut = dir;
+    }
+
+    if (stemOut != nullptr)
+        *stemOut = mod->Path.stem().string();
+
+    return true;
+}
+
+// Accept a chunk-format drop only with its whole set of siblings present.
+static bool modPCSXRegisterChunk(const std::filesystem::path &path,
+                                 const std::string &stem)
+{
+    static const char *kSiblings[] = { ".pcsst", ".pcpst", ".pcsxl" };
+
+    std::error_code ec;
+    for (const char *ext : kSiblings)
+    {
+        std::filesystem::path sibling = path;
+        sibling.replace_extension(ext);
+        if (!std::filesystem::is_regular_file(sibling, ec))
+        {
+            sp_log("[mod] pcsx \"%s\": chunk-format script is missing its "
+                   "\"%s\" companion - .pcsx, .pcsst, .pcpst and .pcsxl must "
+                   "all be dropped together, ignored",
+                   path.filename().string().c_str(), ext);
+            return false;
+        }
+    }
+
+    const uint32_t hash = to_hash(stem.c_str());
+
+    // Re-registration (enumerate_mods() reruns): replace, don't stack.
+    {
+        auto range = Mods.equal_range(hash);
+        for (auto it = range.first; it != range.second; )
+            it = (it->second.Type == MOD_TYPE_PCSX_CHUNK) ? Mods.erase(it)
+                                                          : std::next(it);
+    }
+
+    sp_log("[mod] registered chunk-format pcsx script \"%s\" -> \"%s\" "
+           "(key 0x%08X, dir \"%s\")",
+           path.filename().string().c_str(), stem.c_str(), hash,
+           path.parent_path().string().c_str());
+
+    // No Data: the engine reads all four files off disk itself. Keeping the
+    // vector empty is also what stops modPCSXGetOverride from ever handing
+    // these bytes to the mash parser.
+    Mods.emplace(hash, Mod{path, MOD_TYPE_PCSX_CHUNK, {}});
+
+    return true;
+}
+
+bool modPCSXRegister(const std::filesystem::path &path,
+                     std::vector<uint8_t> &&fileData)
+{
+    const std::string stem = transformToLower(path.stem().string());
+
+    // Two on-disk forms share the .pcsx extension: the compiler's text chunk
+    // format, and a mash image extracted from a pack. Tell them apart by
+    // content rather than trusting the name.
+    if (modPCSXIsChunkImage(fileData.data(), fileData.size()))
+        return modPCSXRegisterChunk(path, stem);
+
+    if (!modPCSXImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod] pcsx \"%s\": neither a \"scrobjs\" chunk script nor a "
+               "packer-produced virgin mash image, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+
+    // A dumped-from-memory image may carry a live IN_USE flag; the flag is
+    // outside the checksummed bits, so clearing it keeps the header valid.
+    auto *header = bit_cast<generic_mash_header *>(fileData.data());
+    header->field_4 &= ~_MASH_FLAG_IN_USE;
+
+    const uint32_t hash = to_hash(stem.c_str());
+
+    // Re-registration (enumerate_mods() reruns): replace, don't stack.
+    {
+        auto range = Mods.equal_range(hash);
+        for (auto it = range.first; it != range.second; )
+            it = (it->second.Type == MOD_TYPE_PCSX_FILE) ? Mods.erase(it) : std::next(it);
+    }
+
+    sp_log("[mod] registered pcsx override \"%s\" -> \"%s\" (%u bytes, key 0x%08X)",
+           path.filename().string().c_str(), stem.c_str(),
+           (unsigned)fileData.size(), hash);
+
+    Mods.emplace(hash, Mod{path, MOD_TYPE_PCSX_FILE, std::move(fileData)});
+
+    // Hash-named drops ("extra/0x1189AB87.pcsx") also bind under the literal
+    // value, mirroring the mesh/texture/wav/ent stem convention.
+    if (uint32_t literal = 0;
+        modParseLiteralHash(stem, &literal) && literal != hash)
+    {
+        const Mod *just = getMod(hash, MOD_TYPE_PCSX_FILE);
+        if (just != nullptr)
+        {
+            Mods.emplace(literal, Mod{just->Path, MOD_TYPE_PCSX_FILE, just->Data});
+            sp_log("[mod] pcsx \"%s\" also bound as literal hash 0x%08X",
+                   stem.c_str(), literal);
+        }
+    }
+
+    return true;
+}
+
+uint8_t *modPCSXGetOverride(uint32_t nameHash, int *sizeOut)
+{
+    Mod *mod = getMod(nameHash, MOD_TYPE_PCSX_FILE);
+    if (mod == nullptr || mod->Data.empty())
+        return nullptr;
+
+    // One 16-aligned (mash images are laid out against a 16-byte base; parse
+    // rebases are 4/8-byte) writable buffer per mod image. The bytes in Mods
+    // stay pristine as the master copy and are re-stamped over the buffer
+    // whenever no loaded exec is using it, so every load un_mashes and links
+    // virgin bytes -- see the block comment above for why re-serving a
+    // once-linked image would run freed pointers.
+    struct pcsxImage { const Mod *source; void *buffer; size_t size; };
+    static std::unordered_map<uint32_t, pcsxImage> s_images;
+
+    auto &slot = s_images[nameHash];
+
+    // Re-registration (enumerate_mods() reruns) can hand us a different-sized
+    // image; a still-loaded exec keeps pointers into the old buffer, so that
+    // one is abandoned rather than freed or resized.
+    if (slot.buffer == nullptr || slot.source != mod ||
+        slot.size != mod->Data.size())
+    {
+        void *buffer = arch_memalign(16u, mod->Data.size());
+        if (buffer == nullptr)
+            return nullptr;
+        slot.source = mod;
+        slot.buffer = buffer;
+        slot.size = mod->Data.size();
+        std::memcpy(slot.buffer, mod->Data.data(), slot.size);
+    }
+    else if (!modPCSXIsLoaded(nameHash))
+    {
+        std::memcpy(slot.buffer, mod->Data.data(), slot.size);
+    }
+
+    if (sizeOut != nullptr)
+        *sizeOut = (int)slot.size;
+    return static_cast<uint8_t *>(slot.buffer);
 }
 
 void script_instance_patch()

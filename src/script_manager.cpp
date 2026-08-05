@@ -10,6 +10,7 @@
 #include "resource_manager.h"
 #include "script_executable.h"
 #include "script_executable_entry.h"
+#include "script_object.h"
 #include "script_executable_allocated_stuff_record.h"
 #include "script_var_container.h"
 #include "os_developer_options.h"
@@ -260,6 +261,12 @@ bool is_loadable(const resource_key &a1)
 {
     TRACE("script_manager::is_loadable");
 
+    // A chunk-format .pcsx drop is loadable without being in any pack: it is
+    // read off disk by script_executable::load, so get_resource below knows
+    // nothing about it (script_object.h).
+    if (modPCSXGetChunkDir(a1.m_hash.source_hash_code, nullptr))
+        return true;
+
     resource_key a1a {a1.m_hash, RESOURCE_KEY_TYPE_SCRIPT};
     int mash_data_size = 0;
     return (resource_manager::get_resource(a1a, &mash_data_size, nullptr) != nullptr);
@@ -307,8 +314,21 @@ script_executable_entry * load(const resource_key &a1, uint32_t a2, void *a3, co
         }
         else
         {
+            // A chunk-format .pcsx dropped under the mod root is the CHUCK
+            // compiler's text output, not a mash image, so it can only come in
+            // through the old-fashioned loader -- reading its .pcsx/.pcsst/
+            // .pcpst/.pcsxl set out of the mod folder instead of "scripts\".
+            // This is per-key: every other script still loads from the packs,
+            // so dropping one script never disturbs the rest.
+            std::string pcsx_chunk_dir, pcsx_chunk_stem;
+            const bool from_pcsx_chunk =
+                    modPCSXGetChunkDir(a1.m_hash.source_hash_code,
+                                       &pcsx_chunk_dir, &pcsx_chunk_stem);
+            const bool old_fashioned =
+                    g_is_the_packer() || using_chuck_old_fashioned() || from_pcsx_chunk;
+
             script_executable_entry entry {};
-            if ( g_is_the_packer() || using_chuck_old_fashioned() )
+            if ( old_fashioned )
             {
                 entry.exec = new script_executable {};
             }
@@ -321,9 +341,20 @@ script_executable_entry * load(const resource_key &a1, uint32_t a2, void *a3, co
 
             entry.field_4 = 1;
             entry.field_8 = static_cast<const char *>(a3);
-            if ( g_is_the_packer() || using_chuck_old_fashioned() )
+            if ( old_fashioned )
             {
-                entry.exec->load(a1);
+                if ( from_pcsx_chunk )
+                {
+                    sp_log("[mod] loading chunk-format pcsx script \"%s\" from \"%s%s.pcsx\"",
+                           a1.m_hash.to_string(), pcsx_chunk_dir.c_str(),
+                           pcsx_chunk_stem.c_str());
+                    entry.exec->load(a1, mString {pcsx_chunk_dir.c_str()},
+                                     mString {pcsx_chunk_stem.c_str()});
+                }
+                else
+                {
+                    entry.exec->load(a1);
+                }
             }
             else
             {

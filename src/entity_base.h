@@ -8,6 +8,10 @@
 
 #include "config.h"
 
+#include <cstdint>
+#include <filesystem>
+#include <vector>
+
 struct po;
 struct event;
 struct conglomerate;
@@ -505,6 +509,31 @@ extern void entity_teleport_abs_position(entity_base *a2, const vector3d &a3, bo
 extern void check_po(entity_base *);
 
 extern int DEBUG_foster_conglom_warning;
+
+// ---------------------------------------------------------------------------
+// .ENT mods (entity_base.cpp)
+//
+// A .ent dropped under the mod root is a packer-produced entity mash image
+// (generic_mash_header + object image, the same bytes a retail pack serves
+// for RESOURCE_KEY_TYPE_ENTITY). enumerate_mods() validates+registers them
+// via modEntRegister under to_hash(stem) — the stem is the entity class
+// name, e.g. extra/GOBLIN.ent overrides the "goblin" template — and
+// resource_manager::get_resource swaps the retail bytes for the mod image
+// via modEntGetOverride at fetch time.
+// ---------------------------------------------------------------------------
+
+// Structural gate: header safety key, entity class_id, mash-data offset.
+extern bool modEntImageUsable(const uint8_t *bytes, size_t size);
+
+// Validate + register one .ent under to_hash(stem) (and its literal-hash
+// stem, if the name parses as one). Called by enumerate_mods().
+extern bool modEntRegister(const std::filesystem::path &path,
+                           std::vector<uint8_t> &&fileData);
+
+// Immortal writable image for the entity class hash, or nullptr. The engine
+// mutates the image in place (IN_USE flag, vtable words) and clones it for
+// repeat spawns, so the same copy is served for the mod's whole lifetime.
+extern uint8_t *modEntGetOverride(uint32_t classHash, int *sizeOut);
 
 //0x004E1290
 extern void entity_set_abs_parent(entity_base *me, entity_base *parent);

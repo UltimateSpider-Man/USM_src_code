@@ -26,7 +26,7 @@
 
 #include "game.h"
 
-#include "FileUSM.h"
+#include "fileusm.h"
 
 #include "fe_menu_nav_bar.h"
 

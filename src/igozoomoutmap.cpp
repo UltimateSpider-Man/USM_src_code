@@ -4,6 +4,10 @@
 #include "fe_menu_nav_bar.h"
 #include "mission_manager.h"
 
+#include "actor.h"
+#include "ai_player_controller.h"
+#include "ai_std_hero.h"
+
 #include "common.h"
 #include "func_wrapper.h"
 #include "game.h"
@@ -41,18 +45,32 @@
 //   sub_5C5920 — 0x005C5920, mission-state refresh (m_script && story==4).
 //   dword_968518 — mission_manager::s_inst (the mission_manager singleton).
 //
-// HIBYTE_RETADDR: in both functions the decompiler emitted a branch on
-// HIBYTE(retaddr) — a read of an unresolved stack slot (the classic Hex-Rays
-// signature for a value it could not recover). The sub_62CC00 call sites pass
-// no argument, so this is NOT a caller-supplied parameter; it is a recovery
-// gap. It selects between two icon/label layouts within each mission branch.
-// Defaulted to the fall-through (non-HIBYTE) path, which matches the PS2
-// default/objective behavior. Flip to confirm against the live binary if the
-// wrong icon set appears for a given mission type.
+// The former HIBYTE_RETADDR: SOLVED against the retail binary. In both
+// functions the decompiler emitted a branch on HIBYTE(retaddr); that is not a
+// recovery gap and not a caller-supplied parameter. Both prologues open with a
+// bare `push ecx`, which creates a 4-byte local immediately below the return
+// address, and both store the AL result of `call 0x005C5920` into its top byte:
+//
+//     00621431  call 0x612760            ; -> bl   (sub_612760)
+//     0062143E  call 0x5C5920            ; -> al
+//     00621449  mov  byte [esp+0x13], al ; <- the slot Hex-Rays calls retaddr
+//     0062144D  call 0x5BAFF0            ; -> ebp  (is_story_mission_active)
+//     ...
+//     00621581  mov  al, byte [esp+0x17] ; same byte, esp scaled by the -1.0f push
+//
+// So the branch predicate is mission_manager::sub_5C5920() — "a script is
+// loaded AND g_mission_type == 4" — which selects the story-stage-4 icon/label
+// layout inside each mission branch. 0x00621860 stores it at the identical slot.
 // ---------------------------------------------------------------------------
 namespace {
-constexpr bool HIBYTE_RETADDR = false;
+
+inline bool legend_story_stage_4()
+{
+    auto *mm = mission_manager::s_inst;
+    return mm != nullptr && mm->sub_5C5920();
 }
+
+} // namespace
 
 VALIDATE_SIZE(IGOZoomOutMap, 0x82Cu);
 VALIDATE_SIZE(IGOZoomOutMap::internal, 0x1Cu);
@@ -270,20 +288,114 @@ inline void legend_set_shown(PanelQuad *quad, bool shown)
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Port of PC zoom_map_ui::UpdateSpideyLegend (0x0062CC00) — the Spider-Man /
+// Venom legend dispatcher. Single call site in the retail binary: 0x006363A9.
+//
+// This is the routine that actually picks which legend gets built. It branches
+// on the live hero type and hands off to one of the two per-hero builders:
+//
+//     0062CC4D  mov eax, [0x95C770]      ; g_world_ptr
+//     0062CC52  mov ecx, [eax + 0x230]   ; ->field_230[0]      (get_hero_ptr(0))
+//     0062CC58  mov edx, [ecx + 0x8C]    ; ->m_player_controller
+//     0062CC5E  mov eax, [edx + 0x420]   ; ->m_hero_type
+//     0062CC64  cmp eax, ebx             ; ebx = 2 == VENOM
+//     0062CC6B  jne 0x62CC74
+//     0062CC6D  call 0x621860            ; VENOM  legend, header icon id 428
+//     0062CC74  call 0x621410            ; SPIDEY legend, header icon id 427
+//
+// Hooking 0x0062CC74 (as this file used to) only wraps the Spider-Man call
+// *inside* this function: the Venom branch is never covered and the reset /
+// alpha / alignment passes around the hand-off are skipped entirely. The hook
+// therefore moved to the dispatcher's own call site.
+//
+// Field map, in dword indices (the interpreted zoom_map_ui names do not line up
+// with these, so the raw form is the faithful one — same rule as sub_621410):
+//     dword  2       cached hero type
+//     dwords 31..44  the 14 icon quads hidden every frame  (vtable+0x5C)
+//     dword  119     selected legend row
+//     dword  120     visible legend line count, seeded to 2 and grown by the
+//                    per-hero builder
+//     dwords 110..114 live icon slots filled by the builder
+//     dwords 124..129 live label slots filled by the builder
+//     dwords 89..     legend text lines, used to align the icons vertically
+//
+// Vtable slots: 0x5C hide(int), 0x6C set_alpha(float, int), 0xAC get_x_abs(),
+// 0xB0 get_y_abs(), 0x98 set_pos_abs(x, y).
+// ---------------------------------------------------------------------------
 void zoom_map_ui::UpdateSpideyLegend()
 {
+    auto *self = reinterpret_cast<char *>(this);
 
-		
-		THISCALL(0x00621410, this);
+    auto DW = [self](int i) -> uint32_t & {
+        return *reinterpret_cast<uint32_t *>(self + 4 * i);
+    };
+    auto VF = [](uint32_t obj, int slot) -> uint32_t {
+        return *reinterpret_cast<uint32_t *>(*reinterpret_cast<uint32_t *>(obj) + slot);
+    };
 
+    DW(119) = 0;
+    DW(120) = 2;
+
+    // Hide the 14 icon quads at dwords 31..44.
+    for (int i = 31; i < 45; ++i) {
+        const uint32_t q = DW(i);
+        if (q != 0) {
+            reinterpret_cast<void(__thiscall *)(uint32_t, int)>(VF(q, 0x5C))(q, 0);
+        }
+    }
+
+    DW(124) = reinterpret_cast<uint32_t>(self + 0x1E4);
+    DW(125) = reinterpret_cast<uint32_t>(self + 0x1E5);
+
+    // g_world_ptr->get_hero_ptr(0)->m_player_controller->m_hero_type.
+    // The retail routine dereferences this chain unguarded; the nulls are
+    // checked here for the same reason legend_set_shown validates its quads —
+    // the map can be opened before the player controller exists.
+    hero_type_enum hero = UNDEFINED;
+    if (auto *hero_ent = g_world_ptr->get_hero_ptr(0)) {
+        if (auto *pc = static_cast<actor *>(hero_ent)->m_player_controller) {
+            hero = pc->m_hero_type;
+        }
+    }
+
+    DW(2) = static_cast<uint32_t>(hero);
+
+    if (hero == VENOM) {
+        this->sub_621860();   // Venom legend      — header icon id 428
+    } else {
+        this->sub_621410();   // Spider-Man legend — header icon id 427
+    }
+
+    // Alpha pass: every legend icon after the first is drawn at 0.75.
+    for (int i = 1; i < static_cast<int>(DW(120)); ++i) {
+        const uint32_t q = DW(110 + i - 1);
+        if (q != 0) {
+            reinterpret_cast<void(__thiscall *)(uint32_t, float, int)>(VF(q, 0x6C))(q, 0.75f, 1);
+        }
+    }
+
+    // Alignment pass: icon k keeps its own X and takes text line k's Y.
+    for (int k = 2; k < static_cast<int>(DW(120)); ++k) {
+        const uint32_t line = DW(89 + k - 2);
+        const uint32_t icon = DW(111 + k - 2);
+        if (line == 0 || icon == 0) {
+            continue;
+        }
+
+        const float y = reinterpret_cast<float(__thiscall *)(uint32_t)>(VF(line, 0xB0))(line);
+        const float x = reinterpret_cast<float(__thiscall *)(uint32_t)>(VF(icon, 0xAC))(icon);
+
+        reinterpret_cast<void(__thiscall *)(uint32_t, float, float)>(VF(icon, 0x98))(icon, x, y);
+    }
 }
 
+// The build variant shares the retail layout and addresses, so it delegates to
+// the dispatcher above instead of jumping straight into the Spider-Man builder
+// (which is what the old body did, making the Venom legend unreachable).
 void zoom_map_ui::UpdateSpideyLegend_build()
 {
-
-		
-		THISCALL(0x00621410, this);
-
+    this->UpdateSpideyLegend();
 }
 
 
@@ -363,8 +475,9 @@ int zoom_map_ui::sub_621410()
     int v2 = *((uint32_t *)self + 136);
     *((uint32_t *)self + 135) = *((uint32_t *)self + 137);
     *((uint32_t *)self + 134) = v2;
+    // Call order is load-bearing: 0x612760, then 0x5C5920, then 0x5BAFF0.
     bool v3 = CDECL_CALL(0x00612760);
-    CDECL_CALL(0x005C5920, mission_manager::s_inst);
+    const bool v4 = legend_story_stage_4();
     int is_story_mission_active = mission_manager::s_inst->is_story_mission_active();
     int v5 = *((uint32_t *)self + 100);
     int v6 = is_story_mission_active;
@@ -409,7 +522,7 @@ int zoom_map_ui::sub_621410()
     }
 
     int *v21 = *((int **)self + 101);
-    if (HIBYTE_RETADDR) {
+    if (v4) {
         int v22 = *v21;
         *((uint32_t *)self + 111) = *((uint32_t *)self + 34);
         int v23 = (*(int (__thiscall **)(int *, int))(*v21 + 276))(v21, -1082130432);
@@ -526,8 +639,9 @@ int zoom_map_ui::sub_621860()
     int *v2 = *(self + 138);
     *(self + 135) = *(self + 139);
     *(self + 134) = v2;
+    // Call order is load-bearing: 0x612760, then 0x5C5920, then 0x5BAFF0.
     bool v3 = CDECL_CALL(0x00612760);
-    CDECL_CALL(0x005C5920, mission_manager::s_inst);
+    const bool v4 = legend_story_stage_4();
     int is_story_mission_active = mission_manager::s_inst->is_story_mission_active();
     int v5 = (int)*(self + 100);
     int v6 = is_story_mission_active;
@@ -538,7 +652,7 @@ int zoom_map_ui::sub_621860()
 
     if (v3) {
         int *v11 = *(self + 101);
-        if (HIBYTE_RETADDR) {
+        if (v4) {
             *(self + 111) = *(self + 34);
             int v12 = *v11;
             int v13 = (*(int (__thiscall **)(int *, int))(*v11 + 276))(v11, -1082130432);
@@ -825,9 +939,12 @@ void IGOZoomOutMap_patch() {
         REDIRECT(0x00648A81, address);
     }
     {
-	FUNC_ADDRESS(address, &zoom_map_ui::UpdateSpideyLegend);
-	REDIRECT(0x062CC74, address);
-	}
+        // 0x006363A9 is the only call site of the dispatcher 0x0062CC00.
+        // The old hook at 0x0062CC74 was the internal `call sub_621410`, i.e.
+        // the Spider-Man branch only.
+        FUNC_ADDRESS(address, &zoom_map_ui::UpdateSpideyLegend);
+        REDIRECT(0x006363A9, address);
+    }
 
 	{
         FUNC_ADDRESS(address, &zoom_map_ui::sub_621410);
@@ -891,9 +1008,9 @@ void IGOZoomOutMap_build_patch() {
        REDIRECT(0x00648A81, address);
     }
     {
-	FUNC_ADDRESS(address, &zoom_map_ui::UpdateSpideyLegend_build);
-	REDIRECT(0x062CC74, address);
-	}
+        FUNC_ADDRESS(address, &zoom_map_ui::UpdateSpideyLegend_build);
+        REDIRECT(0x006363A9, address);
+    }
 
 	{
         FUNC_ADDRESS(address, &zoom_map_ui::sub_621410);

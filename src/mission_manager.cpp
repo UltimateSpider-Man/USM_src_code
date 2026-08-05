@@ -42,10 +42,22 @@ mission_manager::mission_manager()
     }
 }
 
+// 0x005C5920. Recovered from the retail PC binary:
+//     mov eax, [ecx+0x40]        ; m_script
+//     test eax, eax / je  -> 0
+//     call 0x005BAFF0            ; is_story_mission_active()
+//     cmp eax, 4  / jne -> 0
+//     return 1
+// This is the predicate the zoom-map legend reads as the "HIBYTE(retaddr)"
+// stack byte in sub_621410 / sub_621860 (see igozoomoutmap.cpp): it selects
+// the story-stage-4 icon/label layout. The body used to be empty, which made
+// a bool function fall off the end and return whatever was in AL.
 bool  mission_manager::sub_5C5920()
 {
     if constexpr (1)
-    {}
+    {
+        return this->m_script != nullptr && this->is_story_mission_active() == 4;
+    }
     else
     {
       return (bool)  THISCALL(0x005C5920, this);
@@ -90,8 +102,10 @@ int mission_manager::is_story_mission_active()
             return -1;
         }
 
-        mString var_name;
-		mString{"g_mission_type"};
+        // 0x005BAFF0 reads the game var "g_mission_type". The name has to go
+        // into var_name itself: a separate temporary left var_name empty and
+        // the lookup resolved the wrong (empty-named) variable.
+        mString var_name{"g_mission_type"};
 
 
         auto *address = script_manager::get_game_var_address(var_name, 0, 0);
@@ -340,9 +354,9 @@ void mission_manager::blackscreen_off(Float a2) {
             this->field_F8 = -FLT_MAX;  // 0xFF7FFFFF
         }
 
-        this->field_FC = 1;                 // state: fading out
+        this->field_FC = 2;                 // state: fading out
         g_game_ptr->field_166 = false;      // clear "black screen active" flag
-        this->sub_5BABB0();                 // release the hero freeze
+        this->sub_5BAC00();                 // release the hero freeze (0x005BAC00)
     } else {
         THISCALL(0x005BAD80, this, a2);
     }
@@ -797,6 +811,15 @@ void mission_manager_patch()
     }
 
     {
+        // Call sites of the retail blackscreen_off (0x005BAD80), recovered by
+        // scanning .text for E8 rel32 targets. The same scan reproduces the
+        // blackscreen_on list above exactly.
+        FUNC_ADDRESS(address, &mission_manager::blackscreen_off);
+        REDIRECT(0x0067386E, address);
+        REDIRECT(0x007413D9, address);
+    }
+
+    {
         FUNC_ADDRESS(address, &mission_manager::kill_braindead_script);
         SET_JUMP(0x005D7EF0, address);
     }
@@ -817,6 +840,15 @@ void mission_manager_patch2()
         REDIRECT(0x067383D, address);
         REDIRECT(0x0742177, address);
 
+    }
+
+    {
+        // Call sites of the retail blackscreen_off (0x005BAD80), recovered by
+        // scanning .text for E8 rel32 targets. The same scan reproduces the
+        // blackscreen_on list above exactly.
+        FUNC_ADDRESS(address, &mission_manager::blackscreen_off);
+        REDIRECT(0x0067386E, address);
+        REDIRECT(0x007413D9, address);
     }
 
 

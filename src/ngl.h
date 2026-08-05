@@ -430,6 +430,13 @@ extern vector4d sub_411750(const vector4d &a2, const vector4d &a3);
 //0x0076F500
 bool nglLoadMeshFileInternal(const tlFixedString &name, nglMeshFile *MeshFile, const char *ext);
 
+#ifdef OPENUSM_XBPACK_MODE
+bool nglLoadMeshFileInternalXbox(const tlFixedString &name,
+                                 nglMeshFile *MeshFile,
+                                 const char *ext);
+void ngl_xbpack_patch();
+#endif
+
 //0x0076F340
 void nglRebaseMesh(uint32_t a1, uint32_t a2, nglMesh *Mesh);
 

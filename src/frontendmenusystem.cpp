@@ -349,7 +349,7 @@ void FrontEndMenuSystem::GoNextState_beta() {
             break;
         case 10: {
             if (this->m_index != 5) {
-                mission_manager::s_inst->blackscreen_off(0.0);
+                mission_manager::s_inst->blackscreen_off(1.0);
 				g_game_ptr->freeze_hero(true);
             }
 

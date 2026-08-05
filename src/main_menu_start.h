@@ -4,7 +4,7 @@
 
 #include "float.hpp"
 
-#include "PanelQuad.h"
+#include "panelquad.h"
 
 #include "panelfile.h"
 

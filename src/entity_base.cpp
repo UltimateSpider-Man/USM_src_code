@@ -25,6 +25,7 @@
 #include "slab_allocator.h"
 #include "sound_and_pfx_interface.h"
 #include "stack_allocator.h"
+#include "tl_system.h"
 #include "trigger_manager.h"
 #include "trace.h"
 #include "utility.h"
@@ -1634,6 +1635,127 @@ void check_po(entity_base *e)
     } else {
         CDECL_CALL(0x0053CD00, e);
     }
+}
+
+// ---------------------------------------------------------------------------
+// .ENT mod overrides (see entity_base.h for the contract)
+//
+// A .ent image is the same generic-mash blob a retail pack serves for
+// RESOURCE_KEY_TYPE_ENTITY: 16-byte generic_mash_header, then the entity
+// object image whose vtable word holds the 0x7ACE5BAD placeholder until
+// parse_generic_mash_init patches it from ent_v_table_lookup[class_id].
+// The override rides resource_manager::get_resource (the one funnel every
+// named-entity fetch passes through - dynamic spawns, fx caches, console
+// "spawn"), swapping the byte pointer + size while the pack slot the retail
+// lookup produced stays in place, so instance tracking and pack-unload
+// teardown keep working. Scene-embedded entities (.ENS blobs) never do a
+// per-entity fetch and are out of scope on purpose.
+// ---------------------------------------------------------------------------
+
+bool modEntImageUsable(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr || size < sizeof(generic_mash_header) + 4)
+        return false;
+
+    const auto *header = bit_cast<const generic_mash_header *>(bytes);
+
+    // the header authenticates itself; IN_USE (0x80000000) and the
+    // vtable flag (0x40000000) sit outside the checksummed low 28 bits
+    if (header->safety_key != header->generate_safety_key())
+        return false;
+
+    // entity images are polymorphic mashes: class_id indexes the 28-entry
+    // ent_v_table_lookup/ent_size_lookup tables (parse_entity_mash passes
+    // num_table_entries = 0x1C)
+    if (!header->is_flagged(0x40000000) || header->class_id >= 0x1C)
+        return false;
+
+    // shared mash data lives at header + field_8, inside the image
+    if (header->field_8 < (int)sizeof(generic_mash_header) ||
+        (size_t)header->field_8 > size)
+        return false;
+
+    return true;
+}
+
+bool modEntRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData)
+{
+    const std::string stem = transformToLower(path.stem().string());
+
+    if (!modEntImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod] ent \"%s\": not a packer-produced entity mash image, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+
+    // A dumped-from-memory image may carry a live IN_USE flag; the flag is
+    // outside the checksummed bits, so clearing it keeps the header valid.
+    auto *header = bit_cast<generic_mash_header *>(fileData.data());
+    header->field_4 &= ~_MASH_FLAG_IN_USE;
+
+    const uint32_t hash = to_hash(stem.c_str());
+
+    // Re-registration (enumerate_mods() reruns): replace, don't stack.
+    {
+        auto range = Mods.equal_range(hash);
+        for (auto it = range.first; it != range.second; )
+            it = (it->second.Type == MOD_TYPE_ENT_FILE) ? Mods.erase(it) : std::next(it);
+    }
+
+    sp_log("[mod] registered ent override \"%s\" -> \"%s\" (%u bytes, key 0x%08X, class %u)",
+           path.filename().string().c_str(), stem.c_str(),
+           (unsigned)fileData.size(), hash, (unsigned)header->class_id);
+
+    Mods.emplace(hash, Mod{path, MOD_TYPE_ENT_FILE, std::move(fileData)});
+
+    // Hash-named drops ("extra/0x1189AB87.ent") also bind under the literal
+    // value, mirroring the mesh/texture/wav stem convention.
+    if (uint32_t literal = 0;
+        modParseLiteralHash(stem, &literal) && literal != hash)
+    {
+        const Mod *just = getMod(hash, MOD_TYPE_ENT_FILE);
+        if (just != nullptr)
+        {
+            Mods.emplace(literal, Mod{just->Path, MOD_TYPE_ENT_FILE, just->Data});
+            sp_log("[mod] ent \"%s\" also bound as literal hash 0x%08X",
+                   stem.c_str(), literal);
+        }
+    }
+
+    return true;
+}
+
+uint8_t *modEntGetOverride(uint32_t classHash, int *sizeOut)
+{
+    Mod *mod = getMod(classHash, MOD_TYPE_ENT_FILE);
+    if (mod == nullptr || mod->Data.empty())
+        return nullptr;
+
+    // One immortal, 16-aligned, writable copy per mod image, reused for
+    // every spawn: the first parse un-mashes it in place and flags it
+    // IN_USE; every later spawn takes parse_generic_mash_init's clone
+    // branch - exactly a retail pack image's lifecycle, except this one
+    // never unloads. The bytes in Mods stay pristine as the master copy.
+    struct entImage { const Mod *source; void *copy; };
+    static std::unordered_map<uint32_t, entImage> s_images;
+
+    auto &slot = s_images[classHash];
+    if (slot.copy == nullptr || slot.source != mod)
+    {
+        void *copy = tlMemAlloc((uint32_t)mod->Data.size(), 16u, 0x2000000u);
+        if (copy == nullptr)
+            return nullptr;
+        std::memcpy(copy, mod->Data.data(), mod->Data.size());
+        slot.source = mod;
+        slot.copy = copy;   // the previous copy (if any) stays alive: live
+                            // entities keep pointers into it
+    }
+
+    if (sizeOut != nullptr)
+        *sizeOut = (int)mod->Data.size();
+    return static_cast<uint8_t *>(slot.copy);
 }
 
 void entity_base_patch() {

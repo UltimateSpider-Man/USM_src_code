@@ -841,12 +841,20 @@ bool resource_directory::find_tlresource(uint32_t a1,
  
         bool res = func(this, nullptr, a1, tlres_type, out_dir, out_loc);
         if (res) {
-            // Typed lookup, and never for MESH_FILE: a raw .PCMESH mod is file
-            // bytes consumed by nglLoadMeshFileInternal through FileBuf, while
-            // field_8 of a MESH_FILE tlresource is the nglMeshFile struct
-            // itself (see mesh_file_resource_handler). Stuffing file bytes in
-            // here would hand the handler garbage for any name-hash match.
-            if (tlres_type != TLRESOURCE_TYPE_MESH_FILE) {
+            // Typed lookup, and never for the types whose field_8 is a LIVE
+            // STRUCT rather than file bytes: MESH_FILE holds the nglMeshFile
+            // itself (raw .PCMESH mods ride nglLoadMeshFileInternal through
+            // FileBuf instead - see mesh_file_resource_handler), and the NAL
+            // types hold parsed nalAnimFile / nalSceneAnim / nalBaseSkeleton
+            // images whose overrides are owned by nal_system.cpp
+            // (nalFlushPendingAnimOverrides / nalLoadSceneAnimInternal) and
+            // nalConstructSkeleton. Stuffing raw, un-parsed mod bytes into
+            // field_8 for any of those hands the consumer an image whose
+            // offsets were never fixed up into pointers.
+            if (tlres_type != TLRESOURCE_TYPE_MESH_FILE &&
+                tlres_type != TLRESOURCE_TYPE_ANIM_FILE &&
+                tlres_type != TLRESOURCE_TYPE_SCENE_ANIM &&
+                tlres_type != TLRESOURCE_TYPE_SKELETON) {
                 if (Mod* mod = getMod(a1, (int)tlres_type))
                     (*out_loc)->field_8 = reinterpret_cast<char*>(mod->Data.data());
             }

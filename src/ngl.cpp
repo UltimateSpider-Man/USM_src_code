@@ -13,6 +13,7 @@
 #include "igozoomoutmap.h"
 #include "log.h"
 #include "mash_info_struct.h"
+#include "mash_config.h"
 #include "matrix4x3.h"
 #include "memory.h"
 #include "ngl_dx_core.h"
@@ -60,6 +61,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <unordered_set>
 
 #include "game.h"
 
@@ -69,7 +73,27 @@
 
 #if MOD_MESH_SUPPORT
 #   include "mod_mesh_import.h"
+#   include "string_hash.h"
 Mod* dbgReplaceMesh = nullptr;
+#endif
+
+// The mod texture caches are defined inside the mod block further down, which
+// is itself inside #ifndef TARGET_XBOX. One switch keeps the declaration and
+// the call sites (which are NOT inside that block) from drifting away from the
+// definitions and turning into link errors on an Xbox build.
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+#   define MOD_TEX_CACHE 1
+#else
+#   define MOD_TEX_CACHE 0
+#endif
+
+#if MOD_TEX_CACHE
+// Texture-cache invalidation, defined with the importer glue further down.
+// Declared here because the texture lifetime functions (nglDestroyTexture,
+// nglReleaseTexture, nglReleaseAllTextures) sit above that block and are the
+// only honest signal that a pointer we cached has stopped being valid.
+void modTexCacheForgetTexture(nglTexture *tex);
+void modTexCacheNewEpoch(const char *why);
 #endif
 
 VALIDATE_SIZE(nglMeshNode, 0x98);
@@ -283,6 +307,10 @@ void nglSetDebugFlag(const char *Flag, uint8_t Set)
 }
 
 void nglDestroyTexture(nglTexture *a1) {
+#if MOD_TEX_CACHE
+    // Anything the mod texture cache holds for this pointer dies with it.
+    modTexCacheForgetTexture(a1);
+#endif
     CDECL_CALL(0x0077BB20, a1);
 }
 
@@ -2438,9 +2466,21 @@ namespace {
 // fixed-size memcpy shreds any section whose counts differ from what the
 // clone was created with.
 struct ModSectionStorage {
+    // The payload as it goes to the GPU. For a SKINNED section this is the
+    // 64-byte float row, so `vertices` reads naturally as floats. For a STATIC
+    // section it is the section's OWN vertex format, packed - a byte blob that
+    // merely lives in a float vector (every D3D vertex stride is a multiple of
+    // 4, so the alignment holds). Everything below therefore measures in
+    // strideBytes, never in a hard-coded 64.
     std::vector<float>    vertices;    // padded to >= the vanilla vert count
     std::vector<uint16_t> idx16;
     std::vector<uint32_t> idx32;
+    uint32_t strideBytes = 64;         // bytes per vertex, from the section
+    bool     rigid = false;            // static section: no palette, no morphs
+    // resolved layout of a static section, so a second parse of the same mesh
+    // file does not sniff OUR OWN packed output (it would still read correctly,
+    // but the original offsets are ground truth and free to keep)
+    int      layPos = 0, layNrm = -1, layUv = -1, layCol = -1;
     // The palette is tlMemAlloc-owned, NOT vector storage: the engine's
     // dynamic-section teardown (nglDestroySection / retail 0x775700)
     // tlMemFree's BonesIdx on the actor work-mesh clones we mirror onto, so
@@ -2452,6 +2492,13 @@ struct ModSectionStorage {
     uint32_t nverts = 0;               // real (drawn) counts
     uint32_t nidx = 0;
     uint32_t paddedVerts = 0;
+    uint32_t baseVertex = 0;           // first REAL vertex row (see morph note)
+    uint32_t origVerts = 0;            // VANILLA vertex count of this section.
+                                       // Sticky: S->NVertices is ours after the
+                                       // first apply, so re-deriving the dead
+                                       // zone from it would grow the buffer on
+                                       // every re-apply and move the morph
+                                       // window off the vanilla index range.
     uint32_t weightClass = 2;
     bool     wide = false;
     uint32_t revision = 0;             // bumped per (re)build of the source
@@ -2470,12 +2517,40 @@ struct ModSectionStorage {
 std::unordered_map<nglMeshSection *, ModSectionStorage> modSectionRegistry;
 uint32_t modSectionRevision = 0;
 
+// A registry entry is only meaningful while the section STILL POINTS AT the
+// storage we installed. Two things break that:
+//   * nglDestroySection tlMemFree's the section (and the palette we handed it),
+//   * a mesh-file unload frees the whole buffer the file's sections live in,
+//     without ever calling nglDestroySection.
+// Both addresses come straight back from the pool on the next load, so a
+// brand-new, unrelated section could be found in the registry and get another
+// character's geometry mirrored onto it (nglCopySection) with another
+// character's bone palette - sections apparently "reordered", bones scrambled,
+// on exactly the second character loaded. Identity is re-established by
+// comparing the section's CPU vertex pointer against our storage: only a
+// section we really installed can point into that vector.
+ModSectionStorage *modLiveStorage(nglMeshSection *S)
+{
+    if (S == nullptr) return nullptr;
+    auto it = modSectionRegistry.find(S);
+    if (it == modSectionRegistry.end())
+        return nullptr;
+    if (it->second.vertices.empty()
+        || S->field_3C.m_vertexData != (char *) it->second.vertices.data())
+    {
+        modSectionRegistry.erase(it);          // recycled address, not ours
+        return nullptr;
+    }
+    return &it->second;
+}
+
 // (re)creates the D3D buffers and points the section at `st`. Buffers go
 // through the engine pool helpers so the retail teardown recycles them like
 // vanilla ones. Returns false without touching the section on failure.
 bool modApplyStorageToSection(nglMeshSection *S, ModSectionStorage &st)
 {
-    const uint32_t vbytes = st.paddedVerts * 64;
+    const uint32_t stride = st.strideBytes ? st.strideBytes : 64u;
+    const uint32_t vbytes = st.paddedVerts * stride;
     const uint32_t ibytes = st.nidx * (st.wide ? 4u : 2u);
 
     nglVertexBuffer newVB {};
@@ -2531,13 +2606,25 @@ bool modApplyStorageToSection(nglMeshSection *S, ModSectionStorage &st)
     S->m_indices       = st.wide ? nullptr : st.idx16.data();
     S->NVertices       = int(st.nverts);
     S->NIndices        = int(st.nidx);
-    S->m_stride        = 64;
+    S->m_stride        = int(stride);
     S->m_primitiveType = D3DPT_TRIANGLELIST;
     S->StartIndex      = 0;
-    S->field_4C        = 0;              // MinVertexIndex = field_4C / stride
-    S->field_5C        = st.weightClass; // 2/3/4-bone shader selector
-    S->BonesIdx        = st.palette;
-    S->NBones          = int(st.nbones);
+    S->field_4C        = st.baseVertex * stride; // MinVertexIndex = field_4C /
+                                             // stride: the drawn window starts
+                                             // past the morph dead zone (see
+                                             // the layout note in
+                                             // modApplyBuiltSection). Static
+                                             // sections have no dead zone, so
+                                             // baseVertex is 0 there.
+    if (!st.rigid) {
+        S->field_5C = st.weightClass;    // 2/3/4-bone shader selector
+        S->BonesIdx = st.palette;
+        S->NBones   = int(st.nbones);
+    }
+    // A static section has no skinning fields to set: field_5C, BonesIdx and
+    // NBones come from the file and mean something else (or nothing) to the
+    // shader bound to it. Writing a palette there would hand the engine a bone
+    // array a static mesh does not have.
     return true;
 }
 
@@ -2545,46 +2632,1199 @@ bool modApplyStorageToSection(nglMeshSection *S, ModSectionStorage &st)
 
 bool modIsReplacedSection(nglMeshSection *S)
 {
-    return modSectionRegistry.count(S) != 0;
+    return modLiveStorage(S) != nullptr;
 }
 
-static bool modApplyBuiltSection(nglMeshSection *S, const modmesh::BuiltSection &B)
+// Called from nglDestroySection before the section (and the tlMemAlloc'd
+// palette we installed as BonesIdx) go back to the pool.
+void modForgetSection(nglMeshSection *S)
+{
+    if (S != nullptr)
+        modSectionRegistry.erase(S);
+}
+
+// Retarget the section material's diffuse texture to the first candidate
+// stem that resolves through the engine's texture pipeline: FBX-referenced
+// file names first (custom imports shipping their own PNG/DDS overrides by
+// name), then the source family ("VENOM" when venom pieces were mapped onto
+// another character's mesh). Actor work-mesh clones share material pointers,
+// so mutating the material recolors them too. Applied once per
+// material+name; unresolvable names leave the target texture untouched.
+//
+// Source priority per name: mod-shipped image sources (FBX-embedded bytes,
+// mods-folder file, loose file next to the FBX) OUTRANK the already-resident
+// engine texture. A reskin that keeps the vanilla stem (USM_BLACKSUIT.fbx +
+// USM_BLACKSUIT.png) must recolor even while the vanilla texture is resident;
+// the resident copy only wins when the mod ships no image of its own (FBX
+// referencing an engine stem such as "VENOM" with no override on disk).
+// Mod-built textures are cached per stem so sections sharing one image
+// decode it once instead of once per material.
+static bool modLooksD3DXImage(const uint8_t *d, size_t n)
+{
+    if (d == nullptr || n < 8) return false;
+    if (d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') return true; // png
+    if (d[0] == 0xFF && d[1] == 0xD8)                              return true; // jpg
+    if (d[0] == 'B'  && d[1] == 'M')                               return true; // bmp
+    if (d[0] == 'D' && d[1] == 'D' && d[2] == 'S' && d[3] == ' ')  return true; // dds
+    return false;
+}
+
+// A DDS whose pixel format is palette-indexed or pure luminance (the shape a
+// pack-texture extractor produces from this engine's P8 textures). D3DX
+// decodes those as grayscale index/luma data - the "inverted black & white
+// costume" - so in auto texture mode they must never displace a resident
+// texture that already carries the real colors.
+static bool modDDSIsIndexedOrLuma(const uint8_t *d, size_t n)
+{
+    if (d == nullptr || n < 128) return false;
+    if (!(d[0] == 'D' && d[1] == 'D' && d[2] == 'S' && d[3] == ' ')) return false;
+    auto u32 = [&](size_t o) {
+        return uint32_t(d[o]) | uint32_t(d[o+1]) << 8
+             | uint32_t(d[o+2]) << 16 | uint32_t(d[o+3]) << 24;
+    };
+    // DDS layout: 4-byte magic, then DDS_HEADER whose DDS_PIXELFORMAT begins
+    // 72 bytes in (dwSize..dwReserved1[11] = 4*7 + 44). So from file start:
+    // ddspf.dwSize @76, .dwFlags @80, .dwFourCC @84, .dwRGBBitCount @88.
+    constexpr size_t pf = 4 + 72;
+    const uint32_t pfFlags = u32(pf + 4);       // DDS_PIXELFORMAT::dwFlags
+    const uint32_t fourCC  = u32(pf + 8);
+    const uint32_t bpp     = u32(pf + 12);      // dwRGBBitCount
+    if (pfFlags & 0x00000020u) return true;     // DDPF_PALETTEINDEXED8
+    if (pfFlags & 0x00020000u) return true;     // DDPF_LUMINANCE
+    if (fourCC == 0 && bpp == 8) return true;   // uncompressed 8bpp
+    return false;
+}
+
+// A pack extraction RECOMPRESSED after a paletteless decode: a DXT/RGB file
+// whose CONTENT is a gray ramp. The header sniff above cannot see it, so
+// sample the actual color payload - the RGB565 endpoints of the DXT color
+// blocks, or the pixels of an uncompressed RGB surface. Near-total R==G==B
+// means the "colors" are palette indices read as luminance: the exact
+// texture that turns the black suit white and lets the time-of-day light rig
+// tint it by the hour. Only consulted in auto mode when a resident texture
+// exists (see usableModBytes), so a mod that genuinely ships a grayscale
+// recolor can still force it with sidecar texture=mod.
+static bool modDDSLooksGrayscale(const uint8_t *d, size_t n)
+{
+    if (d == nullptr || n < 128 + 8) return false;
+    if (!(d[0] == 'D' && d[1] == 'D' && d[2] == 'S' && d[3] == ' ')) return false;
+    auto u32 = [&](size_t o) {
+        return uint32_t(d[o]) | uint32_t(d[o+1]) << 8
+             | uint32_t(d[o+2]) << 16 | uint32_t(d[o+3]) << 24;
+    };
+    constexpr size_t pf = 4 + 72;               // DDS_PIXELFORMAT offset
+    const uint32_t pfFlags = u32(pf + 4);
+    const uint32_t fourCC  = u32(pf + 8);
+    const uint32_t bpp     = u32(pf + 12);
+    const size_t   data0   = 128;               // legacy header, no DX10 ext
+    size_t gray = 0, colored = 0;
+    auto tally = [&](int R, int G, int B, int tol) {
+        int mx = R > G ? R : G; if (B > mx) mx = B;
+        int mn = R < G ? R : G; if (B < mn) mn = B;
+        if (mx - mn <= tol) ++gray; else ++colored;
+    };
+    auto sample565 = [&](uint32_t c) {
+        tally(int((c >> 11) & 31) * 255 / 31,
+              int((c >>  5) & 63) * 255 / 63,
+              int( c        & 31) * 255 / 31, 12);
+    };
+    if (fourCC == 0x31545844u                   // DXT1
+     || fourCC == 0x33545844u                   // DXT3
+     || fourCC == 0x35545844u) {                // DXT5
+        const size_t blockSz  = (fourCC == 0x31545844u) ? 8u : 16u;
+        const size_t colorOff = blockSz - 8u;   // alpha block first on DXT3/5
+        for (size_t o = data0; o + blockSz <= n && gray + colored < 4096;
+             o += blockSz) {
+            sample565(uint32_t(d[o + colorOff])
+                    | uint32_t(d[o + colorOff + 1]) << 8);
+            sample565(uint32_t(d[o + colorOff + 2])
+                    | uint32_t(d[o + colorOff + 3]) << 8);
+        }
+    } else if (fourCC == 0 && (pfFlags & 0x00000040u)       // DDPF_RGB
+               && (bpp == 24 || bpp == 32)) {
+        const size_t px = bpp / 8;              // D3D order: B G R (A)
+        for (size_t o = data0; o + px <= n && gray + colored < 4096;
+             o += px * 7)                       // sparse, stride-agnostic
+            tally(d[o + 2], d[o + 1], d[o], 8);
+    } else {
+        return false;                           // unknown layout: no opinion
+    }
+    const size_t tot = gray + colored;
+    return tot >= 64 && colored * 50 < tot;     // >= 98% of samples are gray
+}
+
+// Build a texture named `nm` from raw image file bytes. D3DX (the shipped
+// d3dx9_24.dll) decodes the standard formats; anything else goes through the
+// engine's own parser. `forceD3DX` covers extensions D3DX loads but that have
+// no reliable magic (tga).
+static nglTexture *modConstructTexFromBytes(const std::string &nm,
+                                            const uint8_t *data, size_t size,
+                                            bool forceD3DX = false)
+{
+    if (data == nullptr || size == 0)
+        return nullptr;
+    const bool d3dx = forceD3DX || modLooksD3DXImage(data, size);
+    nglTexture *tex = nglConstructTexture(tlFixedString{ nm.c_str() },
+                                          nglTextureFileFormat(d3dx ? 2 : 0),
+                                          const_cast<uint8_t *>(data),
+                                          uint32_t(size));
+    if (tex != nullptr && d3dx && tex->DXTexture == nullptr)
+        return nullptr;                          // d3dx rejected the bytes
+    return tex;
+}
+
+static bool modReadWholeFile(const std::filesystem::path &p,
+                             std::vector<uint8_t> &out)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(p, ec))
+        return false;
+    std::ifstream f(p, std::ios::binary);
+    if (!f)
+        return false;
+    out.assign((std::istreambuf_iterator<char>(f)),
+               std::istreambuf_iterator<char>());
+    return !out.empty();
+}
+
+// ---------------------------------------------------------------------------
+// Mod texture caches, and why they need an epoch.
+//
+// Three caches used to live as function-local statics inside the retarget:
+// the per-material "already applied" marker, the per-stem table of textures
+// built from mod bytes, and the pin material clones. All three are keyed by a
+// RAW POINTER or by a stem whose texture is owned by the engine, and all three
+// outlive the objects they describe. That is the same trap modLiveStorage()
+// documents for sections ("recycled address, not ours"), and it produced the
+// same class of symptom one layer up: switch hero to usm_blacksuit mid-session
+// and the character loads WHITE.
+//
+//   * the reloaded nglMaterialBase lands on the address the previous one was
+//     freed from, the "already applied" entry is still there with a matching
+//     name hash, and the retarget returns before doing anything at all;
+//   * nglReleaseAllTextures() frees everything in the directory, so a stem
+//     cached from the previous load resolves to a dangling nglTexture *;
+//   * a pin clone is a memcpy of the PREVIOUS load's material - stale shader
+//     pointer, stale render state.
+//
+// Identity is re-established the same way the section registry does it:
+// nothing is trusted just because it is in the map. `applied` remembers the
+// texture it installed and is only honoured while the material still draws
+// with it; clones are refreshed from their source on every lookup; built
+// textures are stamped with an epoch and, across an epoch boundary, only
+// reused when the engine's own directory still hands back the same pointer.
+// ---------------------------------------------------------------------------
+namespace {
+
+uint32_t modTexEpoch = 1;
+
+// what the retarget last installed on a material, and what it installed it for
+struct ModAppliedTex {
+    uint32_t    nameHash = 0;
+    nglTexture *tex      = nullptr;
+};
+std::unordered_map<nglMaterialBase *, ModAppliedTex> modAppliedTex;
+
+// textures built from mod bytes (FBX-embedded, mods/ folder, loose file next
+// to the mod), keyed by candidate stem: sections sharing one image decode it
+// once instead of once per material.
+struct ModBuiltTex {
+    nglTexture *tex   = nullptr;
+    uint32_t    epoch = 0;
+};
+std::unordered_map<std::string, ModBuiltTex> modBuiltTex;
+
+// pin/white material clones, keyed by (source material, stem)
+std::map<std::pair<nglMaterialBase *, std::string>, nglMaterialBase *> modMatClones;
+
+} // namespace
+
+// Called from nglDestroyTexture: a pointer that is about to be freed must
+// leave every cache, whatever epoch it was built in.
+void modTexCacheForgetTexture(nglTexture *tex)
+{
+    if (tex == nullptr)
+        return;
+    for (auto it = modBuiltTex.begin(); it != modBuiltTex.end(); ) {
+        if (it->second.tex == tex) {
+            sp_log("[modmesh] cached texture \"%s\" destroyed - dropped\n",
+                   it->first.c_str());
+            it = modBuiltTex.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto &a : modAppliedTex)
+        if (a.second.tex == tex)
+            a.second.tex = nullptr;      // forces a re-resolve, never a re-bind
+}
+
+// Called whenever something invalidates texture pointers wholesale: a texture
+// directory purge, or a mesh file load (the reload event itself). Costs at
+// most one extra rebuild per stem - cross-epoch reuse is not forbidden, only
+// made conditional on the engine confirming the pointer.
+void modTexCacheNewEpoch(const char *why)
+{
+    ++modTexEpoch;
+    if (why != nullptr && !modBuiltTex.empty())
+        sp_log("[modmesh] texture cache epoch %u (%s): %u cached stem(s) now "
+               "need the engine to confirm them before reuse\n",
+               modTexEpoch, why, unsigned(modBuiltTex.size()));
+}
+
+// A sidecar pin (tex<N>=STEM) and a white= section must repaint ONE section.
+// Character materials are shared between sections - and the actor pipeline
+// clones work meshes off them - so writing field_1C in place would drag every
+// section bound to the same nglMaterialBase along with it: pinning the mouth
+// sheet onto the cocoon would repaint the forearms too. Take a shallow
+// 0x50-byte copy (the shader pointer and the render state travel with it; only
+// the diffuse texture is about to change) and point the section at the copy.
+//
+// The allocation is cached per (material, stem) so re-applies and rebuilt
+// work-mesh clones reuse one - but the CONTENTS are refreshed from the source
+// every time. After a character reload the source material has been reloaded
+// (or a different material now occupies that address) and the cached clone
+// still held the previous load's shader pointer and render state.
+static nglMaterialBase *modCloneMaterialForPin(nglMaterialBase *src,
+                                               const std::string &stem)
+{
+    if (src == nullptr)
+        return nullptr;
+    auto key = std::make_pair(src, stem);
+    if (auto it = modMatClones.find(key); it != modMatClones.end()) {
+        if (it->second != nullptr) {
+            // re-sync with the source: cheap, and the only thing that keeps a
+            // clone valid across a mesh-file reload
+            nglTexture *keepTex = it->second->field_1C;
+            std::memcpy(it->second, src, sizeof(nglMaterialBase));
+            it->second->field_1C = keepTex;
+            return it->second;
+        }
+        modMatClones.erase(it);
+    }
+    auto *copy = static_cast<nglMaterialBase *>(
+        tlMemAlloc(int(sizeof(nglMaterialBase)), 8, 0x1000000u));
+    if (copy == nullptr)
+        return nullptr;
+    std::memcpy(copy, src, sizeof(nglMaterialBase));
+    modMatClones[key] = copy;
+    sp_log("[modmesh] material cloned for pin \"%s\" (%p -> %p)\n",
+           stem.c_str(), (void *) src, (void *) copy);
+    return copy;
+}
+
+// The engine's own 1x1 white texture, the target of a white= section. Falls
+// back to a directory lookup when the global has not been filled in yet.
+static nglTexture *modWhiteTexture()
+{
+    if (nglWhiteTex() != nullptr)
+        return nglWhiteTex();
+    return nglGetTexture(tlFixedString{ "nglwhite" });
+}
+
+// Everything this section is called in the file. The engine is the only side
+// that knows these: the importer sees FBX material names, not the names the
+// retail mesh carries. Both are checked - MaterialName is what the section
+// asks for, Material->Name is what it got.
+static void modSectionMaterialNames(nglMeshSection *S,
+                                    const char *out[2])
+{
+    out[0] = out[1] = nullptr;
+    if (S == nullptr)
+        return;
+    if (S->MaterialName != nullptr)
+        out[0] = S->MaterialName->to_string();
+    if (S->Material != nullptr && S->Material->Name != nullptr)
+        out[1] = S->Material->Name->to_string();
+}
+
+// Does either name read like a piece that is meant to be white? Substring
+// match, case-insensitive, against the sidecar's list (white_names=) or the
+// importer's default set.
+static bool modNameSaysWhite(nglMeshSection *S,
+                             const std::vector<std::string> &keys,
+                             const char **whichName, const char **whichKey)
+{
+    const char *names[2];
+    modSectionMaterialNames(S, names);
+    for (const char *n : names) {
+        if (n == nullptr || *n == '\0')
+            continue;
+        std::string u(n);
+        for (auto &c : u) c = char(std::toupper(uint8_t(c)));
+        for (const std::string &k : keys)
+            if (!k.empty() && u.find(k) != std::string::npos) {
+                if (whichName != nullptr) *whichName = n;
+                if (whichKey  != nullptr) *whichKey  = k.c_str();
+                return true;
+            }
+    }
+    return false;
+}
+
+// Should this BLANK section be left white instead of handed to the
+// blank-repair fallbacks? Never called for a material that draws a texture.
+static bool modBlankShouldStayWhite(nglMeshSection *S,
+                                    const modmesh::BuiltSection &B,
+                                    int sectionIndex)
+{
+    if (B.whiteBlank) {
+        sp_log("[modmesh] sec%d: untextured material - sidecar white=blank, "
+               "drawing WHITE (no salvage, no donor borrow)\n", sectionIndex);
+        return true;
+    }
+    if (!B.whiteByName || !B.whiteNames)
+        return false;
+    const char *nm = nullptr, *key = nullptr;
+    if (!modNameSaysWhite(S, *B.whiteNames, &nm, &key))
+        return false;
+    sp_log("[modmesh] sec%d: untextured material \"%s\" matches \"%s\" - "
+           "drawing WHITE instead of borrowing a sheet (sidecar white=off "
+           "disables, white_names= changes the list)\n",
+           sectionIndex, nm != nullptr ? nm : "?", key != nullptr ? key : "?");
+    return true;
+}
+
+// Bind pure white to this section and stop. No candidate search, no salvage,
+// no donor borrow: sidecar white= exists precisely because those heuristics
+// are wrong for geometry that is white on purpose (the black suit's eye
+// lenses and chest spider).
+static bool modApplyForcedWhite(nglMeshSection *S, int sectionIndex)
+{
+    auto *mat = S != nullptr ? S->Material : nullptr;
+    if (mat == nullptr)
+        return false;
+    nglTexture *white = modWhiteTexture();
+    if (white == nullptr) {
+        sp_log("[modmesh] sec%d: white= requested but the engine white texture "
+               "does not exist yet - leaving the material alone\n",
+               sectionIndex);
+        return false;
+    }
+    if (auto *c = modCloneMaterialForPin(mat, "\x01white"); c != nullptr) {
+        S->Material = c;
+        mat = c;
+    }
+    if (mat->field_1C != white) {
+        mat->field_1C = white;
+        sp_log("[modmesh] sec%d: forced WHITE (sidecar white=)\n", sectionIndex);
+    }
+    modAppliedTex[mat] = ModAppliedTex{ 0u, white };
+    return true;
+}
+
+static void modRetargetSectionTextureInner(nglMeshSection *S,
+                                           const modmesh::BuiltSection &B,
+                                           const std::filesystem::path &modPath,
+                                           int sectionIndex)
+{
+    auto *mat = S != nullptr ? S->Material : nullptr;
+    if (mat == nullptr)
+        return;
+
+    // sidecar white=N: the most specific instruction there is - the section
+    // draws pure white and nothing below runs. Placed above texture=keep and
+    // above the pin handling on purpose: white wins over every policy.
+    if (B.forceWhite) {
+        modApplyForcedWhite(S, sectionIndex);
+        return;
+    }
+
+    // sidecar tex<N>=STEM: an explicit instruction outranks every policy below
+    const bool pinned = B.texExclusive && !B.textureCandidates.empty();
+    if (pinned) {
+        if (auto *c = modCloneMaterialForPin(mat, B.textureCandidates.front());
+            c != nullptr) {
+            S->Material = c;
+            mat = c;
+        }
+    }
+
+    if (B.texMode == 1 && !pinned)               // sidecar texture=keep
+        return;
+
+    // BLANK = no diffuse texture bound: the section draws pure white (the
+    // venom_eddie cocoon/teeth/eddie-head symptom). Every guard below exists
+    // to protect a texture the section already draws with - with nothing
+    // bound there is nothing to protect, so blank unlocks the full search.
+    const bool blank = (mat->field_1C == nullptr);
+
+    // A blank material draws pure white, and on a character that is often
+    // CORRECT - the eye lenses and the chest emblem are untextured white
+    // geometry in retail. Everything below this point assumes the opposite
+    // (blank == broken, find it a sheet), so the white policies get to answer
+    // first. texture=keep is left alone: it already means "do not touch".
+    if (blank && B.texMode != 1
+        && modBlankShouldStayWhite(S, B, sectionIndex)) {
+        modApplyForcedWhite(S, sectionIndex);
+        return;
+    }
+
+    // automatic blank-fix carrier (importer autotex): it exists ONLY to
+    // repair a missing diffuse texture and must never displace a bound one
+    if (B.blankOnly && !blank)
+        return;
+
+    const std::vector<std::string> &names = B.textureCandidates;
+    const std::filesystem::path modDir  = modPath.parent_path();
+    const std::string           fbxStem = modPath.stem().string();
+
+    // A section whose geometry was deliberately KEPT (exact round trip) is
+    // vanilla in every respect, textures included. Its material assignment in
+    // the FBX is only as good as the exporter's guess, and that guess is
+    // coarse: the venom_eddie export tags the whole forearm/hand/claw run
+    // (sections 2-8) with VENOM_MOUTH and leaves the eddie-reveal pieces with
+    // no texture at all. Binding a stem that merely TRAVELLED WITH the FBX -
+    // the DDS files it embeds, its .fbm folder, or another resident texture
+    // that happens to carry that name - then paints the teeth sheet onto the
+    // hands, and a palette-indexed pack extraction read as luminance shows up
+    // as the grey/white ramp described above. So for a round-trip section only
+    // a file the USER dropped in mods/ may override the resident texture; that
+    // is the deliberate act, and it is what keeps the recolor workflow
+    // (round-trip FBX + USM_BLACKSUIT.png next to it) working. Sidecar
+    // texture=mod restores the full search.
+    // ... except when the stem was pinned by hand: the pin IS the deliberate
+    // act this restriction exists to protect, so the full search runs.
+    // ... and except when the material is BLANK: the restriction protects a
+    // vanilla texture, and a blank material has none - white is the one
+    // outcome this whole pipeline exists to avoid.
+    const bool userFilesOnly = B.keepGeometry && B.texMode != 2 && !pinned
+                            && !blank;
+
+    // The stem the FBX names may already BE the texture this material draws
+    // with - the normal case for an FBX exported from the game's own asset and
+    // re-imported (every material in USM_BLACKSUIT.fbx names "USM_BLACKSUIT",
+    // which is exactly what the vanilla section is bound to). There is nothing
+    // to retarget: the resident texture IS the intended one.
+    //
+    // Bailing out here, before the file search, is what makes that safe no
+    // matter what sits next to the mod. Otherwise a DDS extracted from the
+    // PCPACK - palette-indexed, shipped without its palette - is found in step
+    // 4 and shadows the correct texture; read as luminance it renders the suit
+    // as a grey ramp, which the time-of-day light rig then tints, so the
+    // costume turns white at noon and shifts colour with the hour instead of
+    // staying the authored dark purple. Header sniffing (modDDSIsIndexedOrLuma)
+    // catches the common variants but cannot catch one that was recompressed on
+    // extraction; identity of the target needs no sniffing at all.
+    //
+    // Sidecar texture=mod (texMode 2) still forces the mod's own bytes.
+    if (B.texMode != 2 && !pinned) {
+        for (const std::string &nm : names) {
+            if (nm.empty() || nm.size() >= 60)
+                continue;
+            nglTexture *res = nglGetTexture(tlFixedString{ nm.c_str() });
+            if (res != nullptr && res == mat->field_1C) {
+                sp_log("[modmesh] texture \"%s\" is already the section's own "
+                       "texture - retarget skipped, vanilla colors kept "
+                       "(sidecar texture=mod forces the mod file)\n",
+                       nm.c_str());
+                return;
+            }
+        }
+    }
+
+    // In auto mode an indexed/luminance DDS (a pack extraction, not an
+    // authored recolor) may only be used when the engine has NO texture of its
+    // own for the stem; texture=mod restores the old unconditional behaviour.
+    //
+    // "Has none" must not be read as "has none RESIDENT RIGHT NOW". That was
+    // the reload bug: on a hero switch the character mesh is loaded before its
+    // texture pack, nglGetTexture() comes back null purely because of load
+    // order, and the guard waves through the very file it exists to reject -
+    // the black suit then renders as the grey/white ramp with the light rig
+    // tinting it by the hour. Asking the engine to LOAD the stem turns a race
+    // into a rule: if the game can produce that texture at all, the mod's
+    // palette-indexed extraction of it does not get to win.
+    auto engineHasTexture = [](const std::string &nm) -> bool {
+        if (nglGetTexture(tlFixedString{ nm.c_str() }) != nullptr)
+            return true;
+        return nglLoadTexture(tlFixedString{ nm.c_str() }) != nullptr;
+    };
+    auto usableModBytes = [&](const std::string &nm,
+                              const uint8_t *d, size_t n) -> bool {
+        if (B.texMode == 2) return true;
+        if (!modDDSIsIndexedOrLuma(d, n) && !modDDSLooksGrayscale(d, n))
+            return true;
+        if (!engineHasTexture(nm)) return true;
+        sp_log("[modmesh] texture \"%s\": mod file is a palette/luminance/"
+               "grayscale DDS (pack extraction) - keeping the engine's own "
+               "texture. Sidecar texture=mod overrides.\n", nm.c_str());
+        return false;
+    };
+
+    for (const std::string &nm : names) {
+        if (nm.empty() || nm.size() >= 60)
+            continue;
+        uint32_t h = 5381;
+        for (char c : nm) h = h * 33u + uint8_t(c);
+        // "this name is already applied" is only true while the material STILL
+        // DRAWS with the texture we installed for it. A reloaded material lands
+        // on a recycled address carrying its own (usually null) diffuse
+        // texture; honouring the stale entry there is what made a reloaded
+        // character come back white. A blank material is never skipped.
+        if (auto it = modAppliedTex.find(mat); it != modAppliedTex.end()) {
+            if (it->second.nameHash == h && it->second.tex != nullptr
+                && mat->field_1C == it->second.tex)
+                return;                          // this name already applied
+            if (mat->field_1C == nullptr || it->second.tex != mat->field_1C)
+                modAppliedTex.erase(it);         // recycled/reloaded, not ours
+        }
+
+        // sidecar tex<N>=WHITE reaching this loop as a stem: never searched
+        // for on disk, it means the engine's own white texture
+        if (nm == "WHITE" || nm == "NGLWHITE") {
+            if (modApplyForcedWhite(S, sectionIndex))
+                return;
+            continue;
+        }
+
+        // 1) a texture already built from mod bytes for this stem. Across an
+        //    epoch boundary (a directory purge, a mesh file reload) the
+        //    pointer is only trusted when the engine's own directory still
+        //    hands back the same object; otherwise it is rebuilt from bytes.
+        nglTexture *tex = nullptr;
+        if (!userFilesOnly) {
+            if (auto mb = modBuiltTex.find(nm); mb != modBuiltTex.end()) {
+                if (mb->second.epoch == modTexEpoch) {
+                    tex = mb->second.tex;
+                } else if (mb->second.tex != nullptr
+                           && nglGetTexture(tlFixedString{ nm.c_str() })
+                              == mb->second.tex) {
+                    mb->second.epoch = modTexEpoch;   // engine confirms it
+                    tex = mb->second.tex;
+                } else {
+                    sp_log("[modmesh] texture \"%s\": cached copy did not "
+                           "survive the reload - rebuilding from the mod\n",
+                           nm.c_str());
+                    modBuiltTex.erase(mb);
+                }
+            }
+        }
+
+        // 2) USER override first: mods/<stem>.png/.jpg/.bmp/.dds bind mods/<stem>.png/.jpg/.bmp/.dds bind
+        //    as TLRESOURCE_TYPE_TEXTURE keyed by the lower-case stem hash
+        //    (subfolders like mods/VENOM.fbm/ are enumerated too). A file
+        //    the user drops in mods/ is the most intentional source there
+        //    is, so it OUTRANKS the image embedded in a downloaded FBX -
+        //    that is what lets a recolored VENOM_EDDIE_03.png darken a
+        //    piece whose embedded texture ships pale.
+        if (tex == nullptr) {
+            std::string low;
+            low.reserve(nm.size());
+            for (char c : nm) low.push_back(char(std::tolower(uint8_t(c))));
+            std::vector<uint8_t> bytes;
+            if (Mod *tm = getMod(to_hash(low.c_str()), TLRESOURCE_TYPE_TEXTURE);
+                tm != nullptr && readModFile(tm, bytes) && !bytes.empty()
+                && usableModBytes(nm, bytes.data(), bytes.size()))
+            {
+                tex = modConstructTexFromBytes(nm, bytes.data(), bytes.size());
+                if (tex != nullptr)
+                    sp_log("[modmesh] texture \"%s\" built from mod file\n",
+                           nm.c_str());
+            }
+        }
+
+        // 3) image bytes embedded in the FBX itself (Video/Content): the
+        //    mod is fully self-contained, its colors ship inside it and
+        //    take precedence over a resident texture with the same stem
+        if (tex == nullptr && !userFilesOnly) {
+            if (auto e = B.embeddedTex.find(nm);
+                e != B.embeddedTex.end() && e->second && !e->second->empty()
+                && usableModBytes(nm, e->second->data(), e->second->size()))
+            {
+                tex = modConstructTexFromBytes(nm, e->second->data(),
+                                               e->second->size());
+                if (tex != nullptr)
+                    sp_log("[modmesh] texture \"%s\" built from FBX-embedded "
+                           "bytes (%u)\n", nm.c_str(),
+                           uint32_t(e->second->size()));
+            }
+        }
+
+        // a round trip carries the FBX's own copy of a VANILLA texture: never
+        // let it (or a same-named resident texture) move onto a section whose
+        // geometry we kept, only a file the user placed in mods/ may
+        if (tex == nullptr && userFilesOnly
+            && (B.embeddedTex.count(nm) || B.texRelPath.count(nm)))
+            sp_log("[modmesh] texture \"%s\": section is an exact round trip - "
+                   "vanilla texture kept (drop mods/%s.png to recolor it, or "
+                   "sidecar texture=mod)\n", nm.c_str(), nm.c_str());
+
+        // 4) loose image next to the FBX, resolved from the path written in
+        //    the file: <fbxdir>/<rel as written>, the Blender media folder
+        //    <fbxdir>/<fbx>.fbm/<basename>, and plain <fbxdir>/<stem>.<ext>
+        if (tex == nullptr && !userFilesOnly && !modDir.empty()) {
+            std::vector<std::filesystem::path> tries;
+            if (auto r = B.texRelPath.find(nm); r != B.texRelPath.end()) {
+                std::string rel = r->second;
+                std::replace(rel.begin(), rel.end(), '\\', '/');
+                std::filesystem::path relP(rel);
+                if (relP.is_relative())
+                    tries.push_back(modDir / relP);
+                tries.push_back(modDir / relP.filename());
+                tries.push_back(modDir / (fbxStem + ".fbm") / relP.filename());
+            }
+            static const char *exts[] = { ".dds", ".png", ".tga",
+                                          ".jpg", ".jpeg", ".bmp" };
+            for (const char *e : exts) {
+                tries.push_back(modDir / (nm + e));
+                tries.push_back(modDir / (fbxStem + ".fbm") / (nm + e));
+            }
+            for (const auto &p : tries) {
+                std::vector<uint8_t> bytes;
+                if (!modReadWholeFile(p, bytes))
+                    continue;
+                if (!usableModBytes(nm, bytes.data(), bytes.size()))
+                    continue;
+                std::string ext = p.extension().string();
+                for (auto &c : ext) c = char(std::tolower(uint8_t(c)));
+                tex = modConstructTexFromBytes(nm, bytes.data(), bytes.size(),
+                                               ext == ".tga");
+                if (tex != nullptr) {
+                    sp_log("[modmesh] texture \"%s\" read next to the mod: "
+                           "\"%s\"\n", nm.c_str(), p.string().c_str());
+                    break;
+                }
+            }
+        }
+
+        // anything built from mod bytes above is remembered for the next
+        // section/material asking for the same stem, stamped with the epoch it
+        // was built in so a later reload knows to re-confirm it
+        if (tex != nullptr && !modBuiltTex.count(nm))
+            modBuiltTex[nm] = ModBuiltTex{ tex, modTexEpoch };
+
+        // 5) already resident (same character reload, shared pack, ...):
+        //    reached only when the mod ships no image of its own, so an
+        //    FBX referencing a vanilla engine stem keeps vanilla colors
+        if (tex == nullptr && !userFilesOnly)
+            tex = nglGetTexture(tlFixedString{ nm.c_str() });
+
+        // 6) the engine's own directory / pack load
+        if (tex == nullptr && !userFilesOnly)
+            tex = nglLoadTexture(tlFixedString{ nm.c_str() });
+        if (tex == nullptr)
+            continue;
+
+        if (tex != mat->field_1C) {
+            mat->field_1C = tex;
+            sp_log("[modmesh] sec%d: material texture -> \"%s\"%s\n",
+                   sectionIndex, nm.c_str(), B.texExclusive ? " (pinned)" : "");
+        }
+        // remember WHAT was installed, not just that something was: the entry
+        // is only honoured again while the material still draws with this
+        // exact texture (see the lookup above)
+        modAppliedTex[mat] = ModAppliedTex{ h, tex };
+        return;
+    }
+}
+
+// Wrapper: run the retarget, then make sure the section did not end up
+// without a diffuse texture. A material whose field_1C is null draws pure
+// white - the "blank" pieces of the venom_eddie import (the reveal cocoon, the
+// teeth, eddie's head), which the exporter ships with no material reference.
+// Recovery runs in two stages after the retarget proper:
+//   1. numbered-variant salvage - family stems tried with _01/_02/... suffixes
+//      against the resident set and the engine loader;
+//   2. sibling-donor fallback - borrow the diffuse texture of the best
+//      textured section of the SAME mesh (most vertices wins: that is the
+//      body sheet; environment/ink sheets are skipped). A blank piece painted
+//      with the body's own sheet blends in when it is ever on screen, which
+//      beats the alternative in every case: flat white on top of the
+//      character.
+// Only a genuinely texture-less mesh still falls through to the WHITE
+// message, which names the section index and the stems that were tried -
+// exactly what a sidecar pin needs:  tex<N>=<STEM>
+static void modRetargetSectionTexture(nglMeshSection *S,
+                                      const modmesh::BuiltSection &B,
+                                      const std::filesystem::path &modPath,
+                                      int sectionIndex = -1,
+                                      nglMesh *Mesh = nullptr)
+{
+    // One line per section naming the MATERIAL, before anything is changed.
+    // This is what turns "the eyes are the wrong colour" into an edit: the
+    // section map from the importer gives the index, this gives the name the
+    // white_names= list is matched against and whether the material was blank
+    // to begin with.
+    if (S != nullptr) {
+        const char *names[2];
+        modSectionMaterialNames(S, names);
+        sp_log("[modmesh] sec%d: material \"%s\" (as \"%s\") diffuse=%s\n",
+               sectionIndex,
+               names[1] != nullptr ? names[1] : "?",
+               names[0] != nullptr ? names[0] : "?",
+               (S->Material != nullptr && S->Material->field_1C != nullptr)
+                   ? "bound" : "NONE (draws white)");
+    }
+
+    modRetargetSectionTextureInner(S, B, modPath, sectionIndex);
+
+    // sidecar white=: the section is finished. Neither the numbered-variant
+    // salvage nor the sibling-donor borrow may run on it - "the material has
+    // no diffuse texture" is the intended state for a white piece, not a
+    // defect, and the donor borrow would paint the body sheet over the eye
+    // lenses and the chest spider.
+    if (B.forceWhite)
+        return;
+
+    auto *mat = S != nullptr ? S->Material : nullptr;
+    if (mat == nullptr || mat->field_1C != nullptr)
+        return;
+
+    // Still blank after the retarget - the candidate search found nothing.
+    // Ask the white policies once more before the fallbacks start guessing:
+    // the inner pass can leave a section blank on a path that never reached
+    // the check above (an empty candidate list, a userFilesOnly bail-out).
+    if (B.texMode != 1 && modBlankShouldStayWhite(S, B, sectionIndex)) {
+        modApplyForcedWhite(S, sectionIndex);
+        return;
+    }
+
+    // Still blank: numbered-variant salvage. The stems the file names are
+    // often FAMILIES ("VENOM_EDDIE") whose real sheets carry numbered
+    // suffixes ("VENOM_EDDIE_01") - try those against the resident set and
+    // the engine loader before giving up. A miss costs nothing: the
+    // alternative is a section that draws pure white.
+    if (B.texMode != 1) {
+        static const char *sfx[] = { "_01", "_02", "_03", "_04",
+                                     "_00", "_1", "_2" };
+        for (const std::string &nm : B.textureCandidates) {
+            if (nm.empty())
+                continue;
+            std::string base = nm;               // "VENOM_EDDIE000" -> family
+            while (!base.empty() && std::isdigit(uint8_t(base.back())))
+                base.pop_back();
+            while (!base.empty() && base.back() == '_')
+                base.pop_back();
+            std::vector<std::string> roots{ nm };
+            if (!base.empty() && base != nm)
+                roots.push_back(base);
+            for (const std::string &root : roots) {
+                for (const char *s : sfx) {
+                    const std::string v = root + s;
+                    if (v.size() >= 60)
+                        continue;
+                    nglTexture *tex = nglGetTexture(tlFixedString{ v.c_str() });
+                    if (tex == nullptr)
+                        tex = nglLoadTexture(tlFixedString{ v.c_str() });
+                    if (tex == nullptr)
+                        continue;
+                    mat->field_1C = tex;
+                    sp_log("[modmesh] sec%d: blank material salvaged - "
+                           "\"%s\" resolved for stem \"%s\"\n",
+                           sectionIndex, v.c_str(), nm.c_str());
+                    return;
+                }
+            }
+        }
+    }
+
+    // Still blank: sibling-donor fallback. Every by-name path is exhausted
+    // (candidates, mod files, embedded bytes, loose files, resident set,
+    // engine loader, numbered variants), so stop resolving NAMES and take a
+    // TEXTURE that provably exists: the diffuse of another section of this
+    // same mesh. The donor with the most vertices is the body sheet, which
+    // is exactly what the venom_eddie reveal pieces should wear when they
+    // are ever on screen; environment/ink sheets (SPHRMAP & friends, mostly
+    // white hatching) are never borrowed. texture=keep still wins: the user
+    // asked for the material to stay untouched, white included.
+    if (B.texMode != 1 && Mesh != nullptr && Mesh->Sections != nullptr) {
+        auto envSheet = [](const char *nm) -> bool {
+            if (nm == nullptr) return false;
+            std::string u = nm;
+            for (auto &c : u) c = char(std::toupper(uint8_t(c)));
+            static const char *bad[] = { "SPHRMAP", "SPHMAP", "SPHEREMAP",
+                "ENVMAP", "CUBEMAP", "REFLECT", "LIGHTMAP", "SHADOW" };
+            for (const char *b : bad)
+                if (u.find(b) != std::string::npos) return true;
+            return false;
+        };
+        nglMeshSection *donor = nullptr;
+        for (auto i = 0u; i < Mesh->NSections; ++i) {
+            nglMeshSection *o = Mesh->Sections[i].Section;
+            if (o == nullptr || o == S)
+                continue;
+            nglMaterialBase *om = o->Material;
+            if (om == nullptr || om == mat || om->field_1C == nullptr)
+                continue;
+            if (envSheet(om->Name != nullptr ? om->Name->to_string() : nullptr))
+                continue;
+            if (donor == nullptr || o->NVertices > donor->NVertices)
+                donor = o;
+        }
+        if (donor != nullptr && donor->Material != nullptr
+            && donor->Material->field_1C != nullptr) {
+            mat->field_1C = donor->Material->field_1C;
+            sp_log("[modmesh] sec%d: blank material - borrowed the diffuse "
+                   "texture of sibling section \"%s\" (%d verts) so it never "
+                   "draws white. Pin the intended sheet with tex%d=<STEM>.\n",
+                   sectionIndex,
+                   donor->Material->Name != nullptr
+                       ? donor->Material->Name->to_string() : "?",
+                   donor->NVertices, sectionIndex);
+            return;
+        }
+    }
+
+    std::string tried;
+    for (const std::string &nm : B.textureCandidates) {
+        if (!tried.empty()) tried += ", ";
+        tried += nm;
+    }
+    sp_log("[modmesh] sec%d: material has NO diffuse texture - this section "
+           "renders WHITE. Stems tried: [%s]. Bind one from the sidecar with "
+           "tex%d=<STEM> (see the \"texture stems present in the file\" line "
+           "of the section map).\n",
+           sectionIndex, tried.empty() ? "-" : tried.c_str(), sectionIndex);
+}
+
+// ---------------------------------------------------------------------------
+//  bounding volumes after a replacement
+// ---------------------------------------------------------------------------
+// The spheres shipped in the PCMESH describe the VANILLA geometry. Replacing a
+// section without refreshing them leaves the engine reasoning about a body that
+// is no longer there: sections get frustum-culled while on screen (or drawn
+// while off), LOD picks the wrong level, and - because the chase camera frames
+// the actor from its bounds - the camera settles at the wrong stand-off, which
+// is how a replaced character ends up with the view glued to its back.
+// Smallest sphere containing both inputs (a, ra) and (b, rb) -> (out, rout).
+// Used to GROW a bounding volume, never to shrink it.
+static void modSphereUnion(const float a[3], float ra,
+                           const float b[3], float rb,
+                           float out[3], float &rout)
+{
+    const float dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+    const float d  = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (d + rb <= ra) {                       // b inside a
+        out[0] = a[0]; out[1] = a[1]; out[2] = a[2]; rout = ra; return;
+    }
+    if (d + ra <= rb) {                       // a inside b
+        out[0] = b[0]; out[1] = b[1]; out[2] = b[2]; rout = rb; return;
+    }
+    rout = (d + ra + rb) * 0.5f;
+    if (d > 1e-8f) {
+        const float t = (rout - ra) / d;      // slide from a towards b
+        out[0] = a[0] + dx * t;
+        out[1] = a[1] + dy * t;
+        out[2] = a[2] + dz * t;
+    } else {
+        out[0] = a[0]; out[1] = a[1]; out[2] = a[2];
+    }
+}
+
+// The tight bind-pose fit is NOT a valid replacement for the shipped sphere:
+// measured against VENOM.PCPACK the retail radii run up to 0.24 units wider
+// than the bind-pose extent, because the volume has to hold the body in every
+// animated pose. So the new sphere is the UNION of the vanilla one and the
+// replacement's extent - it grows to cover geometry the mod added, and never
+// shrinks below the margin the artists shipped.
+static void modRecomputeSectionSphere(nglMeshSection *S,
+                                      const std::vector<float> &verts)
+{
+    if (S == nullptr || verts.size() < 16)
+        return;
+    float lo[3] = { 3.4e38f, 3.4e38f, 3.4e38f };
+    float hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+    for (size_t v = 0; v + 16 <= verts.size(); v += 16)
+        for (int c = 0; c < 3; ++c) {
+            const float x = verts[v + c];
+            if (!std::isfinite(x)) return;          // leave the vanilla sphere
+            if (x < lo[c]) lo[c] = x;
+            if (x > hi[c]) hi[c] = x;
+        }
+    float nc[3] = { (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f,
+                    (lo[2] + hi[2]) * 0.5f };
+    float nr2 = 0.f;
+    for (size_t v = 0; v + 16 <= verts.size(); v += 16) {
+        const float dx = verts[v] - nc[0], dy = verts[v + 1] - nc[1],
+                    dz = verts[v + 2] - nc[2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > nr2) nr2 = d2;
+    }
+    float nr = std::sqrt(nr2);
+
+    const bool oldValid = std::isfinite(S->SphereRadius) && S->SphereRadius > 0.f
+                       && std::isfinite(S->SphereCenter[0])
+                       && std::isfinite(S->SphereCenter[1])
+                       && std::isfinite(S->SphereCenter[2]);
+    float oc[3] = { S->SphereCenter[0], S->SphereCenter[1], S->SphereCenter[2] };
+    if (oldValid) {
+        // A fit whose radius or centre offset dwarfs the vanilla sphere is an
+        // importer outlier, not real geometry. Unioning it in poisons every
+        // consumer of the bounds: nglGetLOD measures the distance to a centre
+        // that is no longer on the body (the character trips the last LOD
+        // threshold and is culled while standing on screen), and the chase
+        // camera solves its stand-off against the same volume (it dives
+        // inside the mesh). Keep the vanilla sphere - a slightly-tight
+        // sphere at worst pops at the screen edge - and let the log point
+        // at the offending import.
+        const float lim = S->SphereRadius * 2.0f + 0.5f;
+        const float dx = nc[0] - oc[0], dy = nc[1] - oc[1], dz = nc[2] - oc[2];
+        const float off = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (nr > lim || off > lim) {
+            sp_log("[modmesh] section sphere fit r=%.2f off=%.2f vs vanilla "
+                   "r=%.2f - importer outlier, vanilla sphere kept\n",
+                   nr, off, S->SphereRadius);
+            return;
+        }
+    }
+    float rc[3], rr;
+    if (oldValid) modSphereUnion(oc, S->SphereRadius, nc, nr, rc, rr);
+    else          { rc[0] = nc[0]; rc[1] = nc[1]; rc[2] = nc[2]; rr = nr; }
+
+    S->SphereCenter[0] = rc[0];
+    S->SphereCenter[1] = rc[1];
+    S->SphereCenter[2] = rc[2];
+    S->SphereCenter[3] = 1.f;
+    S->SphereRadius    = rr;
+}
+
+// Union of the mesh's section spheres, by the same construction the engine uses
+// for the file-wide sphere further down: box over every center +/- radius, then
+// the largest reach from that box's center. Runs before the engine's own
+// aggregation so it feeds on corrected per-mesh values.
+static void modRecomputeMeshBounds(nglMesh *Mesh)
+{
+    if (Mesh == nullptr || Mesh->NSections <= 0 || Mesh->Sections == nullptr)
+        return;
+    float lo[3] = { 3.4e38f, 3.4e38f, 3.4e38f };
+    float hi[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+    int seen = 0;
+    for (int i = 0; i < Mesh->NSections; ++i) {
+        nglMeshSection *S = Mesh->Sections[i].Section;
+        if (S == nullptr || !std::isfinite(S->SphereRadius))
+            continue;
+        const float r = S->SphereRadius;
+        if (!std::isfinite(S->SphereCenter[0])
+            || !std::isfinite(S->SphereCenter[1])
+            || !std::isfinite(S->SphereCenter[2]))
+            continue;
+        for (int c = 0; c < 3; ++c) {
+            if (S->SphereCenter[c] - r < lo[c]) lo[c] = S->SphereCenter[c] - r;
+            if (S->SphereCenter[c] + r > hi[c]) hi[c] = S->SphereCenter[c] + r;
+        }
+        ++seen;
+    }
+    if (seen == 0)
+        return;
+    const float cx = (lo[0] + hi[0]) * 0.5f;
+    const float cy = (lo[1] + hi[1]) * 0.5f;
+    const float cz = (lo[2] + hi[2]) * 0.5f;
+    float rad = 0.f;
+    for (int i = 0; i < Mesh->NSections; ++i) {
+        nglMeshSection *S = Mesh->Sections[i].Section;
+        if (S == nullptr || !std::isfinite(S->SphereRadius))
+            continue;
+        const float dx = S->SphereCenter[0] - cx;
+        const float dy = S->SphereCenter[1] - cy;
+        const float dz = S->SphereCenter[2] - cz;
+        const float reach = std::sqrt(dx * dx + dy * dy + dz * dz)
+                          + S->SphereRadius;
+        if (reach > rad) rad = reach;
+    }
+    float nc[3] = { cx, cy, cz }, rc[3], rr;
+    const bool oldValid = std::isfinite(Mesh->SphereRadius)
+                       && Mesh->SphereRadius > 0.f
+                       && std::isfinite(Mesh->field_20[0])
+                       && std::isfinite(Mesh->field_20[1])
+                       && std::isfinite(Mesh->field_20[2]);
+    float oc[3] = { Mesh->field_20[0], Mesh->field_20[1], Mesh->field_20[2] };
+    if (oldValid) modSphereUnion(oc, Mesh->SphereRadius, nc, rad, rc, rr);
+    else          { rc[0] = cx; rc[1] = cy; rc[2] = cz; rr = rad; }
+
+    Mesh->field_20[0] = rc[0];
+    Mesh->field_20[1] = rc[1];
+    Mesh->field_20[2] = rc[2];
+    Mesh->field_20[3] = 1.f;
+    Mesh->SphereRadius = rr;
+    sp_log("[modmesh] mesh bounds: center (%.3f %.3f %.3f) radius %.3f "
+           "(was %.3f)\n", rc[0], rc[1], rc[2], rr,
+           oldValid ? Mesh->SphereRadius : 0.f);
+}
+
+// Packs the importer's canonical 16-float rows down into a STATIC section's
+// own vertex format. Channels the target does not have are simply not written;
+// bytes the sniffer did not account for keep the value the ORIGINAL vertex had
+// at that offset (tangents, a second UV set, padding), which is the only sane
+// default: zeroing them would blank whatever the shader reads there. The
+// template row is the original section's first vertex.
+static std::vector<float> modPackRigidVertices(const modmesh::BuiltSection &B,
+                                               const void *templateRow)
+{
+    const uint32_t stride = B.targetStride ? B.targetStride : 32u;
+    const size_t   nv     = B.vertices.size() / 16;
+    std::vector<float> outF((nv * stride + 3) / 4, 0.f);
+    uint8_t *out = reinterpret_cast<uint8_t *>(outF.data());
+
+    for (size_t i = 0; i < nv; ++i) {
+        uint8_t *dst = out + i * stride;
+        if (templateRow != nullptr)
+            std::memcpy(dst, templateRow, stride);
+        const float *r = B.vertices.data() + i * 16;
+        if (B.tPosOff >= 0 && uint32_t(B.tPosOff) + 12 <= stride)
+            std::memcpy(dst + B.tPosOff, r + 0, 12);
+        if (B.tNrmOff >= 0 && uint32_t(B.tNrmOff) + 12 <= stride)
+            std::memcpy(dst + B.tNrmOff, r + 3, 12);
+        if (B.tUvOff >= 0 && uint32_t(B.tUvOff) + 8 <= stride)
+            std::memcpy(dst + B.tUvOff, r + 6, 8);
+        if (B.tColOff >= 0 && uint32_t(B.tColOff) + 4 <= stride
+            && i < B.colors.size())
+            std::memcpy(dst + B.tColOff, &B.colors[i], 4);
+    }
+    return outF;
+}
+
+static bool modApplyBuiltSection(nglMeshSection *S, const modmesh::BuiltSection &B,
+                                 int meshNBones)
 {
     if (B.vertices.empty() || B.indices.empty())
         return false;
 
     const uint32_t nverts = uint32_t(B.vertices.size() / 16);
     const uint32_t nidx   = uint32_t(B.indices.size());
-    const bool     wide   = nverts > 0xFFFF;
 
-    // retail morph playback indexes vertices by the VANILLA counts; padding
-    // the CPU array and the VB up to that count keeps those writes in bounds
-    // even when the replacement is smaller
-    const uint32_t origVerts  = uint32_t(S->NVertices > 0 ? S->NVertices : 0);
-    const uint32_t padded     = nverts > origVerts ? nverts : origVerts;
+    // -----------------------------------------------------------------
+    // STATIC section: the section's own vertex format, no morph dead zone
+    // (retail morph playback is a character-mesh feature and never addresses
+    // a static section), no bone palette, no weight class. The vertex window
+    // therefore starts at 0 and the indices are used as the importer built
+    // them.
+    // -----------------------------------------------------------------
+    if (B.rigid) {
+        const uint32_t stride = B.targetStride ? B.targetStride : 32u;
+        const bool wide = nverts > 0xFFFF;
+
+        // Template row: keep whatever the original vertex held in the bytes
+        // the layout does not describe. On a RE-apply (the mesh file is parsed
+        // again, e.g. a second character load or a mod reload) the vanilla
+        // stream is long gone - but our own previous packing still carries
+        // those bytes, so it serves as the template and they survive every
+        // reload instead of decaying to zero on the second one.
+        const void *tmpl = nullptr;
+        const ModSectionStorage *prevSt = modLiveStorage(S);
+        if (prevSt != nullptr) {
+            if (prevSt->rigid && prevSt->strideBytes == stride
+                && !prevSt->vertices.empty())
+                tmpl = prevSt->vertices.data();
+        } else if (S->field_3C.m_vertexData != nullptr && S->NVertices > 0
+                   && uint32_t(S->m_stride) == stride) {
+            tmpl = S->field_3C.m_vertexData;      // still the vanilla stream
+        }
+
+        ModSectionStorage next;
+        next.nverts      = nverts;
+        next.nidx        = nidx;
+        next.paddedVerts = nverts;
+        next.baseVertex  = 0;
+        next.origVerts   = prevSt != nullptr
+                         ? prevSt->origVerts
+                         : uint32_t(S->NVertices > 0 ? S->NVertices : 0);
+        next.wide        = wide;
+        next.strideBytes = stride;
+        next.rigid       = true;
+        next.weightClass = 0;
+        next.layPos      = B.tPosOff;
+        next.layNrm      = B.tNrmOff;
+        next.layUv       = B.tUvOff;
+        next.layCol      = B.tColOff;
+        next.revision    = ++modSectionRevision;
+        next.vertices    = modPackRigidVertices(B, tmpl);
+        if (wide) {
+            next.idx32.assign(B.indices.begin(), B.indices.end());
+            sp_log("[modmesh] static section with %u verts uses a 32-bit index "
+                   "buffer\n", nverts);
+        } else {
+            next.idx16.reserve(nidx);
+            for (uint32_t v : B.indices)
+                next.idx16.push_back(uint16_t(v));
+        }
+
+        ModSectionStorage &st = modSectionRegistry[S];
+        st = std::move(next);
+        if (!modApplyStorageToSection(S, st)) {
+            modSectionRegistry.erase(S);
+            return false;
+        }
+        modRecomputeSectionSphere(S, B.vertices);
+        sp_log("[modmesh] static section replaced: %u verts, %u idx, stride %u "
+               "(pos %d nrm %d uv %d col %d)%s\n",
+               nverts, nidx, stride, B.tPosOff, B.tNrmOff, B.tUvOff, B.tColOff,
+               tmpl != nullptr ? "" : ", no template row");
+        return true;
+    }
+
+    // -----------------------------------------------------------------
+    // Morph dead zone. Retail morph playback (facial animation - eddie,
+    // the spidey head, MJ) writes per-vertex deltas addressed by VANILLA
+    // vertex indices. The old layout kept the replacement vertices at the
+    // front of the buffer and only padded the tail, so those writes landed
+    // ON TOP of re-welded vertices - random spikes that accumulate frame
+    // over frame into the "exploded blob". New layout:
+    //
+    //     [ 0 .. origVerts )              dead zone (all-zero rows)
+    //     [ origVerts .. origVerts+n )    the replacement vertices
+    //
+    // Index values are shifted by origVerts and field_4C points the draw
+    // window (MinVertexIndex = field_4C / stride) past the dead zone, so
+    // every vanilla-indexed morph write lands on vertices that are never
+    // drawn. Facial morphs become a no-op on replaced sections instead of
+    // shredding them. CPU consumers stay consistent: m_vertexData holds the
+    // same layout as the VB and m_indices carries the shifted values.
+    // -----------------------------------------------------------------
+    // S->NVertices is OUR count once the section has been replaced before, so
+    // re-deriving the dead zone from it would stack a new dead zone on top of
+    // the old one every time the mesh file is parsed again.
+    const ModSectionStorage *prev = modLiveStorage(S);
+    const uint32_t origVerts  = prev != nullptr
+                              ? prev->origVerts
+                              : uint32_t(S->NVertices > 0 ? S->NVertices : 0);
+    const uint32_t baseVertex = origVerts;
+    const uint32_t padded     = baseVertex + nverts;
+    const bool     wide       = padded > 0xFFFF;
 
     ModSectionStorage next;
     next.nverts      = nverts;
     next.nidx        = nidx;
     next.paddedVerts = padded;
+    next.baseVertex  = baseVertex;
+    next.origVerts   = origVerts;
     next.wide        = wide;
     next.weightClass = B.weightClass;
-    next.vertices    = B.vertices;
-    next.vertices.resize(size_t(padded) * 16, 0.f);
+    next.vertices.assign(size_t(padded) * 16, 0.f);
+    std::copy(B.vertices.begin(), B.vertices.end(),
+              next.vertices.begin() + size_t(baseVertex) * 16);
     if (wide) {
-        next.idx32 = B.indices;
+        next.idx32.reserve(nidx);
+        for (uint32_t v : B.indices)
+            next.idx32.push_back(v + baseVertex);
         sp_log("[modmesh] section with %u verts uses a 32-bit index buffer\n",
                nverts);
     } else {
         next.idx16.reserve(nidx);
         for (uint32_t v : B.indices)
-            next.idx16.push_back(uint16_t(v));
+            next.idx16.push_back(uint16_t(v + baseVertex));
     }
 
     // final palette snapshot: either the rebuilt one or the section's own,
-    // so work-mesh mirrors always get a self-contained copy
-    if (!B.keepOriginalPalette && !B.palette.empty())
-        next.setPalette(B.palette.data(), uint32_t(B.palette.size()));
+    // so work-mesh mirrors always get a self-contained copy.
+    //
+    // Last line of defence before the GPU: no entry may index past
+    // Mesh->Bones, whatever the importer produced. An out-of-range entry
+    // multiplies the section by a garbage matrix - the screen-crossing
+    // spikes. Entry 0 at worst pins those vertices to the first bone: the
+    // body stays whole and visible.
+    if (!B.keepOriginalPalette && !B.palette.empty()) {
+        std::vector<uint16_t> pal(B.palette.begin(), B.palette.end());
+        if (meshNBones > 0) {
+            uint32_t clamped = 0;
+            for (auto &e : pal)
+                if (int(e) >= meshNBones) { e = 0; ++clamped; }
+            if (clamped)
+                sp_log("[modmesh] %u palette entries >= NBones (%d) clamped "
+                       "to bone 0\n", clamped, meshNBones);
+        }
+        next.setPalette(pal.data(), uint32_t(pal.size()));
+    }
     else if (S->BonesIdx != nullptr && S->NBones > 0)
         next.setPalette(S->BonesIdx, uint32_t(S->NBones));
     else
@@ -2597,8 +3837,146 @@ static bool modApplyBuiltSection(nglMeshSection *S, const modmesh::BuiltSection 
         modSectionRegistry.erase(S);
         return false;
     }
+    // fit the culling/camera sphere to what is actually drawn now
+    modRecomputeSectionSphere(S, B.vertices);
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Static section vertex layout.
+//
+// A character section is the retail 64-byte usperson/us_character row and the
+// importer knows it by heart. Everything else - weapons, pickups, hero-gauge
+// meshes, props, world geometry - carries an arbitrary interleaved D3D vertex
+// whose declaration lives in the section's VertexDef, behind a vtable we do
+// not own. And we run BEFORE the per-section loop assigns Material/shader, so
+// the shader name is not available to ask either.
+//
+// What IS available is the stream itself, and D3D vertex data is highly
+// self-describing:
+//   * POSITION is first in every declaration the game uses -> offset 0;
+//   * a NORMAL is a float3 of length ~1;
+//   * a D3DCOLOR is a dword whose float reinterpretation is NaN/Inf (any
+//     opaque colour has 0xFF in the top byte, i.e. exponent 255) or a
+//     denormal-scale value - never a plausible coordinate;
+//   * a UV is a float2 of small finite values.
+// The sniff is logged, and sidecar "layout=stride:32,pos:0,nrm:12,uv:24" is
+// the escape hatch when a build's layout defeats it.
+// ---------------------------------------------------------------------------
+namespace {
+
+bool modFloatPlausible(float f, float lim)
+{
+    return std::isfinite(f) && std::fabs(f) <= lim
+        && (f == 0.f || std::fabs(f) > 1e-30f);
+}
+
+// dword that cannot be a coordinate: packed colour
+bool modLooksColorDword(const uint8_t *p)
+{
+    float f;
+    std::memcpy(&f, p, 4);
+    if (!std::isfinite(f)) return true;                 // exponent 255
+    if (f != 0.f && std::fabs(f) < 1e-30f) return true; // denormal
+    if (std::fabs(f) > 1e18f) return true;
+    return false;
+}
+
+// Does a 64-byte stream really carry the skinned row? Blend indices are -1 or
+// small non-negative integers, weights are in [0,1] and sum to ~1. A static
+// mesh that happens to be 64 bytes wide (position + normal + two UV sets +
+// colour + tangent) fails this and must not be treated as skinnable.
+bool modLooksSkinned64(const uint8_t *base, uint32_t nverts)
+{
+    const uint32_t n = std::min(nverts, 64u);
+    if (n == 0) return false;
+    uint32_t ok = 0;
+    for (uint32_t k = 0; k < n; ++k) {
+        const float *r = (const float *)(base + size_t(k) * 64);
+        bool good = true;
+        float wsum = 0.f;
+        for (int i = 0; i < 4; ++i) {
+            const float s = r[8 + i], w = r[12 + i];
+            if (!std::isfinite(s) || !std::isfinite(w)) { good = false; break; }
+            if (w < -1e-4f || w > 1.0001f)             { good = false; break; }
+            if (s < -1.5f  || s > 255.f)               { good = false; break; }
+            if (std::fabs(s - std::floor(s + 0.5f)) > 1e-3f) { good = false; break; }
+            wsum += w > 0.f ? w : 0.f;
+        }
+        if (good && wsum > 0.9f && wsum < 1.1f) ++ok;
+    }
+    return ok * 4 >= n * 3;                             // 75% of the sample
+}
+
+void modSniffSectionLayout(modmesh::OrigSectionView &ov, unsigned secIdx)
+{
+    const uint8_t *base = (const uint8_t *)ov.verts;
+    const uint32_t stride = ov.strideBytes;
+    ov.skinned = false;
+    ov.posOff = 0; ov.nrmOff = -1; ov.uvOff = -1; ov.colOff = -1;
+    if (base == nullptr || ov.nverts == 0 || stride < 12 || (stride % 4) != 0)
+        return;
+
+    const uint32_t n = std::min(ov.nverts, 64u);
+    const uint32_t step = std::max(1u, ov.nverts / n);
+
+    auto sampleFloat3Unit = [&](uint32_t off) {
+        if (off + 12 > stride) return false;
+        uint32_t ok = 0, seen = 0;
+        for (uint32_t k = 0; k < ov.nverts && seen < n; k += step, ++seen) {
+            float v[3];
+            std::memcpy(v, base + size_t(k) * stride + off, 12);
+            if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2]))
+                continue;
+            const float l = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            if (l > 0.9f && l < 1.1f) ++ok;
+        }
+        return seen > 0 && ok * 4 >= seen * 3;
+    };
+    auto sampleFloat2UV = [&](uint32_t off) {
+        if (off + 8 > stride) return false;
+        uint32_t ok = 0, seen = 0;
+        for (uint32_t k = 0; k < ov.nverts && seen < n; k += step, ++seen) {
+            float v[2];
+            std::memcpy(v, base + size_t(k) * stride + off, 8);
+            if (modFloatPlausible(v[0], 64.f) && modFloatPlausible(v[1], 64.f))
+                ++ok;
+        }
+        return seen > 0 && ok * 4 >= seen * 3;
+    };
+    auto sampleColor = [&](uint32_t off) {
+        if (off + 4 > stride) return false;
+        uint32_t ok = 0, seen = 0;
+        for (uint32_t k = 0; k < ov.nverts && seen < n; k += step, ++seen)
+            if (modLooksColorDword(base + size_t(k) * stride + off)) ++ok;
+        return seen > 0 && ok * 4 >= seen * 3;
+    };
+
+    uint32_t cur = 12;                              // position occupies 0..11
+    if (sampleFloat3Unit(cur)) { ov.nrmOff = int(cur); cur += 12; }
+    // a colour can sit before or after the UV set; take the first one found
+    for (uint32_t off = cur; off + 4 <= stride; off += 4)
+        if (sampleColor(off)) { ov.colOff = int(off); break; }
+    if (ov.colOff == int(cur)) cur += 4;
+    if (sampleFloat2UV(cur)) ov.uvOff = int(cur);
+    else                                            // colour between nrm and uv
+        for (uint32_t off = cur; off + 8 <= stride; off += 4) {
+            if (int(off) == ov.colOff) continue;
+            if (sampleFloat2UV(off)) { ov.uvOff = int(off); break; }
+        }
+
+    sp_log("[modmesh] sec%u: static vertex layout sniffed - stride %u, "
+           "pos 0, nrm %d, uv %d, col %d\n",
+           secIdx, stride, ov.nrmOff, ov.uvOff, ov.colOff);
+    if (ov.uvOff < 0)
+        sp_log("[modmesh] sec%u: no UV channel recognised in a %u-byte vertex "
+               "- the import will keep the original UVs where it can; add "
+               "\"layout=stride:%u,pos:0,nrm:%d,uv:<offset>\" to the sidecar "
+               "if the section is textured\n",
+               secIdx, stride, stride, ov.nrmOff);
+}
+
+} // namespace
 
 static std::vector<std::optional<modmesh::BuiltSection>>
 modBuildSectionsForMesh(Mod *mod, nglMesh *Mesh)
@@ -2614,6 +3992,11 @@ modBuildSectionsForMesh(Mod *mod, nglMesh *Mesh)
     if (!scene)
         return {};
 
+    if (!scene->anims.empty())
+        sp_log("[modmesh] \"%s\": %u animation clip(s) in the file\n",
+               mod->Path.filename().string().c_str(),
+               unsigned(scene->anims.size()));
+
     std::vector<modmesh::OrigSectionView> views;
     views.reserve(Mesh->NSections);
     for (auto i = 0u; i < Mesh->NSections; ++i) {
@@ -2624,10 +4007,144 @@ modBuildSectionsForMesh(Mod *mod, nglMesh *Mesh)
         ov.verts       = (const float *)S->field_3C.m_vertexData;
         ov.palette     = S->BonesIdx;
         ov.nbones      = S->NBones;
+        // A section that already carries a replacement stores its real rows
+        // BEHIND the morph dead zone. Reading from row 0 handed the weight
+        // transfer a block of all-zero donors: every corner then fell into the
+        // degenerate branch, every vertex ended up rigid on palette slot 0, and
+        // the whole body collapsed onto the root bone.
+        const ModSectionStorage *st = modLiveStorage(S);
+        if (st != nullptr) {
+            const uint32_t stride = st->strideBytes ? st->strideBytes : 64u;
+            ov.verts = (const float *)((const uint8_t *)ov.verts
+                                       + size_t(st->baseVertex) * stride);
+            ov.nverts = st->nverts;
+        }
+        // Which family is this? The stride is the discriminator - the retail
+        // skinned row is exactly 64 bytes - but a static vertex can be 64
+        // bytes wide too, so the blend lanes are checked before trusting it.
+        // Everything that is not the skinned row gets its layout sniffed.
+        const bool skinned64 =
+            ov.strideBytes == 64 && ov.verts != nullptr && ov.nverts > 0
+            && ((st != nullptr && !st->rigid)
+                || modLooksSkinned64((const uint8_t *)ov.verts, ov.nverts));
+        if (skinned64) {
+            ov.skinned = true;                    // defaults already describe it
+        } else if (ov.verts != nullptr && ov.nverts > 0) {
+            if (st != nullptr && st->rigid) {
+                // re-parse of a section we already replaced: reuse the layout
+                // the previous pass resolved instead of sniffing our own output
+                ov.skinned = false;
+                ov.posOff = st->layPos; ov.nrmOff = st->layNrm;
+                ov.uvOff  = st->layUv;  ov.colOff = st->layCol;
+            } else {
+                modSniffSectionLayout(ov, i);
+            }
+        }
         views.push_back(ov);
     }
 
-    return modmesh::buildSectionsForMesh(*scene, Mesh->Name->to_string(), views);
+    // reference frame for the importer's fit when the vertex views are not
+    // the retail 64-byte layout (prerelease/beta builds). We run BEFORE the
+    // bone-inversion loop of nglLoadMeshFileInternal, so Mesh->Bones still
+    // holds BIND POSE matrices: row 3 (floats 12..14 of the 4x4 storage) is
+    // the bone position in model space.
+    modmesh::OrigMeshRef ref;
+    // Hard upper bound for anything that ends up in BonesIdx: the engine
+    // indexes Mesh->Bones with it directly, so a palette entry >= NBones reads
+    // whatever sits behind the bone array.
+    ref.nbones = Mesh->NBones;
+    if (Mesh->NBones > 0 && Mesh->Bones != nullptr) {
+        const float *m = reinterpret_cast<const float *>(Mesh->Bones);
+        bool any = false;
+        ref.bonePos.reserve(size_t(Mesh->NBones) * 3);
+        for (int i = 0; i < Mesh->NBones; ++i, m += 16) {
+            const float *t = m + 12;
+            if (!std::isfinite(t[0]) || !std::isfinite(t[1]) || !std::isfinite(t[2])) {
+                // sentinel far outside any character: never position-matched
+                ref.bonePos.insert(ref.bonePos.end(), { 1e9f, 1e9f, 1e9f });
+                continue;
+            }
+            ref.bonePos.insert(ref.bonePos.end(), { t[0], t[1], t[2] });
+            if (!any) {
+                for (int k = 0; k < 3; ++k)
+                    ref.bonesMin[k] = ref.bonesMax[k] = t[k];
+                any = true;
+                continue;
+            }
+            for (int k = 0; k < 3; ++k) {
+                ref.bonesMin[k] = std::min(ref.bonesMin[k], t[k]);
+                ref.bonesMax[k] = std::max(ref.bonesMax[k], t[k]);
+            }
+        }
+        ref.haveBones = any && (ref.bonesMax[1] - ref.bonesMin[1]) > 1e-4f;
+    }
+    if (std::isfinite(Mesh->SphereRadius) && Mesh->SphereRadius > 1e-4f
+        && std::isfinite(Mesh->field_20[0]) && std::isfinite(Mesh->field_20[1])
+        && std::isfinite(Mesh->field_20[2]))
+    {
+        ref.sphereCenter[0] = Mesh->field_20[0];
+        ref.sphereCenter[1] = Mesh->field_20[1];
+        ref.sphereCenter[2] = Mesh->field_20[2];
+        ref.sphereRadius    = Mesh->SphereRadius;
+        ref.haveSphere      = true;
+    }
+
+    return modmesh::buildSectionsForMesh(
+        *scene, Mesh->Name != nullptr ? Mesh->Name->to_string() : "",
+        views, ref);
+}
+
+// ---------------------------------------------------------------------------
+// FBX animation clips -> the mod.h carriers (modAnimClip).
+//
+// modmesh::loadScene() caches by path, so this re-uses the Scene already
+// parsed for the mesh replacement. Call it AFTER the mesh has been through
+// modBuildSectionsForMesh at least once: that is where every
+// AnimChannel::skelIndex gets resolved against the TARGET mesh's bone array
+// (bind-pose cluster match first, Bone_N name digits as fallback). Channels
+// that stay at skelIndex -1 animate a node this mesh has no bone for and
+// must not be played.
+//
+// Conventions of the converted clips:
+//   - key times and durations in SECONDS (ticksPerSecond = 1.0),
+//   - positions in game units (the importer's sceneScale bake),
+//   - rotations as x y z w quaternions with the FBX RotationOrder and
+//     Pre/PostRotation already folded in - each channel IS the bone's local
+//     transform in parent space, composed T*R*S
+//     (modmesh::channelLocalMatrix() does that composition if preferred).
+// ---------------------------------------------------------------------------
+[[maybe_unused]] static void modCollectFbxAnimations(Mod *mod,
+                                                     std::vector<modAnimClip> &out)
+{
+    auto scene = modmesh::loadScene(mod->Path.string(),
+                                    mod->Data.data(), mod->Data.size());
+    if (!scene || scene->anims.empty())
+        return;
+
+    out.reserve(out.size() + scene->anims.size());
+    for (const auto &clip : scene->anims) {
+        modAnimClip mc;
+        mc.name           = clip.name;
+        mc.duration       = clip.duration;
+        mc.ticksPerSecond = 1.0;                 // times are seconds
+        mc.channels.reserve(clip.channels.size());
+        for (const auto &ch : clip.channels) {
+            modBoneChannel bc;
+            bc.boneName  = ch.boneName;
+            bc.skelIndex = ch.skelIndex;
+            bc.positions.reserve(ch.pos.size());
+            for (const auto &k : ch.pos)
+                bc.positions.push_back({ k.t, k.v[0], k.v[1], k.v[2] });
+            bc.rotations.reserve(ch.rot.size());
+            for (const auto &k : ch.rot)
+                bc.rotations.push_back({ k.t, k.q[0], k.q[1], k.q[2], k.q[3] });
+            bc.scales.reserve(ch.scl.size());
+            for (const auto &k : ch.scl)
+                bc.scales.push_back({ k.t, k.v[0], k.v[1], k.v[2] });
+            mc.channels.push_back(std::move(bc));
+        }
+        out.push_back(std::move(mc));
+    }
 }
 #endif // MOD_MESH_SUPPORT
 
@@ -2713,7 +4230,9 @@ bool modBindRawPCMesh(nglMeshFile *MeshFile, const char *ext)
 #endif
 
 
-bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFile, const char *ext)
+static bool nglLoadMeshFileInternalPC(const tlFixedString &FileName,
+                                      nglMeshFile *MeshFile,
+                                      const char *ext)
 {
     TRACE("nglLoadMeshFileInternal", FileName.to_string());
 
@@ -2731,6 +4250,27 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
             Mod* replacementMesh = nullptr;
             if (!modBindRawPCMesh(MeshFile, ext))
                 replacementMesh = getMod(MeshFile->FileName.m_hash, TLRESOURCE_TYPE_MESH);
+            // A mesh file load IS the reload event: the materials this pass is
+            // about to resolve are new objects on addresses the previous
+            // load's materials were freed from, and any texture cached for the
+            // previous load may or may not have survived. Opening a new epoch
+            // makes every cross-load reuse conditional on the engine
+            // confirming the pointer, instead of assumed.
+            if (replacementMesh != nullptr)
+                modTexCacheNewEpoch(MeshFile->FileName.to_string());
+            // discovery aid for hash-only pack entries (prerelease/beta
+            // packs): log every mesh file identity once, so the exact name
+            // OR literal hash to give a mods/*.fbx is in the log
+            if (replacementMesh == nullptr) {
+                static std::unordered_set<uint32_t> seenMeshFiles;
+                if (seenMeshFiles.insert(MeshFile->FileName.m_hash).second)
+                    sp_log("[modmesh] mesh file \"%s\" hash 0x%08X - replace "
+                           "with mods/%s.obj|.fbx or mods/0x%08X.obj|.fbx\n",
+                           MeshFile->FileName.to_string(),
+                           MeshFile->FileName.m_hash,
+                           MeshFile->FileName.to_string(),
+                           MeshFile->FileName.m_hash);
+            }
 #       endif
 
         nglMeshFileHeader *Header = CAST(Header, MeshFile->FileBuf.Buf);
@@ -2899,9 +4439,14 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
                         if (!replacementMesh && dbgReplaceMesh)
                             replacementMesh = dbgReplaceMesh;
 #                   endif
-                    // one importer pass per nglMesh; sections apply below
+                    // One importer pass per nglMesh; sections apply below.
+                    // Never on a mesh that already went through the load tail:
+                    // its section vertex streams have been packed float->int by
+                    // the us_character path, and re-importing from them feeds
+                    // the weight transfer garbage donor weights.
                     std::vector<std::optional<modmesh::BuiltSection>> builtSections;
-                    if (replacementMesh)
+                    bool anySectionReplaced = false;
+                    if (replacementMesh && (Mesh->Flags & NGLMESH_PROCESSED) == 0)
                         builtSections = modBuildSectionsForMesh(replacementMesh, Mesh);
 #               endif
 
@@ -2941,7 +4486,15 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
                         const bool sectionReplaced =
                             idx_Section < builtSections.size()
                             && builtSections[idx_Section]
-                            && modApplyBuiltSection(MeshSection, *builtSections[idx_Section]);
+                            // an exact-round-trip piece keeps the VANILLA
+                            // buffers on purpose: retail morph playback (the
+                            // eddie reveal, visemes, facial animation) stays
+                            // live; only the texture retarget below runs
+                            && !builtSections[idx_Section]->keepGeometry
+                            && modApplyBuiltSection(MeshSection,
+                                                    *builtSections[idx_Section],
+                                                    int(Mesh->NBones));
+                        anySectionReplaced |= sectionReplaced;
 #                   endif
 
                     auto *v27 = MeshSection->m_indices;
@@ -3094,7 +4647,45 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
                             v42->BindSection(MeshSection);
                         }
                     }
+
+#                   if MOD_MESH_SUPPORT
+                        if (idx_Section < builtSections.size()
+                            && builtSections[idx_Section]
+                            && (sectionReplaced
+                                // round-trip pieces keep vanilla geometry but
+                                // still retarget: a recolor the user dropped
+                                // in mods/ (USM_BLACKSUIT.png) must land even
+                                // when nothing was swapped. Bytes that only
+                                // travelled with the FBX do not - see
+                                // userFilesOnly in the retarget
+                                || builtSections[idx_Section]->keepGeometry
+                                // a sidecar tex<N>= pin carries no geometry at
+                                // all: the record exists only to repaint
+                                || builtSections[idx_Section]->texExclusive)
+                            && replacementMesh != nullptr)
+                        {
+                            // An EMPTY candidate list is still worth a call:
+                            // the wrapper repairs a section whose material has
+                            // no diffuse texture (numbered-variant salvage,
+                            // then the sibling-donor fallback) and reports the
+                            // white-piece diagnostic if even that fails.
+                            modRetargetSectionTexture(MeshSection,
+                                *builtSections[idx_Section],
+                                replacementMesh->Path,
+                                int(idx_Section),
+                                Mesh);
+                        }
+#                   endif
                 }
+
+#               if MOD_MESH_SUPPORT
+                // Every section of this mesh is in place now: refit the mesh
+                // sphere before the engine aggregates the file-wide one below,
+                // so culling, LOD and the chase camera all see the geometry
+                // that is actually being drawn.
+                if (anySectionReplaced)
+                    modRecomputeMeshBounds(Mesh);
+#               endif
 
             } break;
             case TypeDirectoryEntry::MORPH: {
@@ -3225,7 +4816,13 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
                 }
             }
 
-            for (auto *Mesh = v67; Mesh != nullptr; Mesh = Mesh->NextMesh)
+            // NOTE: this used to start from `v67`, which the loop above has
+            // just walked to nullptr - so the body never ran and boned meshes
+            // NEVER got NGLMESH_PROCESSED. A second parse of the same buffer
+            // then re-ran nglRebaseMesh over already-live pointers AND inverted
+            // Mesh->Bones a second time, which is the "melted / exploding
+            // character on load" case. Restart from the list head like retail.
+            for (auto *Mesh = MeshFile->FirstMesh; Mesh != nullptr; Mesh = Mesh->NextMesh)
             {
                 if ((Mesh->Flags & NGLMESH_PROCESSED) == 0)
                 {
@@ -3256,6 +4853,20 @@ bool nglLoadMeshFileInternal(const tlFixedString &FileName, nglMeshFile *MeshFil
     }
     return true;
 
+}
+
+bool nglLoadMeshFileInternal(const tlFixedString &FileName,
+                             nglMeshFile *MeshFile,
+                             const char *ext)
+{
+#ifdef OPENUSM_XBPACK_MODE
+    if (MeshFile != nullptr && MeshFile->FileBuf.Buf != nullptr &&
+        std::memcmp(MeshFile->FileBuf.Buf, "XBXM", 4) == 0) {
+        return nglLoadMeshFileInternalXbox(FileName, MeshFile, ext);
+    }
+#endif
+
+    return nglLoadMeshFileInternalPC(FileName, MeshFile, ext);
 }
 #endif
 
@@ -3562,7 +5173,14 @@ nglMesh *nglCreateMeshClone(nglMesh *a1)
     if (newMesh->NBones != 0) {
         newMesh->Bones = static_cast<decltype(newMesh->Bones)>(
             tlMemAlloc(newMesh->NBones << 6, 64, 0x1000000u));
-        std::copy(a1->Bones, a1->Bones + (newMesh->NBones << 6), newMesh->Bones);
+        // NBones << 6 is the size in BYTES (one bone matrix is 64 bytes).
+        // std::copy walks ELEMENTS, so the old
+        //     std::copy(a1->Bones, a1->Bones + (NBones << 6), ...)
+        // read and wrote NBones * 64 matrices - a 64x overrun of both the
+        // source and the freshly allocated destination. Every character actor
+        // goes through this clone, so it smashed the heap right behind the
+        // bone array (palettes, section headers) on every hero/NPC spawn.
+        std::copy_n(a1->Bones, newMesh->NBones, newMesh->Bones);
     } else {
         newMesh->Bones = nullptr;
     }
@@ -3608,7 +5226,7 @@ void mNglQuad::custom_unmash(mash_info_struct *a2, void *a3)
     TRACE("mNglQuad::custom_unmash");
     mString *v5 = nullptr;
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
     struct {
         int m_size;
         char *guts;
@@ -3716,35 +5334,93 @@ void nglCopySection(nglMesh *DstMesh, int a2, nglMesh *SrcMesh, int a4)
         // Importer-replaced sections can differ in vertex/index count from
         // what the destination (an actor's buffered work-mesh clone) was
         // created with, and the fixed-size memcpy below would shred them.
-        // Mirror the stored replacement onto the destination instead; the
-        // mirror is idempotent per source revision, so the per-frame
-        // actor::swap_all_mesh_buffers copy costs a map lookup after the
-        // first application.
-        if (auto src = modSectionRegistry.find(SrcSection);
-            src != modSectionRegistry.end())
+        // Mirror the stored replacement onto the destination instead. Once
+        // the counts are mirrored, the per-frame call still refreshes the
+        // VB contents from storage: this per-frame copy IS the vanilla
+        // behaviour, and it is what resets the morph deltas retail facial
+        // animation wrote last frame (without it they accumulate).
+        // Both ends go through modLiveStorage: a stale entry left behind by a
+        // destroyed section whose address got recycled would otherwise mirror
+        // one character's geometry and bone palette onto another's section.
+        if (ModSectionStorage *src = modLiveStorage(SrcSection);
+            src != nullptr && SrcSection != DstSection)
         {
-            ModSectionStorage &dst = modSectionRegistry[DstSection];
-            if (dst.mirroredRevision != src->second.revision) {
+            ModSectionStorage *live = modLiveStorage(DstSection);
+            if (live == nullptr || live->mirroredRevision != src->revision) {
                 ModSectionStorage next;                 // self-contained copy
-                next.vertices    = src->second.vertices;
-                next.idx16       = src->second.idx16;
-                next.idx32       = src->second.idx32;
-                next.nverts      = src->second.nverts;
-                next.nidx        = src->second.nidx;
-                next.paddedVerts = src->second.paddedVerts;
-                next.weightClass = src->second.weightClass;
-                next.wide        = src->second.wide;
+                next.vertices    = src->vertices;
+                next.idx16       = src->idx16;
+                next.idx32       = src->idx32;
+                next.nverts      = src->nverts;
+                next.nidx        = src->nidx;
+                next.paddedVerts = src->paddedVerts;
+                next.baseVertex  = src->baseVertex;
+                next.origVerts   = live != nullptr
+                                 ? live->origVerts
+                                 : uint32_t(DstSection->NVertices > 0
+                                            ? DstSection->NVertices : 0);
+                next.weightClass = src->weightClass;
+                next.wide        = src->wide;
+                next.strideBytes = src->strideBytes;
+                next.rigid       = src->rigid;
+                next.layPos      = src->layPos;
+                next.layNrm      = src->layNrm;
+                next.layUv       = src->layUv;
+                next.layCol      = src->layCol;
                 // fresh engine-ownable palette: the clone teardown
-                // tlMemFree's it, so it must never be shared with the source
-                next.setPalette(src->second.palette, src->second.nbones);
-                next.mirroredRevision = src->second.revision;
+                // tlMemFree's it, so it must never be shared with the source.
+                // A static section has none - and must not be given one.
+                if (!src->rigid)
+                    next.setPalette(src->palette, src->nbones);
+                next.mirroredRevision = src->revision;
+                ModSectionStorage &dst = modSectionRegistry[DstSection];
                 dst = std::move(next);
                 if (!modApplyStorageToSection(DstSection, dst)) {
                     modSectionRegistry.erase(DstSection);
                     return;             // leave the clone as-is this frame
                 }
+                // The corrected culling/camera sphere must travel with the
+                // geometry: the buffered clones are what the renderer draws,
+                // and until now they kept whatever sphere they were cloned
+                // with - stale vanilla bounds on a replaced body.
+                for (int k = 0; k < 4; ++k)
+                    DstSection->SphereCenter[k] = SrcSection->SphereCenter[k];
+                DstSection->SphereRadius = SrcSection->SphereRadius;
                 sp_log("[modmesh] mirrored replaced section onto work mesh "
                        "(%u verts, %u idx)\n", dst.nverts, dst.nidx);
+                return;
+            }
+            ModSectionStorage &dst = *live;
+            // counts already mirrored: refresh the vertex payload so morph
+            // deltas from the previous frame are wiped, like vanilla does
+            if (auto *vb = DstSection->field_3C.m_vertexBuffer;
+                vb != nullptr && !dst.vertices.empty())
+            {
+                void *p = nullptr;
+                if (SUCCEEDED(vb->lpVtbl->Lock(vb, 0, 0, &p, 0))) {
+                    std::memcpy(p, dst.vertices.data(),
+                                dst.vertices.size() * sizeof(float));
+                    vb->lpVtbl->Unlock(vb);
+                }
+            }
+            return;
+        }
+        // The SOURCE is vanilla but the DESTINATION clone holds a replaced
+        // section (a mesh-morph pose copy, or a mid-session reload that
+        // removed the mod). The vanilla memcpy below would read
+        // DstSection->field_3C.Size bytes from a smaller source buffer.
+        // Restore the destination from its own storage instead.
+        if (ModSectionStorage *dst = modLiveStorage(DstSection))
+        {
+            if (auto *vb = DstSection->field_3C.m_vertexBuffer;
+                vb != nullptr && !dst->vertices.empty())
+            {
+                void *p = nullptr;
+                if (SUCCEEDED(vb->lpVtbl->Lock(vb, 0, 0, &p, 0))) {
+                    std::memcpy(p, dst->vertices.data(),
+                                dst->vertices.size() * sizeof(float));
+                    vb->lpVtbl->Unlock(vb);
+                }
             }
             return;
         }
@@ -3823,6 +5499,10 @@ void *nglMeshMemAlloc(int Size, int Alignment, int a3) {
 }
 
 void nglReleaseAllTextures() {
+#if MOD_TEX_CACHE
+    // every pointer the mod texture cache holds is about to be freed
+    modTexCacheNewEpoch("nglReleaseAllTextures");
+#endif
     auto *vtbl = bit_cast<int(*)[1]>(nglTextureDirectory()->m_vtbl);
 
     assert((*vtbl)[0] == 0x00560770);
@@ -3833,6 +5513,11 @@ void nglReleaseAllTextures() {
 void nglReleaseTexture(nglTexture *Tex) {
     TRACE("nglReleaseTexture");
 
+#if MOD_TEX_CACHE
+    // the release may take the last reference: never let a cache hand this
+    // pointer out again without the engine confirming it first
+    modTexCacheForgetTexture(Tex);
+#endif
     CDECL_CALL(0x00773380, Tex);
 }
 
@@ -4320,7 +6005,32 @@ bool nglLoadTextureTM2(nglTexture *tex, uint8_t *a2)
         bool result = false;
         
         
-        if (auto data = getModDataByHash(tex->field_60.m_hash)) {
+        Mod *texMod = getMod(tex->field_60.m_hash, TLRESOURCE_TYPE_TEXTURE);
+        std::vector<uint8_t> texBytes;
+        if (texMod != nullptr && !readModFile(texMod, texBytes))
+            texBytes.clear();
+
+        if (!texBytes.empty()
+            && modLooksD3DXImage(texBytes.data(), texBytes.size())) {
+            // plain PNG/JPG/BMP/DDS mod replacing a pack texture: NEVER feed
+            // it to the engine container parser (its header reads would run
+            // wild on image bytes) - decode straight through D3DX
+            if (SUCCEEDED(D3DXCreateTextureFromFileInMemory(
+                    g_Direct3DDevice(), texBytes.data(),
+                    uint32_t(texBytes.size()), &tex->DXTexture))
+                && tex->DXTexture != nullptr) {
+                tex->field_38 = -1;
+                sp_log("[modmesh] texture \"%s\" decoded via D3DX\n",
+                       tex->field_60.to_string());
+                return true;
+            }
+            sp_log("[modmesh] texture \"%s\": D3DX rejected the mod image\n",
+                   tex->field_60.to_string());
+        }
+
+        if (!texBytes.empty()) {
+            a2 = texBytes.data();          // engine-container texture mod
+        } else if (auto data = getModDataByHash(tex->field_60.m_hash)) {
             a2 = data;
         }
 
@@ -4866,6 +6576,13 @@ nglMesh *nglGetMesh(const tlHashString &a1, bool a2)
 
 void nglDestroySection(nglMeshSection *a1)
 {
+#if MOD_MESH_SUPPORT
+    // The palette tlMemFree'd below is the one we handed the section, and the
+    // section address itself is about to be recycled. Drop the replacement
+    // storage now so nothing can be mirrored from (or onto) a dead section.
+    modForgetSection(a1);
+#endif
+
     if (a1->m_indexBuffer != nullptr)
     {
         nglVertexBuffer::sub_77B5D0((nglVertexBuffer *) &a1->m_indexBuffer, ResourceType::IndexBuffer);
@@ -6231,3 +7948,15 @@ void ngl_patch()
     us_pcuv_patch();
 #endif
 }
+
+#ifdef OPENUSM_XBPACK_MODE
+void ngl_xbpack_patch()
+{
+    REDIRECT(0x0056BDAA, nglLoadMeshFileInternal);
+    REDIRECT(0x0056C126, nglLoadMeshFileInternal);
+    REDIRECT(0x0056C244, nglLoadMeshFileInternal);
+    REDIRECT(0x0076FF90, nglLoadMeshFileInternal);
+    REDIRECT(0x007700D9, nglLoadMeshFileInternal);
+    REDIRECT(0x00778649, nglLoadMeshFileInternal);
+}
+#endif

@@ -143,6 +143,16 @@ struct script_executable {
 
     void load(const resource_key &a1);
 
+    // Same loader against an arbitrary directory (trailing separator
+    // included) instead of the built-in "scripts\", optionally under an
+    // explicit base filename instead of the one string_hash::to_string()
+    // derives from the key -- which for a hash the engine's string table does
+    // not know is a synthetic rendering, not the script's name. Used to read a
+    // chunk-format .pcsx dropped under the mod root; see modPCSXGetChunkDir
+    // (script_object.h) and script_manager::load.
+    void load(const resource_key &a1, const mString &dir,
+              const mString &name_override = mString {});
+
     //0x005B0470
     void release_mem();
 

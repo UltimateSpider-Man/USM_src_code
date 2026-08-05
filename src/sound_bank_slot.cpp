@@ -65,13 +65,11 @@ void sound_bank_slot::load(const char *a1, const char *a2, bool a4, int a5)
 
     // WAV mod loader (mod.h): the engine has just kicked off the WBK
     // streaming for (a1 = scene, a2 = bank), which means audio init is long
-    // done — upload every *.wav registered by enumerate_mods() into a
+    // done - upload every *.wav registered by enumerate_mods() into a
     // DirectSound secondary buffer on the game's own device. A wav named
     // exactly like the bank (mods/<a2>.wav) also plays here once, as an
     // audible confirmation that the override pipeline is live.
     modWav_onSoundBankLoad(a1, a2);
-
-    //assert(0);
 }
 
 void sound_bank_slot::frame_advance(Float a2)

@@ -12,6 +12,9 @@
 #include <set>
 
 #include <cstdio>
+#include <cstdint>
+#include <filesystem>
+#include <vector>
 
 struct chunk_file;
 struct vm_executable;
@@ -291,5 +294,45 @@ public:
         void *user_data);
 
 };
+
+// ---------------------------------------------------------------------------
+// .PCSX mods (script_object.cpp)
+//
+// A .pcsx dropped under the mod root is a packer-produced script_executable
+// mash image (generic_mash_header + object image + mashed data with the exec
+// code embedded — the same self-contained bytes a retail pack serves for
+// RESOURCE_KEY_TYPE_SCRIPT). enumerate_mods() validates+registers them via
+// modPCSXRegister under to_hash(stem) — the stem is the script name, e.g.
+// extra/M01_INTRO.pcsx overrides the "m01_intro" script, and a stem that
+// exists in no loaded pack is injected as a brand-new loadable script — and
+// resource_manager::get_resource swaps the retail bytes for the mod image
+// via modPCSXGetOverride when script_manager::load fetches the blob.
+// ---------------------------------------------------------------------------
+
+// Structural gate: header safety key, plain-object mash shape (class_id
+// 0xFFFF, no vtable flag), mash-data offset.
+extern bool modPCSXImageUsable(const uint8_t *bytes, size_t size);
+
+// Validate + register one .pcsx under to_hash(stem) (and its literal-hash
+// stem, if the name parses as one). Called by enumerate_mods().
+extern bool modPCSXRegister(const std::filesystem::path &path,
+                            std::vector<uint8_t> &&fileData);
+
+// Writable image for the script name hash, or nullptr. Re-stamped from the
+// pristine master bytes whenever no loaded exec is using it, so every load
+// un_mashes and links virgin bytes like a re-streamed pack image.
+extern uint8_t *modPCSXGetOverride(uint32_t nameHash, int *sizeOut);
+
+// True when the bytes are a CHUCK-compiler chunk script, i.e. a text file
+// whose first token is "scrobjs" -- the form a .pcsx on disk actually has,
+// as opposed to a mash image lifted out of a pack.
+extern bool modPCSXIsChunkImage(const uint8_t *bytes, size_t size);
+
+// Directory (trailing separator included) and file stem of a registered
+// chunk-format .pcsx for this script, or false if none. script_manager::load
+// hands both to script_executable::load in place of "scripts\" and the
+// name string_hash::to_string() would have produced.
+extern bool modPCSXGetChunkDir(uint32_t nameHash, std::string *dirOut = nullptr,
+                               std::string *stemOut = nullptr);
 
 extern void script_instance_patch();

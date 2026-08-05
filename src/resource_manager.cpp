@@ -2,6 +2,7 @@
 
 #include "binary_search_array_cmp.h"
 #include "common.h"
+#include "entity_base.h"
 #include "filespec.h"
 #include "func_wrapper.h"
 #include "game.h"
@@ -19,6 +20,7 @@
 #include "resource_amalgapak_header.h"
 #include "resource_directory.h"
 #include "return_address.h"
+#include "script_object.h"
 #include "utility.h"
 #include "variables.h"
 #include "worldly_pack_slot.h"
@@ -1149,7 +1151,7 @@ bool get_resource_if_exists(const resource_key &resource_id,
 uint8_t *get_resource(const resource_key &resource_id, int *mash_data_size, resource_pack_slot **a3)
 {
     TRACE("resource_manager::get_resource", resource_id.get_platform_string(g_platform).c_str());
-    
+
     if constexpr (1)
     {
         assert(!g_is_the_packer() && "Don't call this function while packing!");
@@ -1159,7 +1161,67 @@ uint8_t *get_resource(const resource_key &resource_id, int *mash_data_size, reso
 
         auto *result = get_resource_context()->get_resource(resource_id, mash_data_size, a3);
 
-        //sp_log("resource_manager::get_resource:");
+        // .ENT mod override (entity_base.cpp): every named-entity fetch -
+        // dynamic spawns, fx caches, console "spawn" - funnels through here
+        // (SET_JUMP at 0x00531B30 routes the retail callers in), so a
+        // validated extra/<name>.ent image replaces the retail bytes at the
+        // one spot that knows the class-name key. Only bytes and size are
+        // swapped: the pack slot the retail lookup produced stays, keeping
+        // instance tracking and pack-unload teardown intact - which is also
+        // why an entity absent from every loaded pack cannot be injected
+        // (there is no slot to own it). ENTITY only: an EXTERNAL_ENT
+        // (.ENTEXT) request shares the same name hash but expects a
+        // different payload, so handing it the mash image would be wrong.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_ENTITY)
+        {
+            int overrideSize = 0;
+            if (uint8_t *img = modEntGetOverride(resource_id.m_hash.source_hash_code,
+                                                 &overrideSize))
+            {
+                if (result == nullptr)
+                {
+                    sp_log("[mod] ent override 0x%08X: entity not in any loaded "
+                           "pack, cannot inject a brand-new entity - skipped",
+                           resource_id.m_hash.source_hash_code);
+                }
+                else
+                {
+                    sp_log("[mod] serving ent override for \"%s\" (%d bytes)",
+                           resource_id.m_hash.to_string(), overrideSize);
+                    if (mash_data_size != nullptr)
+                        *mash_data_size = overrideSize;
+                    result = img;
+                }
+            }
+        }
+
+        // .PCSX mod override (script_object.cpp): script_manager::load and
+        // script_manager::is_loadable fetch every script-executable blob
+        // through here, so a validated extra/<name>.pcsx image replaces the
+        // retail bytes at the one spot that knows the script name key.
+        // Unlike the .ENT case above no pack slot is involved in the exec's
+        // lifetime — it is governed by script_manager's exec map plus
+        // release_generic_mash on the image itself — so a script absent
+        // from every loaded pack CAN be injected: the override also makes
+        // is_loadable() report it, which is what lets brand-new scripts
+        // load. SCRIPT only: SCRIPT_INST/GV/SV requests share the name hash
+        // but expect different payloads, so handing them this image would
+        // be wrong.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_SCRIPT)
+        {
+            int overrideSize = 0;
+            if (uint8_t *img = modPCSXGetOverride(resource_id.m_hash.source_hash_code,
+                                                  &overrideSize))
+            {
+                sp_log("[mod] serving pcsx override for \"%s\" (%d bytes)%s",
+                       resource_id.m_hash.to_string(), overrideSize,
+                       result == nullptr ? " [not in any pack - injected as new]"
+                                         : "");
+                if (mash_data_size != nullptr)
+                    *mash_data_size = overrideSize;
+                result = img;
+            }
+        }
 
         return result;
     }
@@ -1178,7 +1240,12 @@ void resource_manager_patch()
 
     SET_JUMP(0x00537530, resource_manager::pop_resource_context);
 
-    //REDIRECT(0x00594836, resource_manager::get_resource);
+    // Route every retail get_resource caller (the dynamic-spawn body at
+    // 0x005E0A10, fx caches at 0x00594836, ...) through the reimplementation
+    // above so the .ENT mod override sees all of them. The reimplementation
+    // is complete (context->get_resource -> retail 0x0052AA70) and never
+    // calls back into 0x00531B30, so the detour cannot recurse.
+    SET_JUMP(0x00531B30, resource_manager::get_resource);
 
     {
         resource_pack_slot * (* func)(resource_pack_slot *) = &resource_manager::get_best_context;
@@ -1207,3 +1274,14 @@ void resource_manager_patch()
         REDIRECT(0x0055A371, resource_manager::configure_packs_by_memory_map);
     }
 }
+
+
+void resource_manager2_patch()
+{
+
+    SET_JUMP(0x00531B30, resource_manager::get_resource);
+
+
+    
+}
+

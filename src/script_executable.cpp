@@ -505,14 +505,24 @@ static constexpr auto CHUCK_STR_MAX_LENGTH = 47u;
 
 void script_executable::load(const resource_key &resource_id)
 {
+    this->load(resource_id, mString {"scripts\\"});
+}
+
+void script_executable::load(const resource_key &resource_id, const mString &dir,
+                            const mString &name_override)
+{
     TRACE("script_executable::load", resource_id.get_platform_string(3).c_str());
 
     script_manager::run_callbacks((script_manager_callback_reason)3, this, nullptr);
-    
+
     filespec v98 {mString {resource_id.m_hash.to_string()}};
     //if ( v98.m_dir == mString::null() && script_manager::using_chuck_old_fashioned() )
     {
-        v98.m_dir = mString {"scripts\\"};
+        v98.m_dir = dir;
+    }
+
+    if ( name_override.size() > 0 ) {
+        v98.m_name = name_override;
     }
 
     this->field_0 = fixedstring<8>{v98.m_name.c_str()};
