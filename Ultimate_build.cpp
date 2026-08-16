@@ -146,6 +146,7 @@
 #include "meta_anim_interact.h"
 #include "motion_effect_struct.h"
 #include "mission_manager.h"
+#include "mission_manager_script_data.h"
 #include "morph_file_resource_handler.h"
 #include "debug_render.h"
 #include "moved_entities.h"
@@ -296,6 +297,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <dinput.h>
 #include <direct.h>
 
@@ -318,6 +320,7 @@
 #include "info_node.h"
 #include "entity_base_vhandle.h"
 
+static Var<bool> sounds_paused3{0x00960044};
 
 namespace fs = std::filesystem;
 
@@ -2654,6 +2657,11 @@ void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
         read_and_update_controller_key_button(joy, 9, MENU_SELECT);
 		read_and_update_controller_key_button(joy, 8, MENU_START);
 
+	// DS4 shoulder/trigger buttons in DirectInput order.
+	read_and_update_controller_key_button(joy, 4, MENU_L1);
+	read_and_update_controller_key_button(joy, 6, MENU_L2);
+	read_and_update_controller_key_button(joy, 7, MENU_R2);
+
 	read_and_update_controller_key_dpad(joy, 0, MENU_UP);
 	read_and_update_controller_key_dpad(joy, 9000, MENU_RIGHT);
 	read_and_update_controller_key_dpad(joy, 18000, MENU_DOWN);
@@ -2890,6 +2898,66 @@ else if (is_menu_key_clicked(MENU_LEFT, keyboard)) { // Use is_menu_key_clicked 
 typedef int (__stdcall* GetDeviceState_ptr)(IDirectInputDevice8*, DWORD, LPVOID);
 GetDeviceState_ptr GetDeviceStateOriginal = nullptr;
 
+// Manual L2/R2 suit switching is intentionally restricted to the city's
+// non-story activity missions.  Do not use g_mission_type here: races such
+// as lm_storm_races can use non-zero mission-type values, so a broad
+// is_story_mission_active() test would incorrectly reject valid races.
+static bool is_suit_switch_activity_name(const char *name)
+{
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    // Explicit activity requested by name.  Accept a suffix/prefix variant as
+    // well because mission pack/script-data names are not always identical.
+    if (std::strcmp(name, "vmg_hot_pursuit2") == 0 ||
+        std::strstr(name, "vmg_hot_pursuit2") != nullptr) {
+        return true;
+    }
+
+    // Combat Tour scripts/packs use the combat/tour naming family.
+    if (std::strstr(name, "combat_tour") != nullptr ||
+        (std::strstr(name, "combat") != nullptr &&
+         std::strstr(name, "tour") != nullptr)) {
+        return true;
+    }
+
+    // Covers storm/venom/torch/etc. names that explicitly contain "race".
+    // The project's own mission menu also identifies trick races by the word
+    // "trick" alone, so accept that naming family too.
+    if (std::strstr(name, "race") != nullptr ||
+        std::strstr(name, "trick") != nullptr) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool is_l2_r2_suit_switch_activity_active(mission_manager *mm)
+{
+    if (mm == nullptr || !mm->is_mission_active() || mm->m_script == nullptr) {
+        return false;
+    }
+
+    // Check every mission identifier the retail manager keeps.  Depending on
+    // how the activity was launched, the useful name can be the active script
+    // name, the forced mission pack name, the script-data name, or the debug
+    // title.  The whitelist above means normal story/side missions still fail.
+    if (is_suit_switch_activity_name(mm->m_script->field_0.c_str())) {
+        return true;
+    }
+
+    if (is_suit_switch_activity_name(mm->field_88.to_string())) {
+        return true;
+    }
+
+    if (is_suit_switch_activity_name(mm->field_A8.to_string())) {
+        return true;
+    }
+
+    return is_suit_switch_activity_name(mission_manager::current_mission_debug_title.c_str());
+}
+
 HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* self, DWORD cbData, LPVOID lpvData) {
 
 	HRESULT res = GetDeviceStateOriginal(self, cbData, lpvData);
@@ -2953,6 +3021,52 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* self, DWORD cbData, LP
         //   has_focus == true  -> menu eats input, hero is frozen
         //   has_focus == false -> menu still drawn (dimmed), input passes
         //                         through to the game, hero can move
+        // L2/R2 work only in whitelisted NON-STORY activity missions:
+        // Combat Tours, races, and vmg_hot_pursuit2.  Free roam and all other
+        // missions (including the main story) leave the suit hotkeys disabled.
+        auto *mm = mission_manager::s_inst;
+        const bool suit_switch_activity_active =
+            is_l2_r2_suit_switch_activity_active(mm);
+
+        static bool blackSuitActive = false;
+        static bool SpideyActive = false;
+
+        // Mission scripts can change the hero, so reset the local suit state
+        // whenever the current mission is not one of the allowed activities.
+        if (!suit_switch_activity_active) {
+            blackSuitActive = false;
+            SpideyActive = false;
+        }
+
+        if (!keyboard && suit_switch_activity_active) {
+            // L2 -> normal Spider-Man.
+            if (is_menu_key_pressed(MENU_L2, keyboard)) {
+                if (!SpideyActive || blackSuitActive) {
+                    static string_hash s_spiderman{"switch_to_spiderman()"};
+                    if (script::gsoi() != nullptr) {
+                        script::sub_5028B0(s_spiderman, script::gsoi());
+                        script::exec_thread(0);
+
+                        SpideyActive = true;
+                        blackSuitActive = false;
+                    }
+                }
+            }
+
+            // R2 -> black suit.
+            if (is_menu_key_pressed(MENU_R2, keyboard)) {
+                if (!blackSuitActive || SpideyActive) {
+                    static string_hash s_blacksuit{"switch_to_blacksuit()"};
+                    if (script::gsoi() != nullptr) {
+                        script::sub_5028B0(s_blacksuit, script::gsoi());
+                        script::exec_thread(0);
+
+                        blackSuitActive = true;
+                        SpideyActive = false;
+                    }
+                }
+            }
+        }
         if (debug_enabled || debug_disabled) {
             bool toggle = false;
             if (keyboard && keys[DIK_TAB] == 2) {
@@ -6137,24 +6251,17 @@ void create_game_flags_menu(debug_menu* parent);
 
 // Character List (Script > Pop Character / Pop All Characters)
 // ----------------------------------------------------------------------------------
-// Implements the debug menu character spawning functionality:
-//   - "Pop Character"     : spawns the currently selected character near the hero
-//   - "Pop All Characters": spawns every character in the list near the hero
-//   - [character names]   : selecting one directly spawns that character
+// Native implementation of the character-lineup debug menu shown in the reference
+// video.  The entries live directly inside the root "Script" menu (no extra nested
+// Script submenu).  Selecting a character spawns it immediately and closes the menu.
 //
-// Characters are spawned via wds_entity_manager::create_and_add_entity_or_subclass
-// at the hero's current position with a small offset.
+// Spawning mirrors SpawnXCommand::process_cmd():
+//   * class hash from the character name
+//   * a unique entity id for every spawn
+//   * placement relative to the hero's orientation
+//   * create flags = 1
+//   * visibility + damage interface initialization
 // ----------------------------------------------------------------------------------
-
-
-#include "entity_base.h"
-#include "entity.h"
-#include "oldmath_po.h"
-#include "vector3d.h"
-#include "wds.h"
-#include "terrain.h"
-#include "string_hash.h"
-#include "mstring.h"
 
 static const char *g_character_names[] = {
     "alex_ohirn",
@@ -6228,165 +6335,84 @@ static const char *g_character_names[] = {
     "wolverine",
 };
 
-static constexpr int g_character_count = sizeof(g_character_names) / sizeof(g_character_names[0]);
+static constexpr int g_character_count =
+    static_cast<int>(sizeof(g_character_names) / sizeof(g_character_names[0]));
 
-// Tracks which character entry was last highlighted/selected in the list
-static int g_selected_character_index = 0;
-
-// Spawns a single character by name at the hero's position + offset
-static entity *spawn_character_at_hero(const char *char_name, float offset_x = 2.0f, float offset_z = 0.0f)
+// Spawn one character using the same native path as the spawn_x console command.
+// offset_x / offset_z are HERO-LOCAL offsets, so the character appears relative
+// to the direction the hero is facing rather than at a fixed world-space axis.
+static entity *spawn_character_at_hero(
+    const char *char_name,
+    float offset_x = 0.0f,
+    float offset_z = 2.0f)
 {
-    if (g_world_ptr == nullptr) {
-        return nullptr;
-    }
-
-    auto *hero = g_world_ptr->get_hero_ptr(0);
-    if (hero == nullptr) {
-        return nullptr;
-    }
-
-    // Build spawn transform from hero's current position
-    po spawn_po {identity_matrix};
-    auto &hero_po = hero->get_abs_po();
-    spawn_po = hero_po;
-
-    // Offset the spawn position so the character doesn't overlap the hero
-    auto hero_pos = hero->get_abs_position();
-    vector3d spawn_pos = hero_pos;
-    spawn_pos[0] += offset_x;
-    spawn_pos[2] += offset_z;
-    spawn_po.set_position(spawn_pos);
-
-    // Create entity using type_hash == id_hash (same name for both)
-    string_hash type_hash {char_name};
-    string_hash id_hash {char_name};
-    mString empty_str {};
-
-    auto *ent = g_world_ptr->ent_mgr.create_and_add_entity_or_subclass(
-        type_hash,
-        id_hash,
-        spawn_po,
-        empty_str,
-        129,
-        nullptr);
-
-    if (ent != nullptr) {
-        ent->set_visible(true, false);
-
-        auto *the_terrain = g_world_ptr->get_the_terrain();
-        if (the_terrain != nullptr) {
-            ent->compute_sector(the_terrain, 0, ent);
-        }
-
-        printf("[CharList] Spawned character: %s\n", char_name);
-    } else {
-        printf("[CharList] Failed to spawn character: %s\n", char_name);
-    }
-
-    return ent;
+    // Resource/pack work is unsafe inside the debug-menu callback.  The
+    // shared worker loads the character pack and creates the entity next tick.
+    queue_debug_character_spawn(char_name, offset_x, offset_z);
+    return nullptr;
 }
 
-// Handler: spawn a single character when its menu entry is selected
 static void character_select_handler(debug_menu_entry *entry)
 {
-    if (entry == nullptr) {
+    if ( entry == nullptr ) {
         return;
     }
 
-    // entry->text contains the character name
-    const char *char_name = entry->text;
-
-    // Update the selected index based on the entry's ID
-    g_selected_character_index = entry->get_id();
-
-    spawn_character_at_hero(char_name, 2.0f, 0.0f);
-    debug_menu::hide();
-}
-
-// Handler: "Pop Character" — spawns the last selected/highlighted character
-static void pop_character_handler(debug_menu_entry *entry)
-{
-    if (g_selected_character_index >= 0 && g_selected_character_index < g_character_count) {
-        const char *char_name = g_character_names[g_selected_character_index];
-        spawn_character_at_hero(char_name, 2.0f, 0.0f);
+    const int index = static_cast<int>(entry->get_id());
+    if ( index < 0 || index >= g_character_count ) {
+        return;
     }
 
+    spawn_character_at_hero(g_character_names[index]);
+
+    // The reference menu closes immediately after spawning a character.
     debug_menu::hide();
 }
 
-// Handler: "Pop All Characters" — spawns every character in the list
-static void pop_all_characters_handler(debug_menu_entry *entry)
+static void pop_character_handler(debug_menu_entry *)
 {
-    // Arrange characters in a grid pattern around the hero
-    float offset_x = 3.0f;
-    float offset_z = 0.0f;
-    const float spacing = 3.0f;
-    const int chars_per_row = 8;
+    queue_debug_character_pop();
+    debug_menu::hide();
+}
 
-    for (int i = 0; i < g_character_count; ++i) {
-        float row = static_cast<float>(i / chars_per_row);
-        float col = static_cast<float>(i % chars_per_row);
+static void pop_all_characters_handler(debug_menu_entry *)
+{
+    queue_debug_character_cleanup();
+    debug_menu::hide();
+}
 
-        float ox = (col - chars_per_row / 2.0f) * spacing;
-        float oz = (row + 1.0f) * spacing;
-
-        spawn_character_at_hero(g_character_names[i], ox, oz);
+static void populate_character_list_menu(debug_menu *menu)
+{
+    if ( menu == nullptr ) {
+        return;
     }
 
-    debug_menu::hide();
-}
+    // Do not append the lineup twice if debug initialization is called again.
+    for ( unsigned int i = 0; i < menu->used_slots; ++i ) {
+        if ( std::strcmp(menu->entries[i].text, "Pop Character") == 0 ) {
+            return;
+        }
+    }
 
-// Populates the character list submenu with Pop Character, Pop All, and all names
-static void populate_character_list_menu(debug_menu_entry *entry)
-{
-    auto *submenu = create_menu("Script", debug_menu::sort_mode_t::ascending);
-
-    debug_menu_entry v1;
-    debug_menu_entry *block = v1.alloc_block(submenu, 4);
-    block[0] = debug_menu_entry{submenu};
-    entry->set_submenu(submenu);
-
-    // --- "Pop Character" entry ---
     {
-        auto *pop_entry = create_menu_entry(mString{"Pop Character"});
-        pop_entry->set_game_flags_handler(pop_character_handler);
-        pop_entry->set_id(0);
-        submenu->add_entry(pop_entry);
+        auto *entry = create_menu_entry(mString {"Pop Character"});
+        entry->set_game_flags_handler(pop_character_handler);
+        menu->add_entry(entry);
     }
 
-    // --- "Pop All Characters" entry ---
     {
-        auto *pop_all_entry = create_menu_entry(mString{"Pop All Characters"});
-        pop_all_entry->set_game_flags_handler(pop_all_characters_handler);
-        pop_all_entry->set_id(1);
-        submenu->add_entry(pop_all_entry);
+        auto *entry = create_menu_entry(mString {"Pop All Characters"});
+        entry->set_game_flags_handler(pop_all_characters_handler);
+        menu->add_entry(entry);
     }
 
-    // --- Individual character entries ---
-    for (int i = 0; i < g_character_count; ++i) {
-        auto *char_entry = create_menu_entry(mString{g_character_names[i]});
-        char_entry->set_game_flags_handler(character_select_handler);
-        char_entry->set_id(static_cast<uint16_t>(i));
-        submenu->add_entry(char_entry);
+    for ( int i = 0; i < g_character_count; ++i ) {
+        auto *entry = create_menu_entry(mString {g_character_names[i]});
+        entry->set_id(i);
+        entry->set_game_flags_handler(character_select_handler);
+        menu->add_entry(entry);
     }
 }
-
-// Creates the "Script" submenu and adds it to the parent (root) debug menu
-void create_character_list_menu(debug_menu *parent)
-{
-    auto *char_list_menu = create_menu("Script");
-
-    debug_menu_entry v1;
-    debug_menu_entry *block = v1.alloc_block(char_list_menu, 4);
-    block[0] = debug_menu_entry{char_list_menu};
-
-    auto *entry = create_menu_entry(char_list_menu);
-    entry->set_submenu(nullptr);
-    entry->set_game_flags_handler(populate_character_list_menu);
-    parent->add_entry(entry);
-}
-
-
 
 
 void create_script_menu()
@@ -6398,7 +6424,7 @@ void create_script_menu()
         debug_menu_entry* block = v1.alloc_block(script_menu, 4);
         block[0] = debug_menu_entry{ script_menu };
         debug_menu::root_menu->add_entry(script_menu);
-		//  create_character_list_menu(script_menu);
+        populate_character_list_menu(script_menu);
     }
 }
 
@@ -6666,6 +6692,7 @@ game_process mainflow_proc{ "main", main_flow, 3 };
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -7298,7 +7325,8 @@ void menu_setup(int game_state, int keyboard) {
                 current_menu = debug_menu::root_menu;
                 custom();
 		
-				
+												                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
+                sounds_paused3() = true;
             }
 
  }
@@ -7718,7 +7746,7 @@ BOOL install_redirects()
 	
 
     //SET_JUMP(0x0077A870, nglLoadTextureTM2);
-		
+    tlresource_directory2_patch();		
 
     return true;
 
@@ -7727,8 +7755,6 @@ BOOL install_redirects()
     wds_camera_manager_patch();
 
     resource_directory_patch();
-
-    tlresource_directory_patch();
 
 
     input_settings_patch();
@@ -8419,24 +8445,37 @@ std::vector<uint8_t> read_file(const fs::path& filePath) {
 
 
 
-void enumerate_mods() {
-    Mods.clear();
-    ModFileOverrides.clear();
+int modPCANIMDetectTLType(const uint8_t *raw, size_t size, int preferredType);
+// Typed external-resource registries implemented in resource_manager.cpp.
+bool modBaiRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
+bool modAsgRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
+bool modMsnRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
+bool modPanelRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
+bool modCollRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
+bool modPcmeshdefRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
 
-    const fs::path modsDir = fs::current_path() / "mods";
+void enumerate_mods() {
+    modPS2SXResetRegistry();
+    Mods.clear();
+    nflSystem::ModFileOverrides.clear();
+
+    // External typed resources live in extra/. Keep the legacy mods/ root as
+    // a fallback for older installs that have not moved their loose files yet.
+    fs::path modsDir = fs::current_path() / "extra";
+    if (!fs::is_directory(modsDir))
+        modsDir = fs::current_path() / "mods";
     if (!fs::is_directory(modsDir))
         return;
 
     auto normalize_rel = [](std::string s) {
-        // lower case + backslashes
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return (char) std::tolower(c); });
         std::replace(s.begin(), s.end(), '/', '\\');
-        // trim leading .\\
         while (s.rfind(".\\", 0) == 0) s.erase(0, 2);
         return s;
     };
 
-    // Hash-name sidecars (mods/**/*hash*.txt) are parsed BEFORE the main
+    // Hash-name sidecars (extra/**/*hash*.txt) are parsed BEFORE the main
     // walk so the wav registration below can route friendly stems through
     // them (mod.h, "External hash -> name sidecars").
     ModWavHashNames.clear();
@@ -8458,37 +8497,96 @@ void enumerate_mods() {
 
         const fs::path& path = entry.path();
         std::string ext = transformToLower(path.extension().string());
+        const std::string stem = path.stem().string();
+        const uint32_t hash = to_hash(stem.c_str());
 
-        // 1) Exact file override table (used by NFL openFile hook)
-        //    Key is path relative to mods/, including extension.
+        // Structured external resources use their typed loaders so pristine
+        // source bytes are never handed to a consumer that rebases in place.
+        // This also lets them resolve when no same-name PCPACK entry exists.
+        if (ext != ".pcanim" && ext != ".pcsanim" && ext != ".pcmesh"
+            && ext != ".als" && ext != ".bai" && ext != ".asg"
+            && ext != ".msn" && ext != ".panel" && ext != ".coll"
+            && ext != ".pcmeshdef")
         {
             const fs::path rel = fs::relative(path, modsDir);
             const std::string relKey = normalize_rel(rel.generic_string());
-            ModFileOverrides[relKey] = path;
-
-            // Convenience: if a mod is placed under "mods/data/...", allow it to override
-            // the engine request "data\\..." directly.
-            if (relKey.rfind("data\\", 0) == 0) {
-                ModFileOverrides[relKey] = path;
-                ModFileOverrides[relKey.substr(5)] = path; // also allow without the leading "data\\"
-            }
+            nflSystem::ModFileOverrides[relKey] = path;
+            if (relKey.rfind("data\\", 0) == 0)
+                nflSystem::ModFileOverrides[relKey.substr(5)] = path;
         }
 
-        // PCM/float WAV -> DirectSound override, keyed by stem in the
-        // engine sound-hash space; literal-hash stems ("0x1189AB87.wav")
-        // and sidecar-named stems additionally bind to those hashes, which
-        // is what lets every voice line be overridden even when only its
-        // hash is known (mod.h). Playback hook: sound_instance_id.cpp.
         if (ext == ".wav") {
+            // PCM/float WAV (mono or stereo) -> PCM16 DirectSound override,
+            // keyed by stem in the engine sound-hash space (see mod.h)
             modWavRegister(path, read_file(path));
+								                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
+                sounds_paused3() = true;
+            continue;
+        }
+
+        if (ext == ".png") {
+            // decoded once here; the resulting A8R8G8B8 DDS blob rides the
+            // standard texture-mod path (getModDataByHash in nglLoadTextureTM2)
+            if (modPngRegisterFile(path, hash)) {
+                unsigned int ddsSize = 0;
+                if (auto *dds = modPngGetDDSByHash(hash, &ddsSize)) {
+                    Mods.emplace(hash, Mod{path, TLRESOURCE_TYPE_TEXTURE,
+                                           std::vector<uint8_t>(dds, dds + ddsSize)});
+                    printf("mod: png %s -> 0x%08X\n", stem.c_str(), hash);
+                }
+            }
+            continue;
+        }
+
+        if (ext == ".gif") {
+            if (modGifRegisterFile(path, hash)) {
+                unsigned int ddsSize = 0;
+                if (auto *dds = modGifGetDDSByHash(hash, &ddsSize))
+                    Mods.emplace(hash, Mod{path, TLRESOURCE_TYPE_TEXTURE,
+                                           std::vector<uint8_t>(dds, dds + ddsSize)});
+                printf("mod: gif %s -> 0x%08X\n", stem.c_str(), hash);
+            }
+            continue;
+        }
+
+        // External typed resources. These registries preserve pristine source
+        // bytes and resource_manager can serve them even with no PCPACK entry.
+        if (ext == ".als") {
+            modAlsRegister(path, read_file(path));
+            continue;
+        }
+        if (ext == ".bai") {
+            modBaiRegister(path, read_file(path));
+            continue;
+        }
+        if (ext == ".asg") {
+            modAsgRegister(path, read_file(path));
+            continue;
+        }
+        if (ext == ".msn") {
+            modMsnRegister(path, read_file(path));
+            continue;
+        }
+        if (ext == ".panel") {
+            modPanelRegister(path, read_file(path));
+            continue;
+        }
+        if (ext == ".coll") {
+            modCollRegister(path, read_file(path));
+            continue;
+        }
+        if (ext == ".pcmeshdef") {
+            modPcmeshdefRegister(path, read_file(path));
             continue;
         }
 
         // Packer-produced entity mash image -> named-entity override,
-        // keyed by stem = entity class name (mods/GOBLIN.ent overrides
+        // keyed by stem = entity class name (extra/GOBLIN.ent overrides
         // "goblin"); literal-hash stems bind too. Validation +
         // registration: modEntRegister (entity_base.cpp); served by
         // resource_manager::get_resource on every dynamic spawn/fx fetch.
+        // Intercepted here so it doesn't fall into the TYPE_NONE blob
+        // registration below (the typed getMod lookup needs MOD_TYPE_ENT_FILE).
         if (ext == ".ent") {
             modEntRegister(path, read_file(path));
             continue;
@@ -8501,143 +8599,159 @@ void enumerate_mods() {
         // resource_manager::get_resource when script_manager::load fetches
         // the RESOURCE_KEY_TYPE_SCRIPT blob.
         if (ext == ".pcsx") {
-            modPCSXRegister(path, read_file(path));
+            auto pcsxData = read_file(path);
+            const size_t pcsxSize = pcsxData.size();
+            if (modPCSXRegister(path, std::move(pcsxData))) {
+                printf("mod: PCSX REGISTERED extra/%s (%u bytes; pack entry not required)\n",
+                       fs::relative(path, modsDir).string().c_str(),
+                       static_cast<unsigned int>(pcsxSize));
+            }
+            continue;
+        }
+        // PlayStation 2 beta script mash. The filename may be the literal
+        // engine hash (extra/**/0x1189ab87.PS2SX); registration validates it
+        // against the embedded fixedstring name, translates the PS2 VM/SLC
+        // layout to a native PCSX image and retains the hash -> name mapping.
+        if (ext == ".ps2sx") {
+            modPS2SXRegister(path, read_file(path));
             continue;
         }
 
-        // 2) In-memory override (used by NGL callback + some handlers)
-        //    Keying is extension-less (like ngl_readfile_callback does).
-        //    Example: mods/characters/spidey.fbx -> key "characters/spidey".
+        // PCANIM must not use the generic nfl path override above: doing so
+        // hands an arbitrary renamed bank directly to NAL before its skeleton
+        // contract can be compared with the requested retail bank.  Keep one
+        // pristine byte image and bind it by filename/request hashes; the
+        // validated lookup in nal_system.cpp creates the writable runtime
+        // copy only when the matching animation resource is loaded.
+        if (ext == ".pcanim" || ext == ".pcsanim") {
+												  
+														   
+														   
+            const std::vector<uint8_t> fileData = read_file(path);
+            const int preferredType = ext == ".pcsanim"
+                                    ? TLRESOURCE_TYPE_SCENE_ANIM
+                                    : TLRESOURCE_TYPE_ANIM_FILE;
+            const int animType = modPCANIMDetectTLType(
+                fileData.data(), fileData.size(), preferredType);
+            if (animType != TLRESOURCE_TYPE_ANIM_FILE
+                && animType != TLRESOURCE_TYPE_SCENE_ANIM)
+            {
+                printf("mod: invalid PCANIM/scene-PCANIM ignored: %s\n",
+                       path.string().c_str());
+                continue;
+            }
+            const std::string stemKey = transformToLower(path.stem().string());
+            const fs::path relNoExt = fs::relative(path, modsDir).replace_extension();
+            const std::string relKey = transformToLower(relNoExt.generic_string());
+
+            std::set<uint32_t> aliases;
+            auto addAnimAlias = [&](std::string key) {
+                if (key.empty()) return;
+                key = transformToLower(key);
+                while (key.rfind("./", 0) == 0 || key.rfind(".\\", 0) == 0)
+                    key.erase(0, 2);
+                aliases.insert(to_hash(key.c_str()));
+
+                std::string alternate = key;
+                bool changed = false;
+                for (char &c : alternate) {
+                    if (c == '/') { c = '\\'; changed = true; }
+                    else if (c == '\\') { c = '/'; changed = true; }
+                }
+                if (changed)
+                    aliases.insert(to_hash(alternate.c_str()));
+            };
+
+            // A packed NAL resource can be keyed by basename, relative path,
+            // slash/backslash path, and with or without the extension.  Bind
+            // every equivalent name to this one validated loose image.
+            addAnimAlias(stemKey);
+            addAnimAlias(path.filename().string());
+            addAnimAlias(relKey);
+            addAnimAlias(fs::relative(path, modsDir).generic_string());
+
+            auto parseHashStem = [](const std::string &s, uint32_t *out) {
+                if (s.empty()) return false;
+                size_t i = 0;
+                bool hexMarked = false;
+                if (s.size() > 2 && s[0] == '0'
+                    && (s[1] == 'x' || s[1] == 'X')) {
+                    i = 2;
+                    hexMarked = true;
+                }
+                const size_t n = s.size() - i;
+                if (n == 0 || n > (hexMarked ? 8u : 10u)) return false;
+                bool allDec = true, allHex = true;
+                for (size_t k = i; k < s.size(); ++k) {
+                    const char c = s[k];
+                    if (c < '0' || c > '9') allDec = false;
+                    if (!((c >= '0' && c <= '9')
+                          || (c >= 'a' && c <= 'f')
+                          || (c >= 'A' && c <= 'F')))
+                        allHex = false;
+                }
+                uint64_t value = 0;
+                if (hexMarked || (!allDec && allHex && n == 8)) {
+                    if (!allHex || n > 8) return false;
+                    value = std::strtoull(s.c_str() + i, nullptr, 16);
+                } else if (allDec) {
+                    value = std::strtoull(s.c_str() + i, nullptr, 10);
+                } else {
+                    return false;
+                }
+                if (value > 0xFFFFFFFFull) return false;
+                *out = static_cast<uint32_t>(value);
+                return true;
+            };
+
+            uint32_t literalHash = 0;
+            if (parseHashStem(stemKey, &literalHash))
+                aliases.insert(literalHash);
+
+            for (uint32_t alias : aliases) {
+                bool duplicate = false;
+                const auto range = Mods.equal_range(alias);
+                for (auto it = range.first; it != range.second; ++it) {
+                    if (it->second.Type == animType && it->second.Path == path) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate)
+                    Mods.emplace(alias, Mod{path, animType, fileData});
+            }
+
+            printf("mod: %s DETECTED extra/%s -> stem_hash=0x%08X "
+                   "(%u bytes, %u hash aliases, validated NAL path)\n",
+                   animType == TLRESOURCE_TYPE_SCENE_ANIM ? "scene-PCANIM" : "PCANIM",
+                   fs::relative(path, modsDir).generic_string().c_str(),
+                   to_hash(stemKey.c_str()),
+                   static_cast<unsigned>(fileData.size()),
+                   static_cast<unsigned>(aliases.size()));
+            continue;
+        }
+
         tlresource_type resType = TLRESOURCE_TYPE_NONE;
-        if (ext == ".dds" || ext == ".tga" || ext == ".png"
-            || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp")
+        if (ext == ".dds" || ext == ".tga")
             resType = TLRESOURCE_TYPE_TEXTURE;
         else if (ext == ".obj" || ext == ".fbx" || ext == ".dae" || ext == ".gltf" || ext == ".glb")
             resType = TLRESOURCE_TYPE_MESH;
-
-        // FBX/OBJ mesh mods: names from src/mod_fbx_names.h (venom,
-        // ultimate_spiderman, peter_parker, peter_hooded, ..., plus the
-        // HG_* hero-gallery objects) are recognized and logged as such;
-        // ANY OTHER stem is bound as a custom mesh target as well. The
-        // binding is inert until the engine requests a mesh file with the
-        // same name, so custom stems cost nothing and let renamed swaps
-        // (peter_parker.fbx -> peter_hooded.fbx, gang skins, beta-only
-        // meshes, ...) work without touching the source.
-        if (resType == TLRESOURCE_TYPE_MESH) {
-            bool isObject = false;
-            const std::string fbxStem = path.stem().string();
-            if (modmesh::isKnownFbxTarget(fbxStem, &isObject)) {
-                printf("mod: fbx name '%s' recognized (%s)\n",
-                       fbxStem.c_str(), isObject ? "object" : "character");
-            } else {
-                printf("mod: fbx name '%s' not in the known list - bound as a custom mesh target\n",
-                       fbxStem.c_str());
-            }
-        }
+        // @todo platform
         else if (ext == ".pcmesh")
-            resType = TLRESOURCE_TYPE_MESH_FILE;   // raw drop-in mesh file (see modBindRawPCMesh)
-        else if (ext == ".pcskel")
-            resType = TLRESOURCE_TYPE_SKELETON;    // consumed by nalConstructSkeleton (nal_skeleton.cpp)
-        else if (ext == ".pcanim")
-            resType = TLRESOURCE_TYPE_ANIM_FILE;   // both .PCANIM flavors; loaded via
-                                                   // nalFlushPendingAnimOverrides (nal_system.cpp),
-                                                   // whose lazy scan also re-registers the file
-                                                   // under its EMBEDDED resource name - the key
-                                                   // the NAL consumers actually look up
+            resType = TLRESOURCE_TYPE_MESH_FILE;
+		        else if (ext == ".pcskel")
+            resType = TLRESOURCE_TYPE_SKELETON;
+        // unknown extensions stay registered as TYPE_NONE with their bytes:
+        // resource_directory's generic override path resolves them by stem
 
-        // WAV/ENT files never reach this point (registered + continue above);
-        // they stay reachable through ModFileOverrides regardless.
-        const bool shouldKeepInMemory = (resType != TLRESOURCE_TYPE_NONE);
-
-        if (!shouldKeepInMemory)
-            continue;
-
-        // Textures are read lazily at request time (readModFile): the full
-        // PNG set is thousands of files, preloading would bloat startup/RAM.
-        std::vector<uint8_t> fileData;
-        if (resType != TLRESOURCE_TYPE_TEXTURE)
-            fileData = read_file(path);
-
-        // Build a relative no-ext key (forward slashes -> lower-case -> hashed)
-        const fs::path relNoExt = fs::relative(path, modsDir).replace_extension();
-        const std::string relNoExtKey = transformToLower(relNoExt.generic_string());
-        const uint32_t hash = to_hash(relNoExtKey.c_str());
-
-        // Mesh replacements are requested by bare mesh-file name
-        // ("VENOM" -> VENOM.PCMESH), so nested drops (mods/skins/VENOM.fbx,
-        // mods/skins/VENOM.PCMESH) also get keyed by stem. Anim files and
-        // skeletons follow the same convention (prerelease parity).
-        if (resType == TLRESOURCE_TYPE_MESH_FILE || resType == TLRESOURCE_TYPE_MESH
-            || resType == TLRESOURCE_TYPE_TEXTURE
-            || resType == TLRESOURCE_TYPE_ANIM_FILE
-            || resType == TLRESOURCE_TYPE_SKELETON) {
-            const std::string stemKey = transformToLower(path.stem().string());
-            if (const uint32_t stemHash = to_hash(stemKey.c_str()); stemHash != hash)
-                Mods.emplace(stemHash, Mod{path, (int)resType, fileData});
-
-            // Hash-named drops: prerelease/beta pack entries are often known
-            // only by hash, so a stem that parses as one also binds under the
-            // literal value. "mods/0x1189AB87.fbx" and "mods/1189ab87.fbx"
-            // bind as hex 0x1189AB87; an all-digit stem such as
-            // "mods/294628231.png" binds as that decimal value. The normal
-            // to_hash(stem) bindings above stay in place regardless.
-            {
-                auto parseHashStem = [](const std::string &s, uint32_t *out) {
-                    if (s.empty()) return false;
-                    size_t i = 0;
-                    bool hexMarked = false;
-                    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-                        i = 2;
-                        hexMarked = true;
-                    }
-                    const size_t n = s.size() - i;
-                    if (n == 0 || n > (hexMarked ? 8u : 10u)) return false;
-                    bool allDec = true, allHex = true;
-                    for (size_t k = i; k < s.size(); ++k) {
-                        const char c = s[k];
-                        if (c < '0' || c > '9') allDec = false;
-                        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
-                              || (c >= 'A' && c <= 'F')))
-                            allHex = false;
-                    }
-                    uint64_t v = 0;
-                    if (hexMarked || (!allDec && allHex && n == 8)) {
-                        if (!allHex || n > 8) return false;
-                        v = std::strtoull(s.c_str() + i, nullptr, 16);
-                    } else if (allDec) {
-                        v = std::strtoull(s.c_str() + i, nullptr, 10);
-                    } else {
-                        return false;
-                    }
-                    if (v > 0xFFFFFFFFull) return false;
-                    *out = uint32_t(v);
-                    return true;
-                };
-                uint32_t literal = 0;
-                if (parseHashStem(stemKey, &literal)
-                    && literal != hash && literal != to_hash(stemKey.c_str())) {
-                    Mods.emplace(literal, Mod{path, (int)resType, fileData});
-                    printf("mod: stem '%s' also bound as literal hash 0x%08X\n",
-                           stemKey.c_str(), literal);
-                }
-            }
-
-            if (resType != TLRESOURCE_TYPE_TEXTURE)     // avoid a 5000-line log
-                printf("mod: %s %s -> 0x%08X (%u bytes)\n",
-                       resType == TLRESOURCE_TYPE_MESH_FILE ? "meshfile"
-                       : resType == TLRESOURCE_TYPE_ANIM_FILE ? "animfile"
-                       : resType == TLRESOURCE_TYPE_SKELETON  ? "skeleton"
-                                                              : "mesh",
-                       relNoExtKey.c_str(), hash, (uint32_t)fileData.size());
-        }
-
-        Mods.emplace(hash, Mod{path, (int)resType, std::move(fileData)});
-        //printf("mod: %s -> 0x%08X\n", relNoExtKey.c_str(), hash);
+        Mods.emplace(hash, Mod{path, resType, read_file(path)});
+        printf("name = %s\nhash = 0x%08X\n", stem.c_str(), hash);
     }
 
 #   if MOD_MESH_DBG_REPLACE_ALL
-        dbgReplaceMesh = getMod(0x1189ab87, TLRESOURCE_TYPE_MESH_FILE);
-		dbgReplaceMesh = getMod(0xCB5B8BA9, TLRESOURCE_TYPE_MESH_FILE);
+        dbgReplaceMesh = getMod(0x1189ab87, TLRESOURCE_TYPE_MESH);
+		dbgReplaceMesh = getMod(0xCB5B8BA9, TLRESOURCE_TYPE_MESH);
+		dbgReplaceMesh = getMod(0xFFD36C3A, TLRESOURCE_TYPE_MESH);
 #   endif
 }
 

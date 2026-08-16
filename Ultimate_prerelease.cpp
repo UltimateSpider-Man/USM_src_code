@@ -145,6 +145,7 @@
 #include "meta_anim_interact.h"
 #include "motion_effect_struct.h"
 #include "mission_manager.h"
+#include "mission_manager_script_data.h"
 #include "morph_file_resource_handler.h"
 #include "debug_render.h"
 #include "moved_entities.h"
@@ -296,6 +297,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <dinput.h>
 #include <direct.h>
 
@@ -320,6 +322,8 @@
 
 
 namespace fs = std::filesystem;
+
+static Var<bool> sounds_paused3{0x00960044};
 
 std::multimap<uint32_t, Mod> Mods;
 std::unordered_map<std::string, std::filesystem::path> ModFileOverrides;
@@ -609,7 +613,16 @@ BOOL install_patches()
             SET_JUMP(0x00771AF0, func);
         }
 
-        REDIRECT(0x0056BDAA, nglLoadMeshFileInternal);
+        // Xbox mesh loading. ngl_xbpack_patch() (src/ngl.cpp) redirects the
+        // same six mesh-load sites to nglLoadMeshFileInternal, which sniffs
+        // the "XBXM" tag and dispatches to nglLoadMeshFileInternalXbox,
+        // falling back to nglLoadMeshFileInternalPC otherwise. Redirecting
+        // straight to the Xbox loader here would bypass that sniff and break
+        // PC mesh loading. Both it and the Xbox loader exist only in XBPACK
+        // builds, hence the guard.
+		
+		
+		        REDIRECT(0x0056BDAA, nglLoadMeshFileInternal);
 		        REDIRECT(0x0056C126, nglLoadMeshFileInternal);
         REDIRECT(0x0056C244, nglLoadMeshFileInternal);
         REDIRECT(0x0076FF90, nglLoadMeshFileInternal);
@@ -617,7 +630,14 @@ BOOL install_patches()
         REDIRECT(0x00778649, nglLoadMeshFileInternal);
 		
 		
-		    
+		
+		
+		
+#ifdef OPENUSM_XBPACK_MODE
+        ngl_xbpack_patch();
+#endif
+
+
 
 
 
@@ -2654,6 +2674,11 @@ void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
         read_and_update_controller_key_button(joy, 9, MENU_SELECT);
 		read_and_update_controller_key_button(joy, 8, MENU_START);
 
+	// DS4 shoulder/trigger buttons in DirectInput order.
+	read_and_update_controller_key_button(joy, 4, MENU_L1);
+	read_and_update_controller_key_button(joy, 6, MENU_L2);
+	read_and_update_controller_key_button(joy, 7, MENU_R2);
+
 	read_and_update_controller_key_dpad(joy, 0, MENU_UP);
 	read_and_update_controller_key_dpad(joy, 9000, MENU_RIGHT);
 	read_and_update_controller_key_dpad(joy, 18000, MENU_DOWN);
@@ -2876,6 +2901,147 @@ else if (is_menu_key_clicked(MENU_LEFT, keyboard)) { // Use is_menu_key_clicked 
 typedef int (__stdcall* GetDeviceState_ptr)(IDirectInputDevice8*, DWORD, LPVOID);
 GetDeviceState_ptr GetDeviceStateOriginal = nullptr;
 
+// Automatically transform Spider-Man into the black suit once his LIVE HP
+// reaches 50% of the damage interface maximum.
+//
+// IMPORTANT: world_dynamics_system::get_hero_ptr() returns entity*.  In this
+// codebase entity_base::has_damage_ifc() is a non-virtual stub that always
+// returns false, so calling hero_entity->has_damage_ifc() can NEVER work.
+// The stock code uses is_an_actor() followed by an actor* cast when it needs
+// actor-only interfaces; do the same here and call actor::damage_ifc().
+static bool g_half_health_black_suit_triggered = false;
+
+// Manual L2/R2 suit switching is intentionally restricted to the city's
+// non-story activity missions.  Do not use g_mission_type here: races such
+// as lm_storm_races can use non-zero mission-type values, so a broad
+// is_story_mission_active() test would incorrectly reject valid races.
+static bool is_suit_switch_activity_name(const char *name)
+{
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    // Explicit activity requested by name.  Accept a suffix/prefix variant as
+    // well because mission pack/script-data names are not always identical.
+    if (std::strcmp(name, "vmg_hot_pursuit2") == 0 ||
+        std::strstr(name, "vmg_hot_pursuit2") != nullptr) {
+        return true;
+    }
+
+    // Combat Tour scripts/packs use the combat/tour naming family.
+    if (std::strstr(name, "combat_tour") != nullptr ||
+        (std::strstr(name, "combat") != nullptr &&
+         std::strstr(name, "tour") != nullptr)) {
+        return true;
+    }
+
+    // Covers storm/venom/torch/etc. names that explicitly contain "race".
+    // The project's own mission menu also identifies trick races by the word
+    // "trick" alone, so accept that naming family too.
+    if (std::strstr(name, "race") != nullptr ||
+        std::strstr(name, "trick") != nullptr) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool is_l2_r2_suit_switch_activity_active(mission_manager *mm)
+{
+    if (mm == nullptr || !mm->is_mission_active() || mm->m_script == nullptr) {
+        return false;
+    }
+
+    // Check every mission identifier the retail manager keeps.  Depending on
+    // how the activity was launched, the useful name can be the active script
+    // name, the forced mission pack name, the script-data name, or the debug
+    // title.  The whitelist above means normal story/side missions still fail.
+    if (is_suit_switch_activity_name(mm->m_script->field_0.c_str())) {
+        return true;
+    }
+
+    if (is_suit_switch_activity_name(mm->field_88.to_string())) {
+        return true;
+    }
+
+    if (is_suit_switch_activity_name(mm->field_A8.to_string())) {
+        return true;
+    }
+
+    return is_suit_switch_activity_name(mission_manager::current_mission_debug_title.c_str());
+}
+
+static void auto_switch_to_blacksuit_at_half_health()
+{
+    if (g_world_ptr == nullptr) {
+        return;
+    }
+
+    entity *hero_entity = g_world_ptr->get_hero_ptr(0);
+    if (hero_entity == nullptr || !hero_entity->is_an_actor()) {
+        return;
+    }
+
+    actor *hero = bit_cast<actor *>(hero_entity);
+
+    // Only Spider-Man should auto-transform.  Venom/Parker must not call the
+    // Spider-Man black-suit script just because they also fall below 50% HP.
+    ai_player_controller *controller = hero->get_player_controller();
+    if (controller == nullptr || controller->m_hero_type != hero_type_enum::SPIDEY) {
+        return;
+    }
+
+    damage_interface *damage = hero->damage_ifc();
+    if (damage == nullptr) {
+        return;
+    }
+
+    const float current_health = damage->field_1FC.field_0[0];
+    const float maximum_health = damage->field_1FC.field_0[2];
+
+    // bounded_variable<float>: [0] = current, [1] = min, [2] = max.
+    if (!(maximum_health > 0.0f) || !(current_health > 0.0f)) {
+        return;
+    }
+
+    const float half_health = maximum_health * 0.5f;
+    if (current_health > half_health || g_half_health_black_suit_triggered) {
+        return;
+    }
+
+    script_instance *global_script = script::gsoi();
+    if (global_script == nullptr) {
+        // Do NOT latch on failure: allow a later frame to retry after scripts
+        // have finished initializing.
+        return;
+    }
+
+    static string_hash s_switch_to_blacksuit{"switch_to_blacksuit()"};
+    vm_thread *thread = script::sub_5028B0(s_switch_to_blacksuit, global_script);
+    if (thread == nullptr) {
+        // Function was not available yet; retry on a later frame.
+        return;
+    }
+
+    // Latch before executing because the script may replace/reload the hero.
+    g_half_health_black_suit_triggered = true;
+    script::exec_thread(0);
+
+    sp_log("[AUTO BLACK SUIT] triggered at %.2f / %.2f HP (50%% threshold)",
+           current_health, maximum_health);
+}
+
+// Run the health check from the real gameplay damage-update call, not from
+// DirectInput.  This executes once per gameplay frame after damage interfaces
+// are advanced, even when no keyboard/controller state is being polled.
+static void frame_advance_damage_with_auto_blacksuit(Float time_inc)
+{
+    // Preserve the original retail damage-interface update.
+    CDECL_CALL(0x004D1990, time_inc);
+
+    auto_switch_to_blacksuit_at_half_health();
+}
+
 HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* self, DWORD cbData, LPVOID lpvData) {
 
 	HRESULT res = GetDeviceStateOriginal(self, cbData, lpvData);
@@ -2939,6 +3105,59 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* self, DWORD cbData, LP
         //   has_focus == true  -> menu eats input, hero is frozen
         //   has_focus == false -> menu still drawn (dimmed), input passes
         //                         through to the game, hero can move
+
+        // L2/R2 work only in whitelisted NON-STORY activity missions:
+        // Combat Tours, races, and vmg_hot_pursuit2.  Free roam and all other
+        // missions (including the main story) leave the suit hotkeys disabled.
+        auto *mm = mission_manager::s_inst;
+        const bool suit_switch_activity_active =
+            is_l2_r2_suit_switch_activity_active(mm);
+
+        static bool blackSuitActive = false;
+        static bool SpideyActive = false;
+
+        // Mission scripts can change the hero, so reset the local suit state
+        // whenever the current mission is not one of the allowed activities.
+        if (!suit_switch_activity_active) {
+            blackSuitActive = false;
+            SpideyActive = false;
+        }
+
+        if (!keyboard && suit_switch_activity_active) {
+            // L2 -> normal Spider-Man.
+            if (is_menu_key_pressed(MENU_L2, keyboard)) {
+                if (!SpideyActive || blackSuitActive) {
+                    static string_hash s_spiderman{"switch_to_spiderman()"};
+                    if (script::gsoi() != nullptr) {
+                        script::sub_5028B0(s_spiderman, script::gsoi());
+                        script::exec_thread(0);
+
+                        SpideyActive = true;
+                        blackSuitActive = false;
+
+                        // Keep the 50% automatic transformation latched.
+                        // Otherwise, while HP is still <= 50%, the next damage
+                        // frame would instantly force the black suit back on.
+                        g_half_health_black_suit_triggered = true;
+                    }
+                }
+            }
+
+            // R2 -> black suit.
+            if (is_menu_key_pressed(MENU_R2, keyboard)) {
+                if (!blackSuitActive || SpideyActive) {
+                    static string_hash s_blacksuit{"switch_to_blacksuit()"};
+                    if (script::gsoi() != nullptr) {
+                        script::sub_5028B0(s_blacksuit, script::gsoi());
+                        script::exec_thread(0);
+
+                        blackSuitActive = true;
+                        SpideyActive = false;
+                        g_half_health_black_suit_triggered = true;
+                    }
+                }
+            }
+        }
         if (debug_enabled || debug_disabled) {
             bool toggle = false;
             if (keyboard && keys[DIK_TAB] == 2) {
@@ -6174,24 +6393,17 @@ void create_game_flags_menu(debug_menu* parent);
 
 // Character List (Script > Pop Character / Pop All Characters)
 // ----------------------------------------------------------------------------------
-// Implements the debug menu character spawning functionality:
-//   - "Pop Character"     : spawns the currently selected character near the hero
-//   - "Pop All Characters": spawns every character in the list near the hero
-//   - [character names]   : selecting one directly spawns that character
+// Native implementation of the character-lineup debug menu shown in the reference
+// video.  The entries live directly inside the root "Script" menu (no extra nested
+// Script submenu).  Selecting a character spawns it immediately and closes the menu.
 //
-// Characters are spawned via wds_entity_manager::create_and_add_entity_or_subclass
-// at the hero's current position with a small offset.
+// Spawning mirrors SpawnXCommand::process_cmd():
+//   * class hash from the character name
+//   * a unique entity id for every spawn
+//   * placement relative to the hero's orientation
+//   * create flags = 1
+//   * visibility + damage interface initialization
 // ----------------------------------------------------------------------------------
-
-
-#include "entity_base.h"
-#include "entity.h"
-#include "oldmath_po.h"
-#include "vector3d.h"
-#include "wds.h"
-#include "terrain.h"
-#include "string_hash.h"
-#include "mstring.h"
 
 static const char *g_character_names[] = {
     "alex_ohirn",
@@ -6265,165 +6477,84 @@ static const char *g_character_names[] = {
     "wolverine",
 };
 
-static constexpr int g_character_count = sizeof(g_character_names) / sizeof(g_character_names[0]);
+static constexpr int g_character_count =
+    static_cast<int>(sizeof(g_character_names) / sizeof(g_character_names[0]));
 
-// Tracks which character entry was last highlighted/selected in the list
-static int g_selected_character_index = 0;
-
-// Spawns a single character by name at the hero's position + offset
-static entity *spawn_character_at_hero(const char *char_name, float offset_x = 2.0f, float offset_z = 0.0f)
+// Spawn one character using the same native path as the spawn_x console command.
+// offset_x / offset_z are HERO-LOCAL offsets, so the character appears relative
+// to the direction the hero is facing rather than at a fixed world-space axis.
+static entity *spawn_character_at_hero(
+    const char *char_name,
+    float offset_x = 0.0f,
+    float offset_z = 2.0f)
 {
-    if (g_world_ptr == nullptr) {
-        return nullptr;
-    }
-
-    auto *hero = g_world_ptr->get_hero_ptr(0);
-    if (hero == nullptr) {
-        return nullptr;
-    }
-
-    // Build spawn transform from hero's current position
-    po spawn_po {identity_matrix};
-    auto &hero_po = hero->get_abs_po();
-    spawn_po = hero_po;
-
-    // Offset the spawn position so the character doesn't overlap the hero
-    auto hero_pos = hero->get_abs_position();
-    vector3d spawn_pos = hero_pos;
-    spawn_pos[0] += offset_x;
-    spawn_pos[2] += offset_z;
-    spawn_po.set_position(spawn_pos);
-
-    // Create entity using type_hash == id_hash (same name for both)
-    string_hash type_hash {char_name};
-    string_hash id_hash {char_name};
-    mString empty_str {};
-
-    auto *ent = g_world_ptr->ent_mgr.create_and_add_entity_or_subclass(
-        type_hash,
-        id_hash,
-        spawn_po,
-        empty_str,
-        129,
-        nullptr);
-
-    if (ent != nullptr) {
-        ent->set_visible(true, false);
-
-        auto *the_terrain = g_world_ptr->get_the_terrain();
-        if (the_terrain != nullptr) {
-            ent->compute_sector(the_terrain, 0, ent);
-        }
-
-        printf("[CharList] Spawned character: %s\n", char_name);
-    } else {
-        printf("[CharList] Failed to spawn character: %s\n", char_name);
-    }
-
-    return ent;
+    // Resource/pack work is unsafe inside the debug-menu callback.  The
+    // shared worker loads the character pack and creates the entity next tick.
+    queue_debug_character_spawn(char_name, offset_x, offset_z);
+    return nullptr;
 }
 
-// Handler: spawn a single character when its menu entry is selected
 static void character_select_handler(debug_menu_entry *entry)
 {
-    if (entry == nullptr) {
+    if ( entry == nullptr ) {
         return;
     }
 
-    // entry->text contains the character name
-    const char *char_name = entry->text;
-
-    // Update the selected index based on the entry's ID
-    g_selected_character_index = entry->get_id();
-
-    spawn_character_at_hero(char_name, 2.0f, 0.0f);
-    debug_menu::hide();
-}
-
-// Handler: "Pop Character" — spawns the last selected/highlighted character
-static void pop_character_handler(debug_menu_entry *entry)
-{
-    if (g_selected_character_index >= 0 && g_selected_character_index < g_character_count) {
-        const char *char_name = g_character_names[g_selected_character_index];
-        spawn_character_at_hero(char_name, 2.0f, 0.0f);
+    const int index = static_cast<int>(entry->get_id());
+    if ( index < 0 || index >= g_character_count ) {
+        return;
     }
 
+    spawn_character_at_hero(g_character_names[index]);
+
+    // The reference menu closes immediately after spawning a character.
     debug_menu::hide();
 }
 
-// Handler: "Pop All Characters" — spawns every character in the list
-static void pop_all_characters_handler(debug_menu_entry *entry)
+static void pop_character_handler(debug_menu_entry *)
 {
-    // Arrange characters in a grid pattern around the hero
-    float offset_x = 3.0f;
-    float offset_z = 0.0f;
-    const float spacing = 3.0f;
-    const int chars_per_row = 8;
+    queue_debug_character_pop();
+    debug_menu::hide();
+}
 
-    for (int i = 0; i < g_character_count; ++i) {
-        float row = static_cast<float>(i / chars_per_row);
-        float col = static_cast<float>(i % chars_per_row);
+static void pop_all_characters_handler(debug_menu_entry *)
+{
+    queue_debug_character_cleanup();
+    debug_menu::hide();
+}
 
-        float ox = (col - chars_per_row / 2.0f) * spacing;
-        float oz = (row + 1.0f) * spacing;
-
-        spawn_character_at_hero(g_character_names[i], ox, oz);
+static void populate_character_list_menu(debug_menu *menu)
+{
+    if ( menu == nullptr ) {
+        return;
     }
 
-    debug_menu::hide();
-}
+    // Do not append the lineup twice if debug initialization is called again.
+    for ( unsigned int i = 0; i < menu->used_slots; ++i ) {
+        if ( std::strcmp(menu->entries[i].text, "Pop Character") == 0 ) {
+            return;
+        }
+    }
 
-// Populates the character list submenu with Pop Character, Pop All, and all names
-static void populate_character_list_menu(debug_menu_entry *entry)
-{
-    auto *submenu = create_menu("Script", debug_menu::sort_mode_t::ascending);
-
-    debug_menu_entry v1;
-    debug_menu_entry *block = v1.alloc_block(submenu, 4);
-    block[0] = debug_menu_entry{submenu};
-    entry->set_submenu(submenu);
-
-    // --- "Pop Character" entry ---
     {
-        auto *pop_entry = create_menu_entry(mString{"Pop Character"});
-        pop_entry->set_game_flags_handler(pop_character_handler);
-        pop_entry->set_id(0);
-        submenu->add_entry(pop_entry);
+        auto *entry = create_menu_entry(mString {"Pop Character"});
+        entry->set_game_flags_handler(pop_character_handler);
+        menu->add_entry(entry);
     }
 
-    // --- "Pop All Characters" entry ---
     {
-        auto *pop_all_entry = create_menu_entry(mString{"Pop All Characters"});
-        pop_all_entry->set_game_flags_handler(pop_all_characters_handler);
-        pop_all_entry->set_id(1);
-        submenu->add_entry(pop_all_entry);
+        auto *entry = create_menu_entry(mString {"Pop All Characters"});
+        entry->set_game_flags_handler(pop_all_characters_handler);
+        menu->add_entry(entry);
     }
 
-    // --- Individual character entries ---
-    for (int i = 0; i < g_character_count; ++i) {
-        auto *char_entry = create_menu_entry(mString{g_character_names[i]});
-        char_entry->set_game_flags_handler(character_select_handler);
-        char_entry->set_id(static_cast<uint16_t>(i));
-        submenu->add_entry(char_entry);
+    for ( int i = 0; i < g_character_count; ++i ) {
+        auto *entry = create_menu_entry(mString {g_character_names[i]});
+        entry->set_id(i);
+        entry->set_game_flags_handler(character_select_handler);
+        menu->add_entry(entry);
     }
 }
-
-// Creates the "Script" submenu and adds it to the parent (root) debug menu
-void create_character_list_menu(debug_menu *parent)
-{
-    auto *char_list_menu = create_menu("Script");
-
-    debug_menu_entry v1;
-    debug_menu_entry *block = v1.alloc_block(char_list_menu, 4);
-    block[0] = debug_menu_entry{char_list_menu};
-
-    auto *entry = create_menu_entry(char_list_menu);
-    entry->set_submenu(nullptr);
-    entry->set_game_flags_handler(populate_character_list_menu);
-    parent->add_entry(entry);
-}
-
-
 
 
 void create_script_menu()
@@ -6435,7 +6566,7 @@ void create_script_menu()
         debug_menu_entry* block = v1.alloc_block(script_menu, 4);
         block[0] = debug_menu_entry{ script_menu };
         debug_menu::root_menu->add_entry(script_menu);
-		//  create_character_list_menu(script_menu);
+       // populate_character_list_menu(script_menu);
     }
 }
 
@@ -6611,34 +6742,16 @@ void custom()
 #include "fe_health_widget.h"
 
 
-constexpr auto NUM_HEROES = 25u;
+constexpr auto NUM_HEROES = 5u;
 
 const char* hero_list[NUM_HEROES] = {
     "ultimate_spiderman",
-	"usm_blacksuit_costume",
-	"usm_wrestling_costume",
-	"arachno_man_costume",
-	"peter_parker_costume",
-	"peter_hooded_costume",
-    "venom",
-    "peter_parker",
-    "peter_hooded",
-    "venom_spider",
-    "carnage",
-    "rhino",
-    "green_goblin",
-    "mary_jane",
-    "venarge",
-	"venom_eddie",
-    "electro_suit",
-    "electro_nosuit",
-    "wolverine",
-    "beetle",
-    "shocker",
-    "silver_sable",
-    "johnny_storm",
-	"usm_blacksuit",
-	"spider-man",
+	"venom",
+	"peter_parker",
+	"peter_hooded",
+    "venom_eddie"
+	
+
 };
 
 enum class hero_status_e {
@@ -6704,6 +6817,7 @@ game_process mainflow_proc{ "main", main_flow, 3 };
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -7300,7 +7414,8 @@ void menu_setup(int game_state, int keyboard) {
                 debug_enabled = !debug_enabled;
                 current_menu = debug_menu::root_menu;
                 custom();
-		
+										                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
+                sounds_paused3() = true;
 				
             }
 
@@ -7648,6 +7763,12 @@ BOOL install_redirects()
 			
 		        resource_manager2_patch();
 
+        // Required by external .ENT overrides before the early return below.
+        // Retail PC entities use the normal size table; PS2 beta-preview
+        // conglomerates are normalized by modEntRegister and this parser hook
+        // selects their 0xBC child-actor serialized stride only while un-mashing.
+        entity_mash_patch();
+
           FEText_patch();
 
         alternate_costumes_patch();
@@ -7733,7 +7854,15 @@ BOOL install_redirects()
 	
 
     SET_JUMP(0x0077A870, nglLoadTextureTM2);
-		
+
+
+    tlresource_directory2_patch();		
+
+    // Stock world_dynamics_system::frame_advance calls
+    // damage_interface::frame_advance_all_damage_ifc at 0x00558500.
+    // Hook that CALL before this function's early return so the 50% health
+    // transformation runs on the gameplay thread every frame.
+    REDIRECT(0x00558500, frame_advance_damage_with_auto_blacksuit);
 
     return true;
 
@@ -8407,7 +8536,7 @@ BOOL install_redirects()
 }
 
 
-static Var<bool> sounds_paused3{0x00960044};
+
 
 #include "mod.h"  // Updated mod.h with GIF support
 #include <fstream>
@@ -8433,9 +8562,38 @@ std::vector<uint8_t> read_file(const fs::path& filePath) {
     return buffer;
 }
 
-
+int modPCANIMDetectTLType(const uint8_t *raw, size_t size, int preferredType);
+// Implemented in ngl.cpp. Validates native from-disk PCM 0x601 images.
+int modPCMESHDetectTLType(const uint8_t *raw, size_t size, int preferredType);
+// Implemented in resource_manager.cpp. Validates and registers loose BASE_AI
+// core_ai_resource mash streams from extra/**/*.BAI.
+bool modBaiRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData);
+// Implemented in resource_manager.cpp. Validates and registers loose
+// AI_STATE_GRAPH ai::state_graph mash streams from extra/**/*.ASG.
+bool modAsgRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData);
+// MISSION_TABLE generic-mash images from extra/**/*.MSN.
+bool modMsnRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData);
+// PanelFile mash streams from extra/**/*.PANEL.
+bool modPanelRegister(const std::filesystem::path &path,
+                      std::vector<uint8_t> &&fileData);
+// Collision mesh serialized images from extra/**/*.COLL.
+bool modCollRegister(const std::filesystem::path &path,
+                     std::vector<uint8_t> &&fileData);
+// Cut-scene mash streams from extra/**/*.CUT.
+bool modCutRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData);
+// Generic mesh-file definition mash images from extra/**/*.PCMESHDEF.
+bool modPcmeshdefRegister(const std::filesystem::path &path,
+                          std::vector<uint8_t> &&fileData);
+// SLC function-list tables from extra/**/*.SLF.
+bool modSlfRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData);
 
 void enumerate_mods() {
+    modPS2SXResetRegistry();
     Mods.clear();
     nflSystem::ModFileOverrides.clear();
 
@@ -8476,10 +8634,19 @@ void enumerate_mods() {
         const std::string stem = path.stem().string();
         const uint32_t hash = to_hash(stem.c_str());
 
-        // exact-path override table (every file, any extension): lets a mod
-        // shadow whatever file the engine opens through the nfl layer, e.g.
-        // mods/streams/city_arena.wbk replaces streams/city_arena.wbk, and
-        // mods/data/foo.bin answers both "data\foo.bin" and "foo.bin".
+        // Generic direct-file overrides are safe for ordinary resources, but
+        // NEVER for PCANIM/PCSANIM, raw PCMESH, ALS/BAI/ASG, MSN/PANEL,
+        // COLL/CUT/PCMESHDEF/SLF. Their typed resource paths either rebase,
+        // mutate or consume structured images and keep a pristine Mod::Data
+        // master instead of exposing it through the low-level NFL redirect;
+        // bypassing that ownership path can mutate shared bytes or publish an
+        // unconstructed resource object.
+        if (ext != ".pcanim" && ext != ".pcsanim"
+            && ext != ".ps2anim" && ext != ".pcmesh"
+            && ext != ".als" && ext != ".bai" && ext != ".asg"
+            && ext != ".msn" && ext != ".panel"
+            && ext != ".coll" && ext != ".cut"
+            && ext != ".pcmeshdef" && ext != ".slf")
         {
             const fs::path rel = fs::relative(path, modsDir);
             const std::string relKey = normalize_rel(rel.generic_string());
@@ -8522,7 +8689,88 @@ void enumerate_mods() {
             continue;
         }
 
-        // Packer-produced entity mash image -> named-entity override,
+        // Raw ALS mash stream -> animation-logic-system override.
+        // extra/VENOM.ALS binds to the RESOURCE_KEY_TYPE_ALS_FILE key "venom".
+        // Do not let .ALS fall through the generic TYPE_NONE/NFL path: the
+        // engine must receive an already un-mashed, constructed
+        // animation_logic_system_shared object. modAlsRegister keeps pristine
+        // bytes; resource_manager asks modAlsGetOverride for the live writable
+        // object when an entity resolves its als_res_data resource key.
+        if (ext == ".als") {
+            modAlsRegister(path, read_file(path));
+            continue;
+        }
+
+        // Raw BASE_AI mash stream -> ai::core_ai_resource override.
+        // extra/VENOM.BAI binds to RESOURCE_KEY_TYPE_BASE_AI "venom".  BAI
+        // bytes must never take the generic NFL/TYPE_NONE path because the
+        // resource manager publishes an already un-mashed/constructed object.
+        if (ext == ".bai") {
+            modBaiRegister(path, read_file(path));
+            continue;
+        }
+
+        // Raw AI_STATE_GRAPH mash stream -> ai::state_graph override.
+        // extra/VENOM.ASG binds to RESOURCE_KEY_TYPE_AI_STATE_GRAPH "venom".
+        // ASG is typed and writable-in-place, so never expose its pristine
+        // bytes through the generic NFL/TYPE_NONE override map.
+        if (ext == ".asg") {
+            modAsgRegister(path, read_file(path));
+            continue;
+        }
+
+        // Mission table generic-mash image. The mission parser mutates the
+        // header/vectors in place, so resource_manager serves a new writable
+        // serialized copy on each RESOURCE_KEY_TYPE_MISSION_TABLE request.
+        if (ext == ".msn") {
+            modMsnRegister(path, read_file(path));
+            continue;
+        }
+
+        // PanelFile mash stream. PanelFile::UnmashPanelFile() performs the
+        // in-place unmash/construct itself; resource_manager supplies a fresh
+        // serialized copy for every RESOURCE_KEY_TYPE_PANEL lookup.
+        if (ext == ".panel") {
+            modPanelRegister(path, read_file(path));
+            continue;
+        }
+
+        // Raw collision mesh image. cg_mesh::_un_mash expects the retail
+        // COLL/COLB signature and version 0x0010003F, then marks the image in
+        // place. resource_manager therefore serves a private writable copy.
+        if (ext == ".coll") {
+            modCollRegister(path, read_file(path));
+            continue;
+        }
+
+        // Raw cut_scene mash stream. The cut-scene loader un-mashes this data
+        // in place, so it is registered as RESOURCE_KEY_TYPE_CUT_SCENE rather
+        // than falling through the generic NFL file override.
+        if (ext == ".cut") {
+            modCutRegister(path, read_file(path));
+            continue;
+        }
+
+        // Mesh-file definition generic-mash image paired with .PCMESH data.
+        // parse_generic_mash mutates/rebases it, so keep pristine source bytes
+        // and resolve it through RESOURCE_KEY_TYPE_MESH_FILE_STRUCT.
+        if (ext == ".pcmeshdef") {
+            modPcmeshdefRegister(path, read_file(path));
+            continue;
+        }
+
+        // all_slc_functions_mac.SLF-style table consumed directly by
+        // slc_manager::un_mash_all_funcs(). Registration validates the class
+        // and per-class function counts before publishing the typed resource.
+        if (ext == ".slf") {
+            modSlfRegister(path, read_file(path));
+            continue;
+        }
+
+        // Entity mash image -> named-entity override.  modEntRegister accepts
+        // retail PC .ENT directly and translates the supported PS2 beta-preview
+        // conglomerate layout (legacy vector word order / 0x12C top object /
+        // 0xBC child actors) into a PC-consumable runtime image.
         // keyed by stem = entity class name (extra/GOBLIN.ent overrides
         // "goblin"); literal-hash stems bind too. Validation +
         // registration: modEntRegister (entity_base.cpp); served by
@@ -8541,7 +8789,230 @@ void enumerate_mods() {
         // resource_manager::get_resource when script_manager::load fetches
         // the RESOURCE_KEY_TYPE_SCRIPT blob.
         if (ext == ".pcsx") {
-            modPCSXRegister(path, read_file(path));
+            auto pcsxData = read_file(path);
+            const size_t pcsxSize = pcsxData.size();
+            if (modPCSXRegister(path, std::move(pcsxData))) {
+                printf("mod: PCSX REGISTERED extra/%s (%u bytes; pack entry not required)\n",
+                       fs::relative(path, modsDir).string().c_str(),
+                       static_cast<unsigned int>(pcsxSize));
+            }
+            continue;
+        }
+        // PlayStation 2 beta script mash. The filename may be the literal
+        // engine hash (extra/**/0x1189ab87.PS2SX); registration validates it
+        // against the embedded fixedstring name, translates the PS2 VM/SLC
+        // layout to a native PCSX image and retains the hash -> name mapping.
+        if (ext == ".ps2sx") {
+            modPS2SXRegister(path, read_file(path));
+            continue;
+        }
+
+        // Native PC mesh-file image.  Detect by content, not extension, and
+        // register only as TLRESOURCE_TYPE_MESH_FILE so NGL owns the writable
+        // parse copy.  resource_manager can then expose these raw bytes to
+        // tlReadFile even when no retail PCMESH exists in the active packs.
+        if (ext == ".pcmesh") {
+            const std::vector<uint8_t> fileData = read_file(path);
+            const int meshType = modPCMESHDetectTLType(
+                fileData.data(), fileData.size(), TLRESOURCE_TYPE_MESH_FILE);
+            if (meshType != TLRESOURCE_TYPE_MESH_FILE) {
+                printf("mod: invalid PCMESH ignored: %s\n", path.string().c_str());
+                continue;
+            }
+
+            std::set<uint32_t> aliases;
+            const std::string stemKey = transformToLower(path.stem().string());
+            aliases.insert(to_hash(stemKey.c_str()));
+            aliases.insert(to_hash((stemKey + ".pcmesh").c_str()));
+
+            // Preserve the historical spelling/hash too in case the game's
+            // string-hash implementation is fed a non-normalized filename.
+            aliases.insert(hash);
+
+            // Relative-path aliases help loose files organized in subfolders.
+            fs::path relNoExt = fs::relative(path, modsDir);
+            relNoExt.replace_extension();
+            std::string relKey = transformToLower(relNoExt.generic_string());
+            if (!relKey.empty()) {
+                aliases.insert(to_hash(relKey.c_str()));
+                aliases.insert(to_hash((relKey + ".pcmesh").c_str()));
+                std::replace(relKey.begin(), relKey.end(), '/', '\\');
+                aliases.insert(to_hash(relKey.c_str()));
+                aliases.insert(to_hash((relKey + ".pcmesh").c_str()));
+            }
+
+            // A literal 0x12345678 filename is useful for hash-only pack names.
+            if (stemKey.size() == 10u && stemKey[0] == '0' && stemKey[1] == 'x') {
+                char *end = nullptr;
+                const unsigned long literal = std::strtoul(stemKey.c_str() + 2, &end, 16);
+                if (end != nullptr && *end == '\0' && literal <= 0xFFFFFFFFul)
+                    aliases.insert(static_cast<uint32_t>(literal));
+            }
+
+            for (uint32_t alias : aliases) {
+                bool duplicate = false;
+                const auto range = Mods.equal_range(alias);
+                for (auto it = range.first; it != range.second; ++it) {
+                    if (it->second.Type == meshType && it->second.Path == path) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate)
+                    Mods.emplace(alias, Mod{path, meshType, fileData});
+            }
+
+            printf("mod: PCMESH REGISTERED extra/%s -> stem_hash=0x%08X "
+                   "(%u bytes, %u hash aliases, external-only fallback; "
+                   "PCPACK remains preferred)\n",
+                   fs::relative(path, modsDir).generic_string().c_str(),
+                   to_hash(stemKey.c_str()),
+                   static_cast<unsigned>(fileData.size()),
+                   static_cast<unsigned>(aliases.size()));
+            continue;
+        }
+
+        // PCANIM must not use the generic nfl path override above: doing so
+        // hands an arbitrary renamed bank directly to NAL before its skeleton
+        // contract can be compared with the requested retail bank.  Keep one
+        // pristine byte image and bind it by filename/request hashes; the
+        // validated lookup in nal_system.cpp creates the writable runtime
+        // copy only when the matching animation resource is loaded.
+        if (ext == ".pcanim" || ext == ".pcsanim" || ext == ".ps2anim") {
+            const std::vector<uint8_t> fileData = read_file(path);
+            const bool ps2Anim = ext == ".ps2anim";
+            const int preferredType = ext == ".pcsanim"
+                                    ? TLRESOURCE_TYPE_SCENE_ANIM
+                                    : TLRESOURCE_TYPE_ANIM_FILE;
+            int animType = TLRESOURCE_TYPE_NONE;
+            size_t ps2ClipCount = 0;
+
+            if (ps2Anim)
+            {
+                if (modPS2ANIMValidate(fileData.data(), fileData.size(),
+                                       &ps2ClipCount))
+                    animType = TLRESOURCE_TYPE_ANIM_FILE;
+            }
+            else
+            {
+                animType = modPCANIMDetectTLType(
+                    fileData.data(), fileData.size(), preferredType);
+            }
+
+            if (animType != TLRESOURCE_TYPE_ANIM_FILE
+                && animType != TLRESOURCE_TYPE_SCENE_ANIM)
+            {
+                printf("mod: invalid %s ignored: %s\n",
+                       ps2Anim ? "PS2ANIM" : "PCANIM/scene-PCANIM",
+                       path.string().c_str());
+                continue;
+            }
+            const std::string stemKey = transformToLower(path.stem().string());
+            const fs::path relNoExt = fs::relative(path, modsDir).replace_extension();
+            const std::string relKey = transformToLower(relNoExt.generic_string());
+
+            std::set<uint32_t> aliases;
+            auto addAnimAlias = [&](std::string key) {
+                if (key.empty()) return;
+                key = transformToLower(key);
+                while (key.rfind("./", 0) == 0 || key.rfind(".\\", 0) == 0)
+                    key.erase(0, 2);
+                aliases.insert(to_hash(key.c_str()));
+
+                std::string alternate = key;
+                bool changed = false;
+                for (char &c : alternate) {
+                    if (c == '/') { c = '\\'; changed = true; }
+                    else if (c == '\\') { c = '/'; changed = true; }
+                }
+                if (changed)
+                    aliases.insert(to_hash(alternate.c_str()));
+            };
+
+            // A packed NAL resource can be keyed by basename, relative path,
+            // slash/backslash path, and with or without the extension.  Bind
+            // every equivalent name to this one validated loose image.
+            addAnimAlias(stemKey);
+            addAnimAlias(path.filename().string());
+            addAnimAlias(relKey);
+            addAnimAlias(fs::relative(path, modsDir).generic_string());
+
+            auto parseHashStem = [](const std::string &s, uint32_t *out) {
+                if (s.empty()) return false;
+                size_t i = 0;
+                bool hexMarked = false;
+                if (s.size() > 2 && s[0] == '0'
+                    && (s[1] == 'x' || s[1] == 'X')) {
+                    i = 2;
+                    hexMarked = true;
+                }
+                const size_t n = s.size() - i;
+                if (n == 0 || n > (hexMarked ? 8u : 10u)) return false;
+                bool allDec = true, allHex = true;
+                for (size_t k = i; k < s.size(); ++k) {
+                    const char c = s[k];
+                    if (c < '0' || c > '9') allDec = false;
+                    if (!((c >= '0' && c <= '9')
+                          || (c >= 'a' && c <= 'f')
+                          || (c >= 'A' && c <= 'F')))
+                        allHex = false;
+                }
+                uint64_t value = 0;
+                if (hexMarked || (!allDec && allHex && n == 8)) {
+                    if (!allHex || n > 8) return false;
+                    value = std::strtoull(s.c_str() + i, nullptr, 16);
+                } else if (allDec) {
+                    value = std::strtoull(s.c_str() + i, nullptr, 10);
+                } else {
+                    return false;
+                }
+                if (value > 0xFFFFFFFFull) return false;
+                *out = static_cast<uint32_t>(value);
+                return true;
+            };
+
+            uint32_t literalHash = 0;
+            if (parseHashStem(stemKey, &literalHash))
+                aliases.insert(literalHash);
+
+            for (uint32_t alias : aliases) {
+                bool duplicate = false;
+                const auto range = Mods.equal_range(alias);
+                for (auto it = range.first; it != range.second; ++it) {
+                    if (it->second.Type == animType && it->second.Path == path) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate)
+                    Mods.emplace(alias, Mod{path, animType, fileData});
+            }
+
+            const char *animLabel =
+                ps2Anim ? "PS2ANIM"
+                : (animType == TLRESOURCE_TYPE_SCENE_ANIM ? "scene-PCANIM" : "PCANIM");
+            if (ps2Anim)
+            {
+                printf("mod: %s DETECTED extra/%s -> stem_hash=0x%08X "
+                       "(%u bytes, %u hash aliases, PS2 nalChar v0x10002, "
+                       "%u clips, validated NAL path)\n",
+                       animLabel,
+                       fs::relative(path, modsDir).generic_string().c_str(),
+                       to_hash(stemKey.c_str()),
+                       static_cast<unsigned>(fileData.size()),
+                       static_cast<unsigned>(aliases.size()),
+                       static_cast<unsigned>(ps2ClipCount));
+            }
+            else
+            {
+                printf("mod: %s DETECTED extra/%s -> stem_hash=0x%08X "
+                       "(%u bytes, %u hash aliases, validated NAL path)\n",
+                       animLabel,
+                       fs::relative(path, modsDir).generic_string().c_str(),
+                       to_hash(stemKey.c_str()),
+                       static_cast<unsigned>(fileData.size()),
+                       static_cast<unsigned>(aliases.size()));
+            }
             continue;
         }
 
@@ -8551,12 +9022,8 @@ void enumerate_mods() {
         else if (ext == ".obj" || ext == ".fbx" || ext == ".dae" || ext == ".gltf" || ext == ".glb")
             resType = TLRESOURCE_TYPE_MESH;
         // @todo platform
-        else if (ext == ".pcmesh")
-            resType = TLRESOURCE_TYPE_MESH_FILE;
 		        else if (ext == ".pcskel")
             resType = TLRESOURCE_TYPE_SKELETON;
-				else if (ext == ".pcanim")
-            resType = TLRESOURCE_TYPE_ANIM_FILE;
         // unknown extensions stay registered as TYPE_NONE with their bytes:
         // resource_directory's generic override path resolves them by stem
 
@@ -8565,9 +9032,9 @@ void enumerate_mods() {
     }
 
 #   if MOD_MESH_DBG_REPLACE_ALL
-        dbgReplaceMesh = getMod(0x1189ab87, TLRESOURCE_TYPE_MESH_FILE);
-		dbgReplaceMesh = getMod(0xCB5B8BA9, TLRESOURCE_TYPE_MESH_FILE);
-		dbgReplaceMesh = getMod(0xFFD36C3A, TLRESOURCE_TYPE_MESH_FILE);
+        dbgReplaceMesh = getMod(0x1189ab87, TLRESOURCE_TYPE_MESH);
+		dbgReplaceMesh = getMod(0xCB5B8BA9, TLRESOURCE_TYPE_MESH);
+		dbgReplaceMesh = getMod(0xFFD36C3A, TLRESOURCE_TYPE_MESH);
 #   endif
 }
 
