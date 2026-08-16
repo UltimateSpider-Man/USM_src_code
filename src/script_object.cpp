@@ -16,6 +16,9 @@
 
 #include <cassert>
 #include <cctype>
+#include <cstdio>
+#include <limits>
+#include <unordered_set>
 
 VALIDATE_SIZE(script_object, 0x34);
 VALIDATE_SIZE(script_object::function, 0x10);
@@ -1219,10 +1222,641 @@ static bool modPCSXIsLoaded(uint32_t nameHash)
     return false;
 }
 
+namespace {
+
+constexpr uint32_t MOD_PS2SX_MARKER = 0xA1A1A1A1u;
+
+struct modPS2SXTranslationStats
+{
+    unsigned int vmRecords = 0;
+    unsigned int globalCalls = 0;
+    unsigned int localCalls = 0;
+    unsigned int methodOffsets = 0;
+};
+
+struct modPS2SXRemapRegion
+{
+    uint16_t first;
+    uint16_t last;
+    int delta;
+};
+
+// Derived from the beta/PC counterpart corpus used by the local
+// ps2sx_to_pcsx translator.  The low ranges are deliberately identity
+// regions; indices above the calibrated 0x1F0 ceiling are left untouched.
+constexpr modPS2SXRemapRegion MOD_PS2SX_GLOBAL_REGIONS[] = {
+    {0x0000, 0x0011,  0}, {0x0012, 0x006B,  4},
+    {0x006C, 0x0086,  5}, {0x0087, 0x0095,  6},
+    {0x0096, 0x00E1,  4}, {0x00E2, 0x00EC,  5},
+    {0x00ED, 0x00EE,  8}, {0x00EF, 0x00FA,  9},
+    {0x00FB, 0x00FE, 11}, {0x00FF, 0x011D, 12},
+    {0x011E, 0x0129, 13}, {0x012A, 0x0148, 12},
+    {0x0149, 0x0152, 13}, {0x0153, 0x0162, 14},
+    {0x0163, 0x0191, 15}, {0x0192, 0x01F0, 16},
+};
+
+constexpr modPS2SXRemapRegion MOD_PS2SX_LOCAL_REGIONS[] = {
+    {0x0000, 0x0030, 0}, {0x0031, 0x004F, 1},
+    {0x0050, 0x0054, 2}, {0x0055, 0x006C, 3},
+    {0x006D, 0x00B5, 2}, {0x00B6, 0x00BB, 3},
+    {0x00BC, 0x00C2, 4}, {0x00C3, 0x00ED, 5},
+    {0x00EE, 0x01F0, 6},
+};
+
+static std::map<uint32_t, std::string> &modPS2SXNames()
+{
+    static std::map<uint32_t, std::string> names;
+    return names;
+}
+
+static std::unordered_set<const void *> &modPS2SXRuntimeImages()
+{
+    static std::unordered_set<const void *> images;
+    return images;
+}
+
+static bool modPS2SXReadU16(const uint8_t *bytes, size_t size,
+                            size_t offset, uint16_t *value)
+{
+    if (value == nullptr || offset > size || size - offset < sizeof(*value))
+        return false;
+    std::memcpy(value, bytes + offset, sizeof(*value));
+    return true;
+}
+
+static bool modPS2SXReadU32(const uint8_t *bytes, size_t size,
+                            size_t offset, uint32_t *value)
+{
+    if (value == nullptr || offset > size || size - offset < sizeof(*value))
+        return false;
+    std::memcpy(value, bytes + offset, sizeof(*value));
+    return true;
+}
+
+static bool modPS2SXReadI32(const uint8_t *bytes, size_t size,
+                            size_t offset, int32_t *value)
+{
+    uint32_t raw = 0;
+    if (!modPS2SXReadU32(bytes, size, offset, &raw))
+        return false;
+    std::memcpy(value, &raw, sizeof(raw));
+    return true;
+}
+
+static bool modPS2SXWriteU16(std::vector<uint8_t> &bytes, size_t offset,
+                             uint16_t value)
+{
+    if (offset > bytes.size() || bytes.size() - offset < sizeof(value))
+        return false;
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+    return true;
+}
+
+static bool modPS2SXWriteU32(std::vector<uint8_t> &bytes, size_t offset,
+                             uint32_t value)
+{
+    if (offset > bytes.size() || bytes.size() - offset < sizeof(value))
+        return false;
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+    return true;
+}
+
+static bool modPS2SXAlignInput(size_t *cursor, size_t alignment, size_t size)
+{
+    if (cursor == nullptr || alignment == 0 || *cursor > size)
+        return false;
+    const size_t remainder = *cursor % alignment;
+    const size_t padding = remainder == 0 ? 0 : alignment - remainder;
+    if (padding > size - *cursor)
+        return false;
+    *cursor += padding;
+    return true;
+}
+
+static void modPS2SXAlignOutput(std::vector<uint8_t> &out, size_t alignment)
+{
+    while ((out.size() % alignment) != 0)
+        out.push_back(0xE3);
+}
+
+static bool modPS2SXAppend(const uint8_t *bytes, size_t size,
+                           size_t *cursor, size_t count,
+                           std::vector<uint8_t> &out)
+{
+    if (cursor == nullptr || *cursor > size || count > size - *cursor)
+        return false;
+    out.insert(out.end(), bytes + *cursor, bytes + *cursor + count);
+    *cursor += count;
+    return true;
+}
+
+static bool modPS2SXCountBytes(int32_t count, size_t stride, size_t size,
+                               size_t *byteCount)
+{
+    if (byteCount == nullptr || count < 0 || stride == 0)
+        return false;
+    const size_t n = static_cast<size_t>(count);
+    if (n > size / stride)
+        return false;
+    *byteCount = n * stride;
+    return true;
+}
+
+static uint16_t modPS2SXRemapIndex(
+        uint16_t index, const modPS2SXRemapRegion *regions, size_t count)
+{
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (index >= regions[i].first && index <= regions[i].last)
+            return static_cast<uint16_t>(index + regions[i].delta);
+    }
+    return index;
+}
+
+static bool modPS2SXOpcodeSupported(uint8_t opcode)
+{
+    if (opcode <= 16 || opcode == 18 || (opcode >= 20 && opcode <= 35)
+        || opcode == 37 || opcode == 38
+        || (opcode >= 43 && opcode <= 65))
+        return true;
+    return false;
+}
+
+static int modPS2SXOperandWords(uint8_t argumentType)
+{
+    switch (argumentType)
+    {
+    case 0: return 0;
+    case 1: case 2: case 3: return 2;
+    case 4: case 5: case 6: case 7: return 1;
+    case 8: case 9: case 10: case 11:
+    case 15: case 16: case 17: return 2;
+    default: return -1;
+    }
+}
+
+static bool modPS2SXTranslateCode(std::vector<uint8_t> &out,
+                                  size_t codeStart, size_t codeSize,
+                                  modPS2SXTranslationStats *stats,
+                                  std::string *reason)
+{
+    if ((codeSize & 1u) != 0 || codeStart > out.size()
+        || codeSize > out.size() - codeStart)
+    {
+        if (reason != nullptr) *reason = "invalid beta bytecode range";
+        return false;
+    }
+
+    const size_t codeEnd = codeStart + codeSize;
+    size_t cursor = codeStart;
+    while (cursor < codeEnd)
+    {
+        const size_t instruction = cursor;
+        uint16_t opword = 0;
+        if (!modPS2SXReadU16(out.data(), out.size(), cursor, &opword))
+            return false;
+        cursor += sizeof(opword);
+
+        const uint8_t opcode = static_cast<uint8_t>(opword >> 8);
+        const uint8_t rawArgument = static_cast<uint8_t>(opword & 0xFFu);
+        const uint8_t argumentType = rawArgument & 0x7Fu;
+        const int operandWords = modPS2SXOperandWords(argumentType);
+        if (!modPS2SXOpcodeSupported(opcode) || operandWords < 0)
+        {
+            if (reason != nullptr)
+            {
+                char message[96] {};
+                std::snprintf(message, sizeof(message),
+                              "unsupported opcode/argument 0x%02X/0x%02X at 0x%X",
+                              opcode, argumentType,
+                              static_cast<unsigned int>(instruction - codeStart));
+                *reason = message;
+            }
+            return false;
+        }
+
+        uint16_t dataSize = 4;
+        if ((rawArgument & 0x80u) != 0)
+        {
+            if (!modPS2SXReadU16(out.data(), out.size(), cursor, &dataSize)
+                || cursor + sizeof(dataSize) > codeEnd)
+                return false;
+            cursor += sizeof(dataSize);
+        }
+
+        const size_t operandBytes = static_cast<size_t>(operandWords) * 2u;
+        if (operandBytes > codeEnd - cursor)
+        {
+            if (reason != nullptr) *reason = "truncated beta bytecode operand";
+            return false;
+        }
+
+        // OP_BSL / OP_ARG_LFR stores {SLC group, function index}.  Group 0
+        // addresses the global table; group 7 addresses the local table.
+        if (opcode == 4 && argumentType == 10 && operandBytes == 4)
+        {
+            uint16_t group = 0;
+            uint16_t index = 0;
+            modPS2SXReadU16(out.data(), out.size(), cursor, &group);
+            modPS2SXReadU16(out.data(), out.size(), cursor + 2, &index);
+            uint16_t remapped = index;
+            if (group == 0)
+            {
+                remapped = modPS2SXRemapIndex(
+                        index, MOD_PS2SX_GLOBAL_REGIONS,
+                        sizeof(MOD_PS2SX_GLOBAL_REGIONS)
+                            / sizeof(MOD_PS2SX_GLOBAL_REGIONS[0]));
+                if (remapped != index && stats != nullptr)
+                    ++stats->globalCalls;
+            }
+            else if (group == 7)
+            {
+                remapped = modPS2SXRemapIndex(
+                        index, MOD_PS2SX_LOCAL_REGIONS,
+                        sizeof(MOD_PS2SX_LOCAL_REGIONS)
+                            / sizeof(MOD_PS2SX_LOCAL_REGIONS[0]));
+                if (remapped != index && stats != nullptr)
+                    ++stats->localCalls;
+            }
+            if (remapped != index)
+                modPS2SXWriteU16(out, cursor + 2, remapped);
+        }
+
+        // Beta OP_PSH/VAR records with dsize 0x0C use a method-table offset
+        // four bytes earlier than the PC executable for the calibrated band.
+        if (opcode == 29 && rawArgument == 0x91u && dataSize == 0x0Cu
+            && operandBytes == 4)
+        {
+            uint32_t value = 0;
+            modPS2SXReadU32(out.data(), out.size(), cursor, &value);
+            if (value >= 0x100u && value < 0x300u)
+            {
+                modPS2SXWriteU32(out, cursor, value + 4u);
+                if (stats != nullptr) ++stats->methodOffsets;
+            }
+        }
+
+        cursor += operandBytes;
+    }
+
+    if (cursor != codeEnd)
+    {
+        if (reason != nullptr) *reason = "beta bytecode does not end cleanly";
+        return false;
+    }
+    return true;
+}
+
+static bool modPS2SXAppendVM(const uint8_t *bytes, size_t size,
+                             size_t *cursor, uint32_t codeSize,
+                             std::vector<uint8_t> &out,
+                             modPS2SXTranslationStats *stats,
+                             std::string *reason)
+{
+    if (!modPS2SXAlignInput(cursor, 4, size))
+        return false;
+    modPS2SXAlignOutput(out, 4);
+    if (*cursor > size || size - *cursor < 0x28)
+        return false;
+
+    uint32_t debugInfo = 0;
+    uint32_t extraWord = 0;
+    uint32_t flags = 0;
+    uint32_t sentinel = 0;
+    uint32_t codeOffset = 0;
+    int32_t codeWords = 0;
+    modPS2SXReadU32(bytes, size, *cursor + 0x18, &debugInfo);
+    modPS2SXReadU32(bytes, size, *cursor + 0x1C, &extraWord);
+    modPS2SXReadU32(bytes, size, *cursor + 0x20, &flags);
+    modPS2SXReadU32(bytes, size, *cursor + 0x24, &sentinel);
+    modPS2SXReadU32(bytes, size, *cursor + 0x10, &codeOffset);
+    modPS2SXReadI32(bytes, size, *cursor + 0x14, &codeWords);
+
+    if (debugInfo != 0 || extraWord != 0
+        || (flags != VM_EXECUTABLE_FLAG_FROM_MASH
+            && flags != (VM_EXECUTABLE_FLAG_FROM_MASH
+                         | VM_EXECUTABLE_FLAG_STATIC))
+        || sentinel != 0xCDCDCDCDu)
+    {
+        if (reason != nullptr)
+            *reason = "mixed or unsupported PS2 vm_executable record layout";
+        return false;
+    }
+    if (codeWords < 0 || codeOffset > codeSize
+        || 2u * static_cast<uint32_t>(codeWords) > codeSize - codeOffset)
+    {
+        if (reason != nullptr)
+            *reason = "PS2 vm_executable code range is outside the bytecode image";
+        return false;
+    }
+
+    // PS2: common fields, debug ptr, extra zero, flags, CD sentinel (0x28).
+    // PC:  common fields, debug ptr, flags,      CD sentinel (0x24).
+    out.insert(out.end(), bytes + *cursor, bytes + *cursor + 0x1C);
+    out.insert(out.end(), bytes + *cursor + 0x20,
+               bytes + *cursor + 0x28);
+    *cursor += 0x28;
+    if (stats != nullptr) ++stats->vmRecords;
+    return true;
+}
+
+static bool modPS2SXExtractName(const uint8_t *bytes, size_t size,
+                                std::string *name)
+{
+    if (name == nullptr || size < 0x30)
+        return false;
+    size_t length = 0;
+    while (length < 32 && bytes[0x10 + length] != 0)
+    {
+        const unsigned char c = bytes[0x10 + length];
+        if (c < 0x20 || c > 0x7E)
+            return false;
+        ++length;
+    }
+    if (length == 0 || length == 32)
+        return false;
+    name->assign(reinterpret_cast<const char *>(bytes + 0x10), length);
+    return true;
+}
+
+static bool modPS2SXConvert(const uint8_t *bytes, size_t size,
+                            std::vector<uint8_t> *converted,
+                            modPS2SXTranslationStats *stats,
+                            std::string *reason)
+{
+    if (bytes == nullptr || converted == nullptr || size < 0x70
+        || size > static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+        if (reason != nullptr) *reason = "file is too small or too large";
+        return false;
+    }
+
+    const auto *header = bit_cast<const generic_mash_header *>(bytes);
+    uint32_t marker = 0;
+    uint32_t scriptFlags = 0;
+    uint32_t codeSize = 0;
+    int32_t objectCount = 0;
+    int32_t stringCount = 0;
+    int32_t infoCount = 0;
+    modPS2SXReadU32(bytes, size, 0x6C, &marker);
+    modPS2SXReadU32(bytes, size, 0x60, &scriptFlags);
+    modPS2SXReadU32(bytes, size, 0x34, &codeSize);
+    modPS2SXReadI32(bytes, size, 0x40, &objectCount);
+    modPS2SXReadI32(bytes, size, 0x4C, &stringCount);
+    modPS2SXReadI32(bytes, size, 0x68, &infoCount);
+
+    if (header->field_4 != 0 || header->field_8 != static_cast<int>(size)
+        || header->class_id != 0xFFFF || header->field_E != 0
+        || header->safety_key != header->generate_safety_key()
+        || marker != MOD_PS2SX_MARKER
+        || scriptFlags != script_executable::SCRIPT_EXECUTABLE_FLAG_FROM_MASH
+        || codeSize > size - 0x70)
+    {
+        if (reason != nullptr) *reason = "invalid PS2SX mash header or marker";
+        return false;
+    }
+
+    static constexpr size_t POINTER_FIELDS[] = {
+        0x30, 0x38, 0x3C, 0x44, 0x48, 0x50, 0x58, 0x5C, 0x64
+    };
+    for (const size_t offset : POINTER_FIELDS)
+    {
+        uint32_t value = 0;
+        if (!modPS2SXReadU32(bytes, size, offset, &value) || value != 0)
+        {
+            if (reason != nullptr)
+                *reason = "PS2SX is a live/dumped image instead of virgin pack data";
+            return false;
+        }
+    }
+
+    size_t objectPointerBytes = 0;
+    size_t stringPointerBytes = 0;
+    size_t infoBytes = 0;
+    if (!modPS2SXCountBytes(objectCount, sizeof(uint32_t), size,
+                            &objectPointerBytes)
+        || !modPS2SXCountBytes(stringCount, sizeof(uint32_t), size,
+                               &stringPointerBytes)
+        || !modPS2SXCountBytes(infoCount, sizeof(script_executable::info_t),
+                               size, &infoBytes))
+    {
+        if (reason != nullptr) *reason = "invalid PS2SX object/string counts";
+        return false;
+    }
+
+    converted->clear();
+    converted->reserve(size);
+    converted->insert(converted->end(), bytes, bytes + 0x6C);
+    converted->insert(converted->end(), bytes + 0x70,
+                      bytes + 0x70 + codeSize);
+    if (!modPS2SXTranslateCode(*converted, 0x6C, codeSize, stats, reason))
+        return false;
+
+    size_t cursor = 0x70 + static_cast<size_t>(codeSize);
+    if (!modPS2SXAlignInput(&cursor, 4, size))
+        return false;
+    modPS2SXAlignOutput(*converted, 4);
+    if (!modPS2SXAppend(bytes, size, &cursor, objectPointerBytes, *converted))
+        return false;
+
+    for (int32_t objectIndex = 0; objectIndex < objectCount; ++objectIndex)
+    {
+        if (!modPS2SXAlignInput(&cursor, 8, size))
+            return false;
+        modPS2SXAlignOutput(*converted, 8);
+        const size_t objectOffset = cursor;
+        if (!modPS2SXAppend(bytes, size, &cursor, sizeof(script_object),
+                            *converted))
+            return false;
+
+        int32_t staticDataSize = 0;
+        int32_t functionCount = 0;
+        if (!modPS2SXReadI32(bytes, size, objectOffset + 0x10,
+                             &staticDataSize)
+            || !modPS2SXReadI32(bytes, size, objectOffset + 0x24,
+                                &functionCount)
+            || staticDataSize < 0)
+        {
+            if (reason != nullptr) *reason = "invalid PS2 script_object record";
+            return false;
+        }
+
+        size_t functionPointerBytes = 0;
+        if (!modPS2SXCountBytes(functionCount, sizeof(uint32_t), size,
+                                &functionPointerBytes))
+            return false;
+
+        if (!modPS2SXAlignInput(&cursor, 4, size))
+            return false;
+        modPS2SXAlignOutput(*converted, 4);
+        if (!modPS2SXAppend(bytes, size, &cursor,
+                            static_cast<size_t>(staticDataSize), *converted))
+            return false;
+
+        if (!modPS2SXAlignInput(&cursor, 4, size))
+            return false;
+        modPS2SXAlignOutput(*converted, 4);
+        if (!modPS2SXAppend(bytes, size, &cursor, functionPointerBytes,
+                            *converted))
+            return false;
+
+        for (int32_t function = 0; function < functionCount; ++function)
+        {
+            if (!modPS2SXAppendVM(bytes, size, &cursor, codeSize,
+                                  *converted, stats, reason))
+                return false;
+        }
+    }
+
+    if (!modPS2SXAlignInput(&cursor, 4, size))
+        return false;
+    modPS2SXAlignOutput(*converted, 4);
+    if (!modPS2SXAppend(bytes, size, &cursor, objectPointerBytes, *converted))
+        return false;
+
+    if (!modPS2SXAlignInput(&cursor, 4, size))
+        return false;
+    modPS2SXAlignOutput(*converted, 4);
+    if (!modPS2SXAppend(bytes, size, &cursor, stringPointerBytes, *converted))
+        return false;
+
+    for (int32_t stringIndex = 0; stringIndex < stringCount; ++stringIndex)
+    {
+        if (!modPS2SXAlignInput(&cursor, 4, size))
+            return false;
+        modPS2SXAlignOutput(*converted, 4);
+        uint32_t length = 0;
+        if (!modPS2SXReadU32(bytes, size, cursor, &length)
+            || length > size - cursor - sizeof(length)
+            || !modPS2SXAppend(bytes, size, &cursor,
+                               sizeof(length) + static_cast<size_t>(length),
+                               *converted))
+            return false;
+    }
+
+    if (!modPS2SXAlignInput(&cursor, 4, size))
+        return false;
+    modPS2SXAlignOutput(*converted, 4);
+    if (!modPS2SXAlignInput(&cursor, 4, size))
+        return false;
+    modPS2SXAlignOutput(*converted, 4);
+
+    const size_t infoOffset = cursor;
+    if (!modPS2SXAppend(bytes, size, &cursor, infoBytes, *converted))
+        return false;
+    if (!modPS2SXAlignInput(&cursor, 4, size))
+        return false;
+    modPS2SXAlignOutput(*converted, 4);
+
+    for (int32_t infoIndex = 0; infoIndex < infoCount; ++infoIndex)
+    {
+        int32_t kind = 0;
+        if (!modPS2SXReadI32(bytes, size,
+                             infoOffset
+                                 + static_cast<size_t>(infoIndex)
+                                       * sizeof(script_executable::info_t)
+                                 + 0x10,
+                             &kind))
+            return false;
+        if (kind == -1
+            && !modPS2SXAppendVM(bytes, size, &cursor, codeSize,
+                                 *converted, stats, reason))
+            return false;
+    }
+
+    // Regular beta mashes end here with at most alignment/fill bytes.  The
+    // known QUEENS_COMBAT_TOUR2 anomaly fails earlier because it mixes the
+    // compact and expanded VM layouts and advertises more info records than
+    // physically exist; rejecting it is safer than manufacturing pointers.
+    if (cursor > size || size - cursor > 12)
+    {
+        if (reason != nullptr) *reason = "unexpected PS2SX tail data";
+        return false;
+    }
+
+    // Retail pack payloads end on a 16-byte boundary.  The parser ignores
+    // this final fill, but retaining the allocator contract keeps field_8
+    // and any subsequent shared-data pointer naturally aligned.
+    modPS2SXAlignOutput(*converted, 16);
+    if (converted->size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return false;
+    auto *pcHeader = bit_cast<generic_mash_header *>(converted->data());
+    pcHeader->field_8 = static_cast<int>(converted->size());
+    pcHeader->safety_key = pcHeader->generate_safety_key();
+    return true;
+}
+
+} // namespace
+
+// Some loose PCSX extractors write the total file size into generic_mash_header::field_8
+// but leave the original pack safety key untouched.  In a valid mash field_8 is the
+// offset of the shared-data area, not the file length.  A strict safety-key check would
+// therefore reject an otherwise pristine pack-produced script before it can be used as
+// an external-only resource.  Recover the authenticated offset algebraically, but only
+// for this narrow stale-header shape (field_8 == file size) and only when every other
+// script-mash invariant still matches.  This keeps malformed/runtime-dumped images out.
+static bool modPCSXNormalizeLooseMashHeader(std::vector<uint8_t> &bytes,
+                                            const std::filesystem::path &path)
+{
+    if (bytes.size() < sizeof(generic_mash_header) + sizeof(script_executable))
+        return false;
+
+    auto *header = bit_cast<generic_mash_header *>(bytes.data());
+    if (header->safety_key == header->generate_safety_key())
+        return true;
+
+    constexpr uint32_t kMask = 0x0FFFFFFFu;
+    constexpr uint32_t kSafetyBase = 0x7BADBA5Du;
+
+    // Generic mash safety keys always live in the 0x7xxxxxxx range.  Restrict
+    // repair to ordinary script mashes and the extractor-specific stale-size case.
+    if ((header->safety_key & 0xF0000000u) != 0x70000000u
+        || header->class_id != 0xFFFFu
+        || header->is_flagged(0x40000000u)
+        || header->field_8 != static_cast<int>(bytes.size()))
+        return false;
+
+    const uint32_t wantedLow = header->safety_key & kMask;
+    const uint32_t recovered =
+        (wantedLow
+         - (kSafetyBase & kMask)
+         + (header->field_4 & kMask)
+         - static_cast<uint32_t>(header->class_id)
+         - static_cast<uint32_t>(header->field_E)) & kMask;
+
+    // Shared mash data must begin inside the image and remain naturally aligned.
+    if (recovered < sizeof(generic_mash_header)
+        || recovered >= bytes.size()
+        || (recovered & 3u) != 0u)
+        return false;
+
+    const int staleOffset = header->field_8;
+    header->field_8 = static_cast<int>(recovered);
+    if (header->safety_key != header->generate_safety_key())
+    {
+        header->field_8 = staleOffset;
+        return false;
+    }
+
+    sp_log("[mod] pcsx \"%s\": repaired extracted mash header shared-data offset "
+           "0x%X -> 0x%X using its safety key",
+           path.filename().string().c_str(), staleOffset, recovered);
+    return true;
+}
+
 bool modPCSXImageUsable(const uint8_t *bytes, size_t size)
 {
     if (bytes == nullptr ||
         size < sizeof(generic_mash_header) + sizeof(script_executable))
+        return false;
+
+    // PS2SX starts its actual code after a platform marker and uses wider VM
+    // records.  It can satisfy the generic header checks below but must first
+    // pass through modPS2SXRegister's structural translator.
+    uint32_t platformMarker = 0;
+    if (size >= 0x70
+        && modPS2SXReadU32(bytes, size, 0x6C, &platformMarker)
+        && platformMarker == MOD_PS2SX_MARKER)
         return false;
 
     const auto *header = bit_cast<const generic_mash_header *>(bytes);
@@ -1375,6 +2009,12 @@ bool modPCSXRegister(const std::filesystem::path &path,
     if (modPCSXIsChunkImage(fileData.data(), fileData.size()))
         return modPCSXRegisterChunk(path, stem);
 
+    // Accept pristine pack mashes directly.  For loose files extracted by tools that
+    // replaced field_8 with the total byte count, restore the authenticated shared-data
+    // offset before validation.  This is what allows a standalone .PCSX to be used even
+    // when no RESOURCE_KEY_TYPE_SCRIPT entry exists in any loaded PCPACK.
+    modPCSXNormalizeLooseMashHeader(fileData, path);
+
     if (!modPCSXImageUsable(fileData.data(), fileData.size()))
     {
         sp_log("[mod] pcsx \"%s\": neither a \"scrobjs\" chunk script nor a "
@@ -1420,11 +2060,155 @@ bool modPCSXRegister(const std::filesystem::path &path,
     return true;
 }
 
+bool modPS2SXRegister(const std::filesystem::path &path,
+                      std::vector<uint8_t> &&fileData)
+{
+    std::string embeddedName;
+    if (!modPS2SXExtractName(fileData.data(), fileData.size(), &embeddedName))
+    {
+        sp_log("[mod] ps2sx \"%s\": embedded script name is invalid, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+
+    const uint32_t embeddedHash = to_hash(embeddedName.c_str());
+    const std::string stem = transformToLower(path.stem().string());
+    uint32_t filenameHash = 0;
+    const bool literalStem = modParseLiteralHash(stem, &filenameHash);
+    if ((!literalStem && to_hash(stem.c_str()) != embeddedHash)
+        || (literalStem && filenameHash != embeddedHash))
+    {
+        sp_log("[mod] ps2sx \"%s\": filename key does not match embedded "
+               "script \"%s\" (0x%08X), ignored",
+               path.filename().string().c_str(), embeddedName.c_str(),
+               embeddedHash);
+        return false;
+    }
+
+    modPS2SXTranslationStats stats {};
+    std::vector<uint8_t> converted;
+    std::string reason;
+    if (!modPS2SXConvert(fileData.data(), fileData.size(), &converted,
+                         &stats, &reason)
+        || !modPCSXImageUsable(converted.data(), converted.size()))
+    {
+        sp_log("[mod] ps2sx \"%s\" (%s, 0x%08X): %s, ignored",
+               path.filename().string().c_str(), embeddedName.c_str(),
+               embeddedHash,
+               reason.empty() ? "translated image failed PC mash validation"
+                              : reason.c_str());
+        return false;
+    }
+
+    auto &names = modPS2SXNames();
+    const auto oldName = names.find(embeddedHash);
+    if (oldName != names.end()
+        && transformToLower(oldName->second)
+               != transformToLower(embeddedName))
+    {
+        sp_log("[mod] ps2sx hash collision 0x%08X: \"%s\" vs \"%s\", "
+               "new file ignored", embeddedHash, oldName->second.c_str(),
+               embeddedName.c_str());
+        return false;
+    }
+
+    if (const Mod *existing = getMod(embeddedHash, MOD_TYPE_PS2SX_FILE))
+    {
+        if (existing->Data == converted)
+        {
+            sp_log("[mod] ps2sx \"%s\": byte-identical duplicate of \"%s\", "
+                   "ignored", path.filename().string().c_str(),
+                   existing->Path.string().c_str());
+            return true;
+        }
+
+        sp_log("[mod] ps2sx \"%s\": conflicts with \"%s\" for script "
+               "\"%s\" (0x%08X), first file retained",
+               path.filename().string().c_str(), existing->Path.string().c_str(),
+               embeddedName.c_str(), embeddedHash);
+        return false;
+    }
+    names[embeddedHash] = embeddedName;
+
+    // Re-enumeration and byte-identical copies from several PS2 packs should
+    // leave one deterministic override entry, not a chain of aliases.
+    auto range = Mods.equal_range(embeddedHash);
+    for (auto it = range.first; it != range.second; )
+        it = it->second.Type == MOD_TYPE_PS2SX_FILE ? Mods.erase(it)
+                                                    : std::next(it);
+
+    sp_log("[mod] registered ps2sx \"%s\" -> \"%s\" (0x%08X): "
+           "%u -> %u bytes, %u VM records, remapped %u global/%u local "
+           "calls and %u method offsets",
+           path.filename().string().c_str(), embeddedName.c_str(),
+           embeddedHash, static_cast<unsigned int>(fileData.size()),
+           static_cast<unsigned int>(converted.size()), stats.vmRecords,
+           stats.globalCalls, stats.localCalls, stats.methodOffsets);
+
+    Mods.emplace(embeddedHash,
+                 Mod{path, MOD_TYPE_PS2SX_FILE, std::move(converted)});
+    return true;
+}
+
+bool modPS2SXHashToString(uint32_t nameHash, std::string *nameOut)
+{
+    const auto found = modPS2SXNames().find(nameHash);
+    if (found == modPS2SXNames().end())
+        return false;
+    if (nameOut != nullptr)
+        *nameOut = found->second;
+    return true;
+}
+
+const char *modPS2SXHashName(uint32_t nameHash)
+{
+    const auto found = modPS2SXNames().find(nameHash);
+    return found == modPS2SXNames().end() ? nullptr
+                                          : found->second.c_str();
+}
+
+void modPS2SXResetRegistry()
+{
+    modPS2SXNames().clear();
+}
+
+bool modPS2SXOverrideSelected(uint32_t nameHash)
+{
+    return getMod(nameHash, MOD_TYPE_PCSX_FILE) == nullptr
+           && getMod(nameHash, MOD_TYPE_PS2SX_FILE) != nullptr;
+}
+
+bool modPS2SXIsRuntimeImage(const void *image)
+{
+    return image != nullptr
+           && modPS2SXRuntimeImages().count(image) != 0;
+}
+
 uint8_t *modPCSXGetOverride(uint32_t nameHash, int *sizeOut)
 {
     Mod *mod = getMod(nameHash, MOD_TYPE_PCSX_FILE);
+    bool fromPS2SX = false;
+    if (mod == nullptr)
+    {
+        mod = getMod(nameHash, MOD_TYPE_PS2SX_FILE);
+        fromPS2SX = mod != nullptr;
+    }
     if (mod == nullptr || mod->Data.empty())
         return nullptr;
+
+    // enumerate_mods runs before the engine creates its hash dictionary.
+    // Register the embedded name lazily now, when resource loading is live,
+    // so string_hash::to_string resolves 0x1189AB87 as ULTIMATE_SPIDERMAN
+    // instead of returning the synthetic hexadecimal fallback.
+    if (fromPS2SX)
+    {
+        std::string embeddedName;
+        if (modPS2SXHashToString(nameHash, &embeddedName))
+        {
+            const string_hash registeredName {embeddedName.c_str()};
+            (void)registeredName;
+        }
+    }
 
     // One 16-aligned (mash images are laid out against a 16-byte base; parse
     // rebases are 4/8-byte) writable buffer per mod image. The bytes in Mods
@@ -1450,6 +2234,8 @@ uint8_t *modPCSXGetOverride(uint32_t nameHash, int *sizeOut)
         slot.buffer = buffer;
         slot.size = mod->Data.size();
         std::memcpy(slot.buffer, mod->Data.data(), slot.size);
+        if (fromPS2SX)
+            modPS2SXRuntimeImages().insert(slot.buffer);
     }
     else if (!modPCSXIsLoaded(nameHash))
     {

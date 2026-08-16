@@ -318,6 +318,34 @@ extern bool modPCSXImageUsable(const uint8_t *bytes, size_t size);
 extern bool modPCSXRegister(const std::filesystem::path &path,
                             std::vector<uint8_t> &&fileData);
 
+// Validate and translate one PS2 beta .PS2SX mash into the PC layout, bind it
+// by the embedded fixedstring name/hash, and retain that name for the engine's
+// runtime hash dictionary. Malformed or unsupported beta images are rejected.
+extern bool modPS2SXRegister(const std::filesystem::path &path,
+                             std::vector<uint8_t> &&fileData);
+
+// Stable embedded-name lookup for hash-named PS2SX drops. This is also used
+// when auto-loading scripts so resource_key is built from the real script
+// name instead of from a filename such as "0x1189ab87".
+extern bool modPS2SXHashToString(uint32_t nameHash,
+                                 std::string *nameOut = nullptr);
+
+// Stable pointer into the embedded-name registry, used by
+// string_hash::to_string when the retail dictionary is unavailable.
+extern const char *modPS2SXHashName(uint32_t nameHash);
+
+// Clear filename/name registration before enumerate_mods rebuilds Mods.
+// Runtime-image identities are deliberately retained for live exec buffers.
+extern void modPS2SXResetRegistry();
+
+// True when the unified PCSX getter will select a converted PS2SX image for
+// this key (native PCSX has precedence when both formats are present).
+extern bool modPS2SXOverrideSelected(uint32_t nameHash);
+
+// Runtime-buffer identity used by script_executable::un_mash to keep an
+// optional scripts/<name>.pcsxl file from replacing converted beta bytecode.
+extern bool modPS2SXIsRuntimeImage(const void *image);
+
 // Writable image for the script name hash, or nullptr. Re-stamped from the
 // pristine master bytes whenever no loaded exec is using it, so every load
 // un_mashes and links virgin bytes like a re-streamed pack image.

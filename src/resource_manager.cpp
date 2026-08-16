@@ -2,7 +2,10 @@
 
 #include "binary_search_array_cmp.h"
 #include "common.h"
+#include "core_ai_resource.h"
+#include "base_ai_res_state_graph.h"
 #include "entity_base.h"
+#include "entity.h"
 #include "filespec.h"
 #include "func_wrapper.h"
 #include "game.h"
@@ -10,6 +13,7 @@
 #include "log.h"
 #include "trace.h"
 #include "memory.h"
+#include "mash_info_struct.h"
 #include "nal_system.h"
 #include "nfl_system.h"
 #include "ngl.h"
@@ -27,7 +31,998 @@
 #include "osassert.h"
 
 #include <cassert>
+#include <cstring>
 #include <numeric>
+#include <unordered_map>
+
+// ---------------------------------------------------------------------------
+// Loose .MSN / .PANEL serialized resource overrides
+//
+// These two formats are intentionally NOT pre-unmashed here:
+//   * MISSION_TABLE (.MSN) is a generic-mash image. mission_manager parses it
+//     with parse_generic_object_mash<mission_table_container>(), which sets the
+//     generic header in-use bit and rebases its mashable vectors in place.
+//   * PANEL is a raw PanelFile mash stream. PanelFile::UnmashPanelFile() builds
+//     a mash_info_struct over the bytes, un-mashes PanelFile and then runs its
+//     from-mash constructor.
+//
+// Returning Mod::Data directly would corrupt the pristine loose-file source on
+// the first load and make later loads re-unmash already-rebased pointers.  Each
+// lookup therefore gets a new 16-byte-aligned writable serialized image.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+inline constexpr int MOD_TYPE_MSN_FILE = 0x107;
+inline constexpr int MOD_TYPE_PANEL_FILE = 0x108;
+inline constexpr int MOD_TYPE_COLL_FILE = 0x109;
+inline constexpr int MOD_TYPE_CUT_FILE = 0x10A;
+inline constexpr int MOD_TYPE_PCMESHDEF_FILE = 0x10B;
+inline constexpr int MOD_TYPE_SLF_FILE = 0x10C;
+
+#pragma pack(push, 1)
+struct mod_generic_mash_header_disk {
+    uint32_t safety_key;
+    uint32_t flags;
+    int32_t mash_data_offset;
+    uint16_t class_id;
+    uint16_t field_E;
+};
+
+struct mod_mashable_vector_disk {
+    uint32_t data_cookie;
+    uint16_t size;
+    uint8_t shared;
+    uint8_t from_mash;
+};
+
+struct mod_msn_root_disk {
+    mod_mashable_vector_disk marker_bases;
+    mod_mashable_vector_disk camera_markers;
+    mod_mashable_vector_disk transform_markers;
+    mod_mashable_vector_disk camera_transform_markers;
+    mod_mashable_vector_disk nums;
+    mod_mashable_vector_disk strings;
+    mod_mashable_vector_disk positions;
+    mod_mashable_vector_disk conditions;
+    int32_t field_40;
+    uint32_t region_cookie;
+};
+
+struct mod_panel_vector_disk {
+    int32_t field_0;
+    int32_t size;
+    uint32_t data_cookie;
+    int32_t capacity;
+    uint8_t from_mash;
+    uint8_t padding[3];
+};
+
+struct mod_panel_root_disk {
+    mod_panel_vector_disk pquads;
+    mod_panel_vector_disk ptext;
+    mod_panel_vector_disk animations;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(mod_generic_mash_header_disk) == 0x10u,
+              "generic mash header disk layout changed");
+static_assert(sizeof(mod_mashable_vector_disk) == 0x08u,
+              "mashable_vector disk layout changed");
+static_assert(sizeof(mod_msn_root_disk) == 0x48u,
+              "mission_table_container disk layout changed");
+static_assert(sizeof(mod_panel_vector_disk) == 0x14u,
+              "PanelFile mVector disk layout changed");
+static_assert(sizeof(mod_panel_root_disk) == 0x3Cu,
+              "PanelFile disk layout changed");
+
+bool modMsnVectorUsable(const mod_mashable_vector_disk &vec)
+{
+    if (vec.shared > 1u || vec.from_mash != 1u)
+        return false;
+    if (vec.size > 0x7FFFu)
+        return false;
+    return true;
+}
+
+bool modPanelVectorUsable(const mod_panel_vector_disk &vec)
+{
+    if (vec.size < 0 || vec.size > 0x10000)
+        return false;
+    if (vec.capacity < vec.size || vec.capacity > 0x10000)
+        return false;
+    if (vec.from_mash != 1u)
+        return false;
+    if (vec.size > 0 && vec.data_cookie == 0u)
+        return false;
+    return true;
+}
+
+void modEraseTypedBinding(uint32_t hash, int modType)
+{
+    auto range = Mods.equal_range(hash);
+    for (auto it = range.first; it != range.second; )
+    {
+        if (it->second.Type == modType)
+            it = Mods.erase(it);
+        else
+            ++it;
+    }
+}
+
+bool modRegisterSerializedResource(const std::filesystem::path &path,
+                                   std::vector<uint8_t> &&fileData,
+                                   int modType,
+                                   const char *label)
+{
+    const std::string stem = transformToLower(path.stem().string());
+    const uint32_t hash = to_hash(stem.c_str());
+
+    uint32_t literal = 0;
+    const bool hasLiteral = modParseLiteralHash(stem, &literal) && literal != hash;
+
+    modEraseTypedBinding(hash, modType);
+    if (hasLiteral)
+        modEraseTypedBinding(literal, modType);
+
+    const unsigned fileSize = static_cast<unsigned>(fileData.size());
+    Mods.emplace(hash, Mod{path, modType, std::move(fileData)});
+
+    if (hasLiteral)
+    {
+        const Mod *registered = getMod(hash, modType);
+        if (registered != nullptr)
+            Mods.emplace(literal, Mod{registered->Path, modType, registered->Data});
+    }
+
+    sp_log("[mod][%s] registered \"%s\" -> \"%s\" (0x%08X, %u bytes)%s",
+           label, path.filename().string().c_str(), stem.c_str(), hash, fileSize,
+           hasLiteral ? " [literal-hash alias added]" : "");
+    return true;
+}
+
+uint8_t *modGetFreshSerializedOverride(uint32_t hash,
+                                       int modType,
+                                       int *sizeOut,
+                                       const char *label)
+{
+    Mod *mod = getMod(hash, modType);
+    if (mod == nullptr || mod->Data.empty() || mod->Data.size() > 0x7FFFFFFFu)
+        return nullptr;
+
+    void *raw = tlMemAlloc(static_cast<uint32_t>(mod->Data.size()),
+                           16u, 0x2000000u);
+    if (raw == nullptr)
+        return nullptr;
+
+    std::memcpy(raw, mod->Data.data(), mod->Data.size());
+    if (sizeOut != nullptr)
+        *sizeOut = static_cast<int>(mod->Data.size());
+
+    sp_log("[mod][%s] prepared fresh writable serialized image 0x%08X (%u bytes)",
+           label, hash, static_cast<unsigned>(mod->Data.size()));
+    return static_cast<uint8_t *>(raw);
+}
+
+} // namespace
+
+bool modMsnImageUsable(const uint8_t *bytes, size_t size)
+{
+    constexpr size_t rootOffset = sizeof(mod_generic_mash_header_disk);
+    constexpr size_t minimumSize = rootOffset + sizeof(mod_msn_root_disk);
+    if (bytes == nullptr || size < minimumSize || size > 0x7FFFFFFFu)
+        return false;
+
+    mod_generic_mash_header_disk header{};
+    mod_msn_root_disk root{};
+    std::memcpy(&header, bytes, sizeof(header));
+    std::memcpy(&root, bytes + rootOffset, sizeof(root));
+
+    // Mission tables use the non-polymorphic generic-mash path.  0xFFFF is
+    // the canonical no-class-id marker for the retail mission-table image.
+    if (header.class_id != 0xFFFFu)
+        return false;
+    if ((header.flags & 0xC0000000u) != 0u) // pristine + no vtable class path
+        return false;
+    if (header.mash_data_offset < static_cast<int32_t>(minimumSize)
+        || static_cast<size_t>(header.mash_data_offset) > size)
+        return false;
+
+    const mod_mashable_vector_disk *vectors[] = {
+        &root.marker_bases, &root.camera_markers, &root.transform_markers,
+        &root.camera_transform_markers, &root.nums, &root.strings,
+        &root.positions, &root.conditions
+    };
+    for (const auto *vec : vectors)
+        if (!modMsnVectorUsable(*vec))
+            return false;
+
+    return true;
+}
+
+bool modMsnRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData)
+{
+    if (!modMsnImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][msn] \"%s\": invalid mission_table_container generic mash, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+    return modRegisterSerializedResource(path, std::move(fileData),
+                                         MOD_TYPE_MSN_FILE, "msn");
+}
+
+uint8_t *modMsnGetOverride(uint32_t hash, int *sizeOut)
+{
+    Mod *mod = getMod(hash, MOD_TYPE_MSN_FILE);
+    if (mod == nullptr || !modMsnImageUsable(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+    return modGetFreshSerializedOverride(hash, MOD_TYPE_MSN_FILE, sizeOut, "msn");
+}
+
+bool modPanelImageUsable(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr || size < sizeof(mod_panel_root_disk)
+        || size > 0x7FFFFFFFu)
+        return false;
+
+    mod_panel_root_disk root{};
+    std::memcpy(&root, bytes, sizeof(root));
+    return modPanelVectorUsable(root.pquads)
+        && modPanelVectorUsable(root.ptext)
+        && modPanelVectorUsable(root.animations);
+}
+
+bool modPanelRegister(const std::filesystem::path &path,
+                      std::vector<uint8_t> &&fileData)
+{
+    if (!modPanelImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][panel] \"%s\": invalid PanelFile mash stream, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+    return modRegisterSerializedResource(path, std::move(fileData),
+                                         MOD_TYPE_PANEL_FILE, "panel");
+}
+
+uint8_t *modPanelGetOverride(uint32_t hash, int *sizeOut)
+{
+    Mod *mod = getMod(hash, MOD_TYPE_PANEL_FILE);
+    if (mod == nullptr || !modPanelImageUsable(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+    return modGetFreshSerializedOverride(hash, MOD_TYPE_PANEL_FILE, sizeOut, "panel");
+}
+
+
+// ---------------------------------------------------------------------------
+// Loose .COLL / .CUT / .PCMESHDEF / .SLF resource overrides
+//
+// These are engine resource-key payloads, not generic filesystem blobs:
+//   COLL      -> RESOURCE_KEY_TYPE_COLLISION_MESH
+//   CUT       -> RESOURCE_KEY_TYPE_CUT_SCENE
+//   PCMESHDEF -> RESOURCE_KEY_TYPE_MESH_FILE_STRUCT
+//   SLF       -> RESOURCE_KEY_TYPE_SLF_LIST
+//
+// COLL is modified in-place by cg_mesh::_un_mash (the last signature byte is
+// changed to 'Z'). CUT is un-mashed in place by cut_scene_resource_handler,
+// and PCMESHDEF is a generic-mash image. Keep Mod::Data pristine and hand the
+// engine aligned writable copies. SLF itself is read-only, but using the same
+// copy path keeps external-only resource ownership uniform.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+#pragma pack(push, 1)
+struct mod_coll_header_disk {
+    char magic[4];
+    uint32_t version;
+    int32_t field_8;
+    int32_t field_C;
+};
+
+struct mod_cut_vector_disk {
+    int32_t field_0;
+    int32_t size;
+    uint32_t data_cookie;
+    int32_t capacity;
+    uint8_t from_mash;
+    uint8_t padding[3];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(mod_coll_header_disk) == 0x10u,
+              "COLL header disk layout changed");
+static_assert(sizeof(mod_cut_vector_disk) == 0x14u,
+              "CUT mVector disk layout changed");
+
+bool modCutVectorUsable(const mod_cut_vector_disk &vec)
+{
+    if (vec.size < 0 || vec.size > 0x4000)
+        return false;
+    if (vec.capacity < vec.size || vec.capacity > 0x10000)
+        return false;
+    if (vec.from_mash > 1u)
+        return false;
+    if (vec.size > 0 && vec.data_cookie == 0u)
+        return false;
+    return true;
+}
+
+bool modSlfImageUsableInternal(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr || size < sizeof(uint32_t) || size > 0x7FFFFFFFu)
+        return false;
+
+    uint32_t totalClasses = 0;
+    std::memcpy(&totalClasses, bytes, sizeof(totalClasses));
+    if (totalClasses == 0u || totalClasses > 0x1000u)
+        return false;
+
+    size_t cursor = sizeof(uint32_t);
+    for (uint32_t i = 0; i < totalClasses; ++i)
+    {
+        if (cursor > size || size - cursor < sizeof(uint32_t))
+            return false;
+
+        uint32_t totalFuncs = 0;
+        std::memcpy(&totalFuncs, bytes + cursor, sizeof(totalFuncs));
+        cursor += sizeof(uint32_t);
+
+        if (totalFuncs > 0x10000u)
+            return false;
+
+        const size_t funcBytes = static_cast<size_t>(totalFuncs) * sizeof(uint32_t);
+        if (cursor > size || funcBytes > size - cursor)
+            return false;
+        cursor += funcBytes;
+    }
+
+    // slc_manager::un_mash_all_funcs walks this exact stream without a size
+    // field or footer. Trailing bytes therefore indicate a mismatched image.
+    return cursor == size;
+}
+
+} // namespace
+
+bool modCollImageUsable(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr || size < sizeof(mod_coll_header_disk)
+        || size > 0x7FFFFFFFu)
+        return false;
+
+    mod_coll_header_disk header{};
+    std::memcpy(&header, bytes, sizeof(header));
+
+    if (std::memcmp(header.magic, "COLL", 4) != 0
+        && std::memcmp(header.magic, "COLB", 4) != 0)
+        return false;
+
+    // cg_mesh::_un_mash accepts this exact retail PC collision version.
+    return header.version == 0x0010003Fu;
+}
+
+bool modCollRegister(const std::filesystem::path &path,
+                     std::vector<uint8_t> &&fileData)
+{
+    if (!modCollImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][coll] \"%s\": invalid/unsupported collision mesh, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+    return modRegisterSerializedResource(path, std::move(fileData),
+                                         MOD_TYPE_COLL_FILE, "coll");
+}
+
+uint8_t *modCollGetOverride(uint32_t hash, int *sizeOut)
+{
+    Mod *mod = getMod(hash, MOD_TYPE_COLL_FILE);
+    if (mod == nullptr || !modCollImageUsable(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+    return modGetFreshSerializedOverride(hash, MOD_TYPE_COLL_FILE, sizeOut, "coll");
+}
+
+bool modCutImageUsable(const uint8_t *bytes, size_t size)
+{
+    // cut_scene is 0x54 bytes on PC; its mVector<cut_scene_segment> begins at
+    // offset 0x10 and is still in serialized/from-mash form on disk.
+    constexpr size_t cutSceneSize = 0x54u;
+    constexpr size_t segmentsOffset = 0x10u;
+    if (bytes == nullptr || size < cutSceneSize || size > 0x7FFFFFFFu)
+        return false;
+
+    mod_cut_vector_disk segments{};
+    std::memcpy(&segments, bytes + segmentsOffset, sizeof(segments));
+    return modCutVectorUsable(segments);
+}
+
+bool modCutRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData)
+{
+    if (!modCutImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][cut] \"%s\": invalid cut_scene mash stream, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+    return modRegisterSerializedResource(path, std::move(fileData),
+                                         MOD_TYPE_CUT_FILE, "cut");
+}
+
+uint8_t *modCutGetOverride(uint32_t hash, int *sizeOut)
+{
+    Mod *mod = getMod(hash, MOD_TYPE_CUT_FILE);
+    if (mod == nullptr || !modCutImageUsable(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+    return modGetFreshSerializedOverride(hash, MOD_TYPE_CUT_FILE, sizeOut, "cut");
+}
+
+bool modPcmeshdefImageUsable(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr || size < sizeof(mod_generic_mash_header_disk) + 4u
+        || size > 0x7FFFFFFFu)
+        return false;
+
+    mod_generic_mash_header_disk header{};
+    std::memcpy(&header, bytes, sizeof(header));
+
+    if (header.class_id != 0xFFFFu)
+        return false;
+    if ((header.flags & 0xC0000000u) != 0u)
+        return false;
+    if (header.mash_data_offset < static_cast<int32_t>(sizeof(header))
+        || static_cast<size_t>(header.mash_data_offset) > size)
+        return false;
+
+    return true;
+}
+
+bool modPcmeshdefRegister(const std::filesystem::path &path,
+                          std::vector<uint8_t> &&fileData)
+{
+    if (!modPcmeshdefImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][pcmeshdef] \"%s\": invalid mesh-file definition generic mash, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+    return modRegisterSerializedResource(path, std::move(fileData),
+                                         MOD_TYPE_PCMESHDEF_FILE, "pcmeshdef");
+}
+
+uint8_t *modPcmeshdefGetOverride(uint32_t hash, int *sizeOut)
+{
+    Mod *mod = getMod(hash, MOD_TYPE_PCMESHDEF_FILE);
+    if (mod == nullptr
+        || !modPcmeshdefImageUsable(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+    return modGetFreshSerializedOverride(hash, MOD_TYPE_PCMESHDEF_FILE,
+                                         sizeOut, "pcmeshdef");
+}
+
+bool modSlfRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData)
+{
+    if (!modSlfImageUsableInternal(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][slf] \"%s\": invalid SLC function-list stream, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+    return modRegisterSerializedResource(path, std::move(fileData),
+                                         MOD_TYPE_SLF_FILE, "slf");
+}
+
+uint8_t *modSlfGetOverride(uint32_t hash, int *sizeOut)
+{
+    Mod *mod = getMod(hash, MOD_TYPE_SLF_FILE);
+    if (mod == nullptr
+        || !modSlfImageUsableInternal(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+    return modGetFreshSerializedOverride(hash, MOD_TYPE_SLF_FILE, sizeOut, "slf");
+}
+
+
+// ---------------------------------------------------------------------------
+// Loose .BAI resource overrides
+//
+// BASE_AI resources are raw ai::core_ai_resource mash streams.  The packed
+// base_ai_resource_handler gets writable pack bytes, un-mashes the root in
+// place, then runs its from-mash constructor.  extra/**/*.bai must follow the
+// same lifetime: Mod::Data stays pristine and the game receives a private,
+// aligned, writable and already-constructed core_ai_resource object.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+inline constexpr int MOD_TYPE_BAI_FILE = 0x105;
+
+#pragma pack(push, 1)
+struct mod_bai_vector_disk {
+    int32_t field_0;
+    int32_t size;
+    uint32_t data_cookie;
+    int32_t capacity;
+    uint8_t flag;
+    uint8_t padding[3];
+};
+
+struct mod_bai_root_disk {
+    uint32_t param_field_0;
+    uint32_t param_array_cookie;
+    uint8_t param_flag;
+    uint8_t param_padding[3];
+    uint32_t field_C;
+    uint32_t combo_system_cookie;
+    mod_bai_vector_disk base_graphs;
+    mod_bai_vector_disk locomotion_graphs;
+    uint32_t pack_slot_cookie;
+    uint32_t field_40;
+    uint8_t field_44;
+    uint8_t tail_padding[3];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(mod_bai_vector_disk) == 0x14u,
+              "BAI mVector disk layout changed");
+static_assert(sizeof(mod_bai_root_disk) == 0x48u,
+              "BAI core_ai_resource disk layout changed");
+
+struct mod_bai_runtime_image {
+    const Mod *source = nullptr;
+    uint8_t *copy = nullptr;
+    int size = 0;
+};
+
+std::unordered_map<uint32_t, mod_bai_runtime_image> &modBaiRuntimeImages()
+{
+    static std::unordered_map<uint32_t, mod_bai_runtime_image> images;
+    return images;
+}
+
+bool modBaiVectorUsable(const mod_bai_vector_disk &vec)
+{
+    if (vec.size < 0 || vec.size > 0x4000)
+        return false;
+    if (vec.capacity < vec.size || vec.capacity > 0x10000)
+        return false;
+    if (vec.flag > 1u)
+        return false;
+    if (vec.size > 0 && vec.data_cookie == 0u)
+        return false;
+    return true;
+}
+
+void modBaiEraseTypedBinding(uint32_t hash)
+{
+    auto range = Mods.equal_range(hash);
+    for (auto it = range.first; it != range.second; )
+    {
+        if (it->second.Type == MOD_TYPE_BAI_FILE)
+            it = Mods.erase(it);
+        else
+            ++it;
+    }
+}
+
+} // namespace
+
+bool modBaiImageUsable(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr || size < sizeof(mod_bai_root_disk))
+        return false;
+
+    mod_bai_root_disk root{};
+    std::memcpy(&root, bytes, sizeof(root));
+
+    // param_block::field_8 is a bool followed by mash padding.
+    if (root.param_flag > 1u)
+        return false;
+
+    if (!modBaiVectorUsable(root.base_graphs)
+        || !modBaiVectorUsable(root.locomotion_graphs))
+        return false;
+
+    // Each populated mVector needs at least one serialized pointer slot per
+    // element somewhere in the stream.  This is deliberately only a lower
+    // bound: param_block/combo data may appear before those arrays.
+    const size_t minimumSize = sizeof(mod_bai_root_disk)
+        + sizeof(uint32_t) * static_cast<size_t>(root.base_graphs.size)
+        + sizeof(uint32_t) * static_cast<size_t>(root.locomotion_graphs.size);
+    if (minimumSize > size)
+        return false;
+
+    return true;
+}
+
+bool modBaiRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData)
+{
+    if (!modBaiImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][bai] \"%s\": invalid core_ai_resource mash stream, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+
+    const std::string stem = transformToLower(path.stem().string());
+    const uint32_t hash = to_hash(stem.c_str());
+
+    uint32_t literal = 0;
+    const bool hasLiteral = modParseLiteralHash(stem, &literal) && literal != hash;
+
+    modBaiEraseTypedBinding(hash);
+    if (hasLiteral)
+        modBaiEraseTypedBinding(literal);
+
+    // Do not free a previous live image here: game objects may still point at
+    // it.  Dropping the cache entry simply makes a later request build from
+    // the newly registered pristine source.
+    modBaiRuntimeImages().erase(hash);
+    if (hasLiteral)
+        modBaiRuntimeImages().erase(literal);
+
+    const unsigned fileSize = static_cast<unsigned>(fileData.size());
+    Mods.emplace(hash, Mod{path, MOD_TYPE_BAI_FILE, std::move(fileData)});
+
+    if (hasLiteral)
+    {
+        const Mod *registered = getMod(hash, MOD_TYPE_BAI_FILE);
+        if (registered != nullptr)
+            Mods.emplace(literal,
+                         Mod{registered->Path, MOD_TYPE_BAI_FILE, registered->Data});
+    }
+
+    sp_log("[mod][bai] registered \"%s\" -> \"%s\" "
+           "(0x%08X, %u bytes, core_ai_resource mash)%s",
+           path.filename().string().c_str(), stem.c_str(), hash, fileSize,
+           hasLiteral ? " [literal-hash alias added]" : "");
+    return true;
+}
+
+uint8_t *modBaiGetOverride(uint32_t baiHash, int *sizeOut)
+{
+    Mod *mod = getMod(baiHash, MOD_TYPE_BAI_FILE);
+    if (mod == nullptr || mod->Data.empty()
+        || !modBaiImageUsable(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+
+    auto &slot = modBaiRuntimeImages()[baiHash];
+    if (slot.copy == nullptr || slot.source != mod)
+    {
+        if (mod->Data.size() > 0x7FFFFFFFu)
+            return nullptr;
+
+        void *raw = tlMemAlloc(static_cast<uint32_t>(mod->Data.size()),
+                               16u, 0x2000000u);
+        if (raw == nullptr)
+            return nullptr;
+
+        std::memcpy(raw, mod->Data.data(), mod->Data.size());
+
+        auto *aiResource = bit_cast<ai::core_ai_resource *>(raw);
+        mash_info_struct mash{static_cast<uint8_t *>(raw),
+                              static_cast<int>(mod->Data.size())};
+
+        // Same LOAD path as base_ai_resource_handler::_handle_resource.
+        mash.unmash_class(aiResource, nullptr);
+        mash_info_struct::construct_class(aiResource);
+
+        if (aiResource != raw)
+        {
+            sp_log("[mod][bai] 0x%08X: root rebased away from image base, rejected",
+                   baiHash);
+            tlMemFree(raw);
+            return nullptr;
+        }
+
+        slot.source = mod;
+        slot.copy = static_cast<uint8_t *>(raw);
+        slot.size = static_cast<int>(mod->Data.size());
+
+        sp_log("[mod][bai] prepared writable BAI 0x%08X (%d bytes)",
+               baiHash, slot.size);
+    }
+
+    if (sizeOut != nullptr)
+        *sizeOut = slot.size;
+    return slot.copy;
+}
+
+
+// ---------------------------------------------------------------------------
+// Loose .ASG resource overrides
+//
+// AI_STATE_GRAPH resources are raw ai::state_graph mash streams.  The packed
+// ai_state_graph_resource_handler un-mashes the writable resource image in
+// place and then runs the state_graph from-mash constructor. extra/**/*.asg
+// follows the same path while preserving Mod::Data as a pristine source.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+inline constexpr int MOD_TYPE_ASG_FILE = 0x106;
+
+#pragma pack(push, 1)
+struct mod_asg_vector_disk {
+    int32_t field_0;
+    int32_t size;
+    uint32_t data_cookie;
+    int32_t capacity;
+    uint8_t flag;
+    uint8_t padding[3];
+};
+
+struct mod_asg_root_disk {
+    uint32_t name_hash;
+    uint32_t resource_type;
+    mod_asg_vector_disk states;
+    uint32_t initial_state_cookie;
+    mod_asg_vector_disk base_states;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(mod_asg_vector_disk) == 0x14u,
+              "ASG mVector disk layout changed");
+static_assert(sizeof(mod_asg_root_disk) == 0x34u,
+              "ASG ai::state_graph disk layout changed");
+
+struct mod_asg_runtime_image {
+    const Mod *source = nullptr;
+    uint8_t *copy = nullptr;
+    int size = 0;
+};
+
+std::unordered_map<uint32_t, mod_asg_runtime_image> &modAsgRuntimeImages()
+{
+    static std::unordered_map<uint32_t, mod_asg_runtime_image> images;
+    return images;
+}
+
+bool modAsgVectorUsable(const mod_asg_vector_disk &vec)
+{
+    if (vec.size < 0 || vec.size > 0x4000)
+        return false;
+    if (vec.capacity < vec.size || vec.capacity > 0x10000)
+        return false;
+    if (vec.flag > 1u)
+        return false;
+    if (vec.size > 0 && vec.data_cookie == 0u)
+        return false;
+    return true;
+}
+
+void modAsgEraseTypedBinding(uint32_t hash)
+{
+    auto range = Mods.equal_range(hash);
+    for (auto it = range.first; it != range.second; )
+    {
+        if (it->second.Type == MOD_TYPE_ASG_FILE)
+            it = Mods.erase(it);
+        else
+            ++it;
+    }
+}
+
+} // namespace
+
+bool modAsgImageUsable(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr || size < sizeof(mod_asg_root_disk))
+        return false;
+
+    mod_asg_root_disk root{};
+    std::memcpy(&root, bytes, sizeof(root));
+
+    if (root.resource_type
+        != static_cast<uint32_t>(RESOURCE_KEY_TYPE_AI_STATE_GRAPH))
+        return false;
+
+    if (!modAsgVectorUsable(root.states)
+        || !modAsgVectorUsable(root.base_states))
+        return false;
+
+    // A populated graph must have a valid initial-state mash cookie.
+    if (root.states.size > 0 && root.initial_state_cookie == 0u)
+        return false;
+
+    // Minimum pointer-table footprint. Actual state/base-state records add
+    // more data after the root; this is only a conservative bounds check.
+    const size_t minimumSize = sizeof(mod_asg_root_disk)
+        + sizeof(uint32_t) * static_cast<size_t>(root.states.size)
+        + sizeof(uint32_t) * static_cast<size_t>(root.base_states.size);
+    if (minimumSize > size)
+        return false;
+
+    return true;
+}
+
+bool modAsgRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData)
+{
+    if (!modAsgImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][asg] \"%s\": invalid ai::state_graph mash stream, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+
+    const std::string stem = transformToLower(path.stem().string());
+    const uint32_t hash = to_hash(stem.c_str());
+
+    uint32_t literal = 0;
+    const bool hasLiteral = modParseLiteralHash(stem, &literal) && literal != hash;
+
+    modAsgEraseTypedBinding(hash);
+    if (hasLiteral)
+        modAsgEraseTypedBinding(literal);
+
+    // Existing live state graphs can still be referenced by AI state machines,
+    // so do not free them here. Dropping the cache binding makes future
+    // requests construct from the newly registered pristine source.
+    modAsgRuntimeImages().erase(hash);
+    if (hasLiteral)
+        modAsgRuntimeImages().erase(literal);
+
+    const unsigned fileSize = static_cast<unsigned>(fileData.size());
+    Mods.emplace(hash, Mod{path, MOD_TYPE_ASG_FILE, std::move(fileData)});
+
+    if (hasLiteral)
+    {
+        const Mod *registered = getMod(hash, MOD_TYPE_ASG_FILE);
+        if (registered != nullptr)
+            Mods.emplace(literal,
+                         Mod{registered->Path, MOD_TYPE_ASG_FILE, registered->Data});
+    }
+
+    sp_log("[mod][asg] registered \"%s\" -> \"%s\" "
+           "(0x%08X, %u bytes, ai::state_graph mash)%s",
+           path.filename().string().c_str(), stem.c_str(), hash, fileSize,
+           hasLiteral ? " [literal-hash alias added]" : "");
+    return true;
+}
+
+uint8_t *modAsgGetOverride(uint32_t asgHash, int *sizeOut)
+{
+    Mod *mod = getMod(asgHash, MOD_TYPE_ASG_FILE);
+    if (mod == nullptr || mod->Data.empty()
+        || !modAsgImageUsable(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+
+    auto &slot = modAsgRuntimeImages()[asgHash];
+    if (slot.copy == nullptr || slot.source != mod)
+    {
+        if (mod->Data.size() > 0x7FFFFFFFu)
+            return nullptr;
+
+        void *raw = tlMemAlloc(static_cast<uint32_t>(mod->Data.size()),
+                               16u, 0x2000000u);
+        if (raw == nullptr)
+            return nullptr;
+
+        std::memcpy(raw, mod->Data.data(), mod->Data.size());
+
+        auto *stateGraph = bit_cast<ai::state_graph *>(raw);
+        mash_info_struct mash{static_cast<uint8_t *>(raw),
+                              static_cast<int>(mod->Data.size())};
+
+        // Same LOAD path as ai_state_graph_resource_handler::_handle_resource.
+        mash.unmash_class(stateGraph, nullptr);
+        mash_info_struct::construct_class(stateGraph);
+
+        if (stateGraph != raw)
+        {
+            sp_log("[mod][asg] 0x%08X: root rebased away from image base, rejected",
+                   asgHash);
+            tlMemFree(raw);
+            return nullptr;
+        }
+
+        slot.source = mod;
+        slot.copy = static_cast<uint8_t *>(raw);
+        slot.size = static_cast<int>(mod->Data.size());
+
+        sp_log("[mod][asg] prepared writable ASG 0x%08X (%d bytes)",
+               asgHash, slot.size);
+    }
+
+    if (sizeOut != nullptr)
+        *sizeOut = slot.size;
+    return slot.copy;
+}
+
+// nal_system.cpp: content-based PCANIM flavor detection used to keep
+// RESOURCE_KEY_TYPE_SCENE_ANIM bound to TLRESOURCE_TYPE_SCENE_ANIM.
+int modPCANIMDetectTLType(const uint8_t *raw, size_t size, int preferredType);
+int modPCMESHDetectTLType(const uint8_t *raw, size_t size, int preferredType);
+
+// Resource-pack bytes are normally writable pack memory.  A loose external
+// file must not expose its pristine Mod::Data directly because NAL, NGL and
+// several mash readers patch/rebase the serialized image in place.
+static uint8_t *modCloneExternalSerializedImage(const uint8_t *src, int size)
+{
+    if (src == nullptr || size <= 0)
+        return nullptr;
+
+    void *copy = tlMemAlloc(static_cast<uint32_t>(size), 16u, 0x2000000u);
+    if (copy == nullptr)
+        return nullptr;
+
+    std::memcpy(copy, src, static_cast<size_t>(size));
+    return static_cast<uint8_t *>(copy);
+}
+
+static uint8_t *modGetLooseTLBytes(uint32_t hash, int tlType, int *sizeOut)
+{
+    if (sizeOut != nullptr)
+        *sizeOut = 0;
+
+    if (tlType == TLRESOURCE_TYPE_ANIM_FILE
+        || tlType == TLRESOURCE_TYPE_SCENE_ANIM
+        || tlType == TLRESOURCE_TYPE_SKELETON)
+        modScanNalOverrides();
+
+    Mod *mod = getMod(hash, tlType);
+    if (mod == nullptr || mod->Data.empty() || mod->Data.size() > 0x7FFFFFFFu)
+        return nullptr;
+
+    const int size = static_cast<int>(mod->Data.size());
+    uint8_t *copy = modCloneExternalSerializedImage(mod->Data.data(), size);
+    if (copy != nullptr && sizeOut != nullptr)
+        *sizeOut = size;
+    return copy;
+}
+
+// Same as modGetLooseTLBytes, but selects an exact loose-file extension from
+// the hash bucket.  Texture hashes can have several typed entries (.DDS, .TGA,
+// generated images), so the external-only DDS path must not accidentally hand
+// another file format to a caller that requested raw DDS bytes.
+static uint8_t *modGetLooseTLBytesByExtension(uint32_t hash, int tlType,
+                                              const char *extension,
+                                              int *sizeOut)
+{
+    if (sizeOut != nullptr)
+        *sizeOut = 0;
+
+    if (extension == nullptr)
+        return nullptr;
+
+    if (tlType == TLRESOURCE_TYPE_SKELETON)
+        modScanNalOverrides();
+
+    const std::string wanted = transformToLower(extension);
+    auto range = Mods.equal_range(hash);
+    for (auto it = range.first; it != range.second; ++it)
+    {
+        Mod &mod = it->second;
+        if (mod.Type != tlType
+            || transformToLower(mod.Path.extension().string()) != wanted
+            || mod.Data.empty()
+            || mod.Data.size() > 0x7FFFFFFFu)
+            continue;
+
+        // Reject obviously malformed DDS images before NGL/D3DX sees them.
+        if (wanted == ".dds")
+        {
+            if (mod.Data.size() < 128u)
+                continue;
+            uint32_t magic = 0;
+            std::memcpy(&magic, mod.Data.data(), sizeof(magic));
+            if (magic != 0x20534444u && magic != 0x4D534444u)
+                continue;
+        }
+
+        const int size = static_cast<int>(mod.Data.size());
+        uint8_t *copy = modCloneExternalSerializedImage(mod.Data.data(), size);
+        if (copy != nullptr && sizeOut != nullptr)
+            *sizeOut = size;
+        return copy;
+    }
+
+    return nullptr;
+}
 
 namespace resource_manager {
 
@@ -1140,6 +2135,250 @@ bool get_resource_if_exists(const resource_key &resource_id,
     assert(slot_ptr != nullptr);
 
     auto v6 = slot_ptr->get_resource(resource_id, mash_data_size, nullptr);
+
+    // These file classes may be referenced by another loose resource even when
+    // no active PCPACK has a directory entry for them.  Resolve the external
+    // registry before the retail-null early return.
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_ENTITY)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modEntGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_ALS_FILE)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modAlsGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    // DDS/PCSKEL are fallback-only in this path: a real PCPACK entry stays
+    // authoritative.  Loose files are consulted only when the active pack has
+    // no resource with this key.  This is the same external-only behavior used
+    // for resources that exist solely under extra/.
+    if (v6 == nullptr && resource_id.get_type() == RESOURCE_KEY_TYPE_TEXTURE)
+    {
+        int externalSize = 0;
+        if (uint8_t *img = modGetLooseTLBytesByExtension(
+                resource_id.m_hash.source_hash_code, TLRESOURCE_TYPE_TEXTURE,
+                ".dds", &externalSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = externalSize;
+            *a3 = img;
+            sp_log("[mod][resource_manager] external-only DDS found for %s "
+                   "(0x%08X, %d bytes; no PCPACK entry)",
+                   resource_id.m_hash.to_string(),
+                   resource_id.m_hash.source_hash_code, externalSize);
+            return true;
+        }
+    }
+
+    if (v6 == nullptr && resource_id.get_type() == RESOURCE_KEY_TYPE_NAL_SKL)
+    {
+        int externalSize = 0;
+        if (uint8_t *img = modGetLooseTLBytesByExtension(
+                resource_id.m_hash.source_hash_code, TLRESOURCE_TYPE_SKELETON,
+                ".pcskel", &externalSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = externalSize;
+            *a3 = img;
+            sp_log("[mod][resource_manager] external-only PCSKEL found for %s "
+                   "(0x%08X, %d bytes; no PCPACK entry)",
+                   resource_id.m_hash.to_string(),
+                   resource_id.m_hash.source_hash_code, externalSize);
+            return true;
+        }
+    }
+
+    // Explicit raw PCMESH override.  Unlike DDS/PCSKEL fallback resources,
+    // extra/<name>.PCMESH is a drop-in mesh-file replacement: when it exists it
+    // must win even if the active PCPACK also contains the same mesh key.
+    //
+    // Return the PRISTINE Mod::Data bytes here. nglLoadMeshFileInternalPC will
+    // immediately clone them through tlMemAlloc before the retail parser rebases
+    // offsets in place. This keeps the registry immutable and gives FileBuf the
+    // same allocator ownership expected by tlReleaseFile().
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_MESH)
+    {
+        int externalSize = 0;
+        const uint8_t *external = modPCMESHGetOverride(
+            resource_id.m_hash.source_hash_code, &externalSize);
+        if (external != nullptr
+            && externalSize > 0
+            && modPCMESHDetectTLType(external, static_cast<size_t>(externalSize),
+                                     TLRESOURCE_TYPE_MESH_FILE)
+                == TLRESOURCE_TYPE_MESH_FILE)
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = externalSize;
+            *a3 = const_cast<uint8_t *>(external);
+            sp_log("[mod][resource_manager] PCMESH override selected for %s "
+                   "(0x%08X, %d bytes; packed=%s)",
+                   resource_id.m_hash.to_string(),
+                   resource_id.m_hash.source_hash_code, externalSize,
+                   v6 != nullptr ? "yes" : "no");
+            return true;
+        }
+    }
+
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_ANIMATION
+        || resource_id.get_type() == RESOURCE_KEY_TYPE_SCENE_ANIM)
+    {
+        const bool sceneFlavor =
+            resource_id.get_type() == RESOURCE_KEY_TYPE_SCENE_ANIM;
+        const int originalSize = (v6 != nullptr && mash_data_size != nullptr)
+                               ? *mash_data_size : 0;
+        int overrideSize = 0;
+        uint8_t *src = modPCANIMGetOverride(
+            resource_id.m_hash.source_hash_code, &overrideSize,
+            v6, originalSize, sceneFlavor);
+        if (src != nullptr)
+        {
+            uint8_t *img = modCloneExternalSerializedImage(src, overrideSize);
+            if (img != nullptr)
+            {
+                modPCANIMTrackExternalImage(
+                    img, resource_id.m_hash.source_hash_code,
+                    overrideSize, sceneFlavor);
+                if (mash_data_size != nullptr)
+                    *mash_data_size = overrideSize;
+                *a3 = img;
+                return true;
+            }
+        }
+    }
+
+    // Keep BASE_AI loose-file behavior consistent with get_resource(). Some
+    // gameplay paths use this "if exists" helper instead of the global
+    // context getter, so consult the typed BAI registry even when the retail
+    // slot has no same-name resource.
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_BASE_AI)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modBaiGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    // State graphs can be queried through this helper too. Keep loose ASG
+    // behavior identical to get_resource(), including external-only graphs.
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_AI_STATE_GRAPH)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modAsgGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    // Mission tables and panels are serialized images whose consumers perform
+    // in-place un-mashing. Return a fresh writable copy even for external-only
+    // resources so repeated loads never see previously rebased pointers.
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_MISSION_TABLE)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modMsnGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_PANEL)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modPanelGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    // External-only serialized engine resources. Check these before the
+    // retail-null early return so references from other loose assets resolve
+    // even when the active PCPACK has no directory entry for the resource.
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_COLLISION_MESH)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modCollGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_CUT_SCENE)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modCutGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_MESH_FILE_STRUCT)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modPcmeshdefGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
+    if (resource_id.get_type() == RESOURCE_KEY_TYPE_SLF_LIST)
+    {
+        int overrideSize = 0;
+        if (uint8_t *img = modSlfGetOverride(
+                resource_id.m_hash.source_hash_code, &overrideSize))
+        {
+            if (mash_data_size != nullptr)
+                *mash_data_size = overrideSize;
+            *a3 = img;
+            return true;
+        }
+    }
+
     if (v6 == nullptr) {
         return false;
     }
@@ -1159,46 +2398,409 @@ uint8_t *get_resource(const resource_key &resource_id, int *mash_data_size, reso
         assert(get_resource_context() != nullptr && "Can't get a resource without a context!");
         assert(get_resource_context()->is_data_ready() && "Invalid resource context");
 
-        auto *result = get_resource_context()->get_resource(resource_id, mash_data_size, a3);
+        // Keep the retail byte count even when the caller did not request it:
+        // PCANIM compatibility checks need the exact bounds of the packed
+        // source image before an external file may replace it.
+        int localMashDataSize = 0;
+        int *actualMashDataSize = mash_data_size != nullptr
+                                ? mash_data_size : &localMashDataSize;
+        auto *result = get_resource_context()->get_resource(
+            resource_id, actualMashDataSize, a3);
 
-        // .ENT mod override (entity_base.cpp): every named-entity fetch -
-        // dynamic spawns, fx caches, console "spawn" - funnels through here
-        // (SET_JUMP at 0x00531B30 routes the retail callers in), so a
-        // validated extra/<name>.ent image replaces the retail bytes at the
-        // one spot that knows the class-name key. Only bytes and size are
-        // swapped: the pack slot the retail lookup produced stays, keeping
-        // instance tracking and pack-unload teardown intact - which is also
-        // why an entity absent from every loaded pack cannot be injected
-        // (there is no slot to own it). ENTITY only: an EXTERNAL_ENT
-        // (.ENTEXT) request shares the same name hash but expects a
-        // different payload, so handing it the mash image would be wrong.
-        if (resource_id.get_type() == RESOURCE_KEY_TYPE_ENTITY)
+        // Explicit .PCMESH override. The loose file intentionally wins over
+        // a same-name PCPACK resource. Publish only pristine registry bytes;
+        // NGL clones them into engine-owned writable memory before parsing.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_MESH)
         {
-            int overrideSize = 0;
-            if (uint8_t *img = modEntGetOverride(resource_id.m_hash.source_hash_code,
-                                                 &overrideSize))
+            int externalSize = 0;
+            const uint8_t *external = modPCMESHGetOverride(
+                resource_id.m_hash.source_hash_code, &externalSize);
+
+            if (external != nullptr
+                && externalSize > 0
+                && modPCMESHDetectTLType(external, static_cast<size_t>(externalSize),
+                                         TLRESOURCE_TYPE_MESH_FILE)
+                    == TLRESOURCE_TYPE_MESH_FILE)
             {
-                if (result == nullptr)
+                const bool replacedPacked = result != nullptr;
+                result = const_cast<uint8_t *>(external);
+                *actualMashDataSize = externalSize;
+                if (a3 != nullptr)
+                    *a3 = nullptr;
+
+                sp_log("[mod][resource_manager] serving PCMESH override \"%s\" "
+                       "(hash 0x%08X, %d bytes; replaced packed=%s); "
+                       "NGL will clone+parse it",
+                       resource_id.m_hash.to_string(),
+                       resource_id.m_hash.source_hash_code,
+                       externalSize,
+                       replacedPacked ? "yes" : "no");
+            }
+        }
+
+        // Loose .DDS is fallback-only here.  If the pack already has the
+        // texture, leave its bytes and owner untouched.  Only synthesize a
+        // resource from extra/<name>.dds when the PCPACK lookup failed.
+        if (result == nullptr && resource_id.get_type() == RESOURCE_KEY_TYPE_TEXTURE)
+        {
+            int externalSize = 0;
+            if (uint8_t *img = modGetLooseTLBytesByExtension(
+                    resource_id.m_hash.source_hash_code, TLRESOURCE_TYPE_TEXTURE,
+                    ".dds", &externalSize))
+            {
+                *actualMashDataSize = externalSize;
+                if (a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+                sp_log("[mod][resource_manager] serving external-only DDS for \"%s\" "
+                       "(0x%08X, %d bytes; no PCPACK entry)",
+                       resource_id.m_hash.to_string(),
+                       resource_id.m_hash.source_hash_code, externalSize);
+            }
+        }
+
+        // Same policy for .PCSKEL.  Packed skeletons remain authoritative; a
+        // private writable loose image is returned only for a missing pack key.
+        if (result == nullptr && resource_id.get_type() == RESOURCE_KEY_TYPE_NAL_SKL)
+        {
+            int externalSize = 0;
+            if (uint8_t *img = modGetLooseTLBytesByExtension(
+                    resource_id.m_hash.source_hash_code, TLRESOURCE_TYPE_SKELETON,
+                    ".pcskel", &externalSize))
+            {
+                *actualMashDataSize = externalSize;
+                if (a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+                sp_log("[mod][resource_manager] serving external-only PCSKEL for \"%s\" "
+                       "(0x%08X, %d bytes; no PCPACK entry)",
+                       resource_id.m_hash.to_string(),
+                       resource_id.m_hash.source_hash_code, externalSize);
+            }
+        }
+
+        // External animation banks are selected by the requested resource
+        // hash (regular banks often embed the shared name "allanims"). Packed
+        // resources retain their original TL shell, while an external-only
+        // PCANIM/PCSANIM receives a private writable shell and no pack owner.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_ANIMATION
+            || resource_id.get_type() == RESOURCE_KEY_TYPE_SCENE_ANIM)
+        {
+            const bool sceneFlavor =
+                resource_id.get_type() == RESOURCE_KEY_TYPE_SCENE_ANIM;
+            const int expectedTLType = sceneFlavor
+                                     ? TLRESOURCE_TYPE_SCENE_ANIM
+                                     : TLRESOURCE_TYPE_ANIM_FILE;
+            const bool externalOnly = (result == nullptr);
+            const int retailSize = externalOnly ? 0 : *actualMashDataSize;
+
+            bool retailCompatible = true;
+            if (!externalOnly)
+            {
+                retailCompatible = retailSize >= 0x70
+                    && modPCANIMDetectTLType(
+                        result, static_cast<size_t>(retailSize), expectedTLType)
+                       == expectedTLType;
+                if (!retailCompatible)
                 {
-                    sp_log("[mod] ent override 0x%08X: entity not in any loaded "
-                           "pack, cannot inject a brand-new entity - skipped",
+                    sp_log("[mod] %s resource 0x%08X has an invalid/wrong NAL flavor; "
+                           "override bridge skipped",
+                           sceneFlavor ? "scene-PCANIM" : "PCANIM",
                            resource_id.m_hash.source_hash_code);
                 }
-                else
+            }
+
+            if (retailCompatible)
+            {
+                int overrideSize = 0;
+                uint8_t *img = nullptr;
+                const char *overrideKind = nullptr;
+
+                if (!sceneFlavor)
                 {
-                    sp_log("[mod] serving ent override for \"%s\" (%d bytes)",
-                           resource_id.m_hash.to_string(), overrideSize);
-                    if (mash_data_size != nullptr)
-                        *mash_data_size = overrideSize;
-                    result = img;
+                    img = modPS2ANIMGetOverride(
+                        resource_id.m_hash.source_hash_code, &overrideSize,
+                        externalOnly ? nullptr : result, retailSize);
+                    if (img != nullptr)
+                        overrideKind = "PS2ANIM";
+                }
+
+                if (img == nullptr)
+                {
+                    img = modPCANIMGetOverride(
+                        resource_id.m_hash.source_hash_code, &overrideSize,
+                        externalOnly ? nullptr : result, retailSize, sceneFlavor);
+                    if (img != nullptr)
+                        overrideKind = sceneFlavor ? "scene-PCANIM" : "PCANIM";
+                }
+
+                if (img != nullptr)
+                {
+                    if (externalOnly)
+                    {
+                        uint8_t *shell =
+                            modCloneExternalSerializedImage(img, overrideSize);
+                        if (shell != nullptr)
+                        {
+                            modPCANIMTrackExternalImage(
+                                shell, resource_id.m_hash.source_hash_code,
+                                overrideSize, sceneFlavor);
+                            *actualMashDataSize = overrideSize;
+                            if (a3 != nullptr)
+                                *a3 = nullptr;
+                            result = shell;
+                            sp_log("[mod] serving external-only %s for \"%s\" "
+                                   "(0x%08X, %d bytes; no PCPACK entry)",
+                                   overrideKind != nullptr ? overrideKind : "animation",
+                                   resource_id.m_hash.to_string(),
+                                   resource_id.m_hash.source_hash_code, overrideSize);
+                        }
+                    }
+                    else
+                    {
+                        // Keep the pack-owned shell. The NAL wrapper parses a
+                        // private writable copy and publishes its lists onto it.
+                        sp_log("[mod] validated %s override for \"%s\" (%d bytes)",
+                               overrideKind != nullptr ? overrideKind : "animation",
+                               resource_id.m_hash.to_string(), overrideSize);
+                    }
                 }
             }
         }
 
-        // .PCSX mod override (script_object.cpp): script_manager::load and
+        // Loose .ALS override (entity.cpp).  ALS resources are raw
+        // animation_logic_system_shared mash streams, not generic-mash
+        // images. modAlsGetOverride owns a private writable copy and performs
+        // the exact un-mash + construct sequence that als_resource_handler
+        // performs for packed ALS bytes before publishing the pointer here.
+        //
+        // Unlike .ENT, an ALS may be injected even when the active pack does
+        // not contain a same-name resource: the entity's als_res_data already
+        // carries the RESOURCE_KEY_TYPE_ALS_FILE key and only needs a live
+        // animation_logic_system_shared pointer back.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_ALS_FILE)
+        {
+            const uint32_t alsHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modAlsGetOverride(alsHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving ALS override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), alsHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // Loose .BAI override.  BASE_AI is a raw ai::core_ai_resource mash
+        // stream.  modBaiGetOverride keeps Mod::Data pristine, prepares a
+        // 16-byte aligned writable image and performs the same un-mash +
+        // construct sequence as base_ai_resource_handler before returning it.
+        // This can also satisfy a BASE_AI key that is referenced by an entity
+        // but absent from the active retail pack.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_BASE_AI)
+        {
+            const uint32_t baiHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modBaiGetOverride(baiHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving BAI override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), baiHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // Loose .ASG override. AI_STATE_GRAPH is a raw ai::state_graph mash
+        // stream. modAsgGetOverride owns a private 16-byte aligned writable
+        // image and performs the same un-mash + construct sequence as
+        // ai_state_graph_resource_handler before publishing it. A graph may
+        // therefore live only in extra/ and still satisfy a BASE_AI reference.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_AI_STATE_GRAPH)
+        {
+            const uint32_t asgHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modAsgGetOverride(asgHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving ASG override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), asgHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // Loose .MSN override. MISSION_TABLE is still serialized generic-mash
+        // data at this layer; mission_manager parses and rebases it afterwards.
+        // Always return a fresh writable image so header/vector mutations from
+        // a previous mission-table parse cannot leak into a later load.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_MISSION_TABLE)
+        {
+            const uint32_t msnHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modMsnGetOverride(msnHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving MSN override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), msnHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // Loose .PANEL override. PanelFile::UnmashPanelFile() owns the actual
+        // un-mash/construct step, so resource_manager supplies untouched but
+        // writable serialized bytes. A fresh copy is required on every call.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_PANEL)
+        {
+            const uint32_t panelHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modPanelGetOverride(panelHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving PANEL override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), panelHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // Loose .COLL override. cg_mesh::_un_mash validates and marks the
+        // signature in place, so it receives a private writable serialized
+        // image. This also supports a COLL referenced by a loose ENT even when
+        // that collision resource has no PCPACK directory entry.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_COLLISION_MESH)
+        {
+            const uint32_t collHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modCollGetOverride(collHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving COLL override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), collHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // Loose .CUT serialized cut_scene image. The cut-scene loader un-mashes
+        // this payload in place, therefore Mod::Data itself is never exposed.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_CUT_SCENE)
+        {
+            const uint32_t cutHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modCutGetOverride(cutHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving CUT override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), cutHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // Loose .PCMESHDEF generic-mash image paired with a mesh-file key.
+        // Keep a pristine master because generic-mash parsing rebases pointers
+        // and flips header state in the writable image.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_MESH_FILE_STRUCT)
+        {
+            const uint32_t defHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modPcmeshdefGetOverride(defHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving PCMESHDEF override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), defHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // Loose .SLF table used by slc_manager::un_mash_all_funcs(). The file
+        // is structurally validated at enumeration time and may be external-only.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_SLF_LIST)
+        {
+            const uint32_t slfHash = resource_id.m_hash.source_hash_code;
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modSlfGetOverride(slfHash, &overrideSize))
+            {
+                sp_log("[mod][resource_manager] serving SLF override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       resource_id.m_hash.to_string(), slfHash, overrideSize,
+                       externalOnly ? " [external-only]" : "");
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // .ENT mod override (entity_base.cpp). The loose registry owns an
+        // immortal writable generic-mash image, so a class absent from every
+        // active PCPACK can now be injected exactly like an external PCSX.
+        // ENTITY only: .ENTEXT shares the name hash but expects another payload.
+        if (resource_id.get_type() == RESOURCE_KEY_TYPE_ENTITY)
+        {
+            const uint32_t entHash = resource_id.m_hash.source_hash_code;
+            const bool ps2BetaPreview = modEntIsPS2BetaPreviewHash(entHash);
+            const bool externalOnly = (result == nullptr);
+            int overrideSize = 0;
+            if (uint8_t *img = modEntGetOverride(entHash, &overrideSize))
+            {
+                sp_log("[mod] serving %s ENT override for \"%s\" "
+                       "(0x%08X, %d bytes)%s",
+                       ps2BetaPreview ? "PS2 beta-preview" : "PC",
+                       resource_id.m_hash.to_string(), entHash, overrideSize,
+                       externalOnly ? " [external-only; no PCPACK entry]" : "");
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
+                result = img;
+            }
+        }
+
+        // PCSX / translated PS2SX override (script_object.cpp):
+        // script_manager::load and
         // script_manager::is_loadable fetch every script-executable blob
-        // through here, so a validated extra/<name>.pcsx image replaces the
-        // retail bytes at the one spot that knows the script name key.
+        // through here, so a validated external image replaces the retail
+        // bytes at the one spot that knows the canonical script-name key.
         // Unlike the .ENT case above no pack slot is involved in the exec's
         // lifetime — it is governed by script_manager's exec map plus
         // release_generic_mash on the image itself — so a script absent
@@ -1209,16 +2811,24 @@ uint8_t *get_resource(const resource_key &resource_id, int *mash_data_size, reso
         // be wrong.
         if (resource_id.get_type() == RESOURCE_KEY_TYPE_SCRIPT)
         {
+            const uint32_t nameHash = resource_id.m_hash.source_hash_code;
+            const bool translatedPS2SX = modPS2SXOverrideSelected(nameHash);
             int overrideSize = 0;
-            if (uint8_t *img = modPCSXGetOverride(resource_id.m_hash.source_hash_code,
-                                                  &overrideSize))
+            if (uint8_t *img = modPCSXGetOverride(nameHash, &overrideSize))
             {
-                sp_log("[mod] serving pcsx override for \"%s\" (%d bytes)%s",
-                       resource_id.m_hash.to_string(), overrideSize,
-                       result == nullptr ? " [not in any pack - injected as new]"
-                                         : "");
-                if (mash_data_size != nullptr)
-                    *mash_data_size = overrideSize;
+                const bool externalOnly = (result == nullptr);
+                sp_log("[mod] serving %s override for \"%s\" (0x%08X, %d bytes)%s",
+                       translatedPS2SX ? "translated ps2sx" : "pcsx",
+                       resource_id.m_hash.to_string(), nameHash, overrideSize,
+                       externalOnly ? " [not in any pack - injected as new]" : "");
+
+                // Keep the local size valid even when the public caller passed
+                // mash_data_size == nullptr.  For a script that exists only in
+                // extra/, explicitly report no pack owner: the runtime image is
+                // owned by the PCSX registry/script manager, not by a PCPACK slot.
+                *actualMashDataSize = overrideSize;
+                if (externalOnly && a3 != nullptr)
+                    *a3 = nullptr;
                 result = img;
             }
         }
@@ -1284,4 +2894,3 @@ void resource_manager2_patch()
 
     
 }
-

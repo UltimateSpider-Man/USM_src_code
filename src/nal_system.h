@@ -10,6 +10,7 @@
 #include <nal_generic.h>
 #include <nalcomp/nal_pose_comp.h>
 
+#include <cstddef>
 #include <memory>
 
 struct BaseComponent {
@@ -81,7 +82,12 @@ struct nalCharAnim {
     uint32_t field_2C;
 
     bool CheckVersion() {
-        return this->field_2C == 0x10003;
+        // PC retail character animations are v0x10003.  PS2 .ps2anim
+        // character clips are v0x10002 and use the same entropy/legs pose
+        // decoder layout in this engine generation.  Accept both versions
+        // without rewriting the serialized PS2 bytes: pretending v2 is v3
+        // is what makes platform-specific pose data easy to misinterpret.
+        return this->field_2C == 0x10003 || this->field_2C == 0x10002;
     }
 
     static int vtbl_ptr;
@@ -259,3 +265,41 @@ extern void nalSetSceneAnimDirectory(tlResourceDirectory<nalSceneAnim, tlFixedSt
 extern void nalStreamInstance_patch();
 
 extern void modScanNalOverrides();
+
+// Return pristine bytes for the external .PCANIM bound to nameHash.  When a
+// packed/original image is supplied the override is returned only when its
+// skeleton dependency table is compatible with that image.  Callers that
+// parse the result must first make a writable copy: the NAL loaders rebase
+// offsets in place.
+extern uint8_t *modPCANIMGetOverride(uint32_t nameHash,
+                                     int *sizeOut,
+                                     const uint8_t *originalImage = nullptr,
+                                     int originalSize = 0,
+                                     bool sceneFlavor = false);
+
+// Bind a writable external-only PCANIM/PCSANIM shell to the exact resource
+// key that requested it. The NAL wrapper consumes this one-shot identity before
+// parsing so regular PCANIMs whose embedded name is only "allanims" still load
+// correctly when no PCPACK tlresource shell exists.
+extern void modPCANIMTrackExternalImage(const uint8_t *image,
+                                        uint32_t nameHash,
+                                        int imageSize,
+                                        bool sceneFlavor);
+
+// PS2 character-animation compatibility.  .PS2ANIM uses the same outer
+// nalAnimFile/skeleton table as PCANIM, but nalChar clips carry version
+// 0x10002 instead of the PC 0x10003.  The loader preserves that version and
+// lets the patched nalChar version gate select the existing compatible
+// entropy/legs decoder.
+extern bool modPS2ANIMValidate(const uint8_t *raw,
+                               size_t size,
+                               size_t *clipCountOut = nullptr);
+
+extern uint8_t *modPS2ANIMGetOverride(uint32_t nameHash,
+                                      int *sizeOut,
+                                      const uint8_t *originalImage = nullptr,
+                                      int originalSize = 0);
+
+// tlresource_directory uses this to give an already parsed PS2 override clip
+// explicit precedence without parsing/registering the same bank a second time.
+extern nalAnimClass<nalAnyPose> *modPS2ANIMFindLoadedClip(uint32_t clipHash);

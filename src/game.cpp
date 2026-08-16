@@ -76,7 +76,9 @@
 #include "scene_entity_base.h"
 #include "scratchpad_stack.h"
 #include "script_controller.h"
+#include "script_lib_debug_menu.h"
 #include "script_manager.h"
+#include "script.h"
 #include "script_sound_manager.h"
 #include "sin_container.h"
 #include "slc_manager.h"
@@ -2008,6 +2010,7 @@ void game::load_this_level()
 
         g_world_ptr->field_28.setup_cameras();
         script_manager::link();
+        script::load_external_pcsx_scripts(common_slot);
         this->the_world->field_140.hook_up_global_script_object();
         mString hero_name {this->gamefile->field_340.m_hero_name.to_string()};
 
@@ -3080,6 +3083,11 @@ void game::frame_advance(Float a2)
     TRACE("game::frame_advance");
  
     sp_log("%f", float(a2));
+
+    // Menu input is processed from resource_manager::frame_advance() inside
+    // the preceding game tick.  Consume deferred character pack/entity work
+    // here, after that resource callback has completely returned.
+    process_debug_character_spawn_queue();
  
 #if FPS_UNLOCK_60
     // ---------------------------------------------------------------
@@ -3194,6 +3202,9 @@ void game::unload_current_level()
         mem_print_stats("unload_current_level() start");
 
         this->field_170 = true;
+        // Debug characters own their pushed viewer packs.  Destroy their
+        // entities before releasing those packs or tearing down the world.
+        clear_debug_character_spawns();
         if (g_femanager.IGO != nullptr) {
             g_femanager.IGO->field_0->SetShown(false);
         }
@@ -3802,7 +3813,4 @@ void game_patch()
     }
     }
 }
-
-
-
 

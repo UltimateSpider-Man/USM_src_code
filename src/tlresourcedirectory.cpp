@@ -199,6 +199,22 @@ nglMeshFile *tlResourceDirectory<nglMeshFile, tlFixedString>::StandardLoad(const
         char Dest[256] {};
         _snprintf(Dest, 256u, "%s%s%s", nglMeshPath(), a1.to_string(), ".pcmesh");
         auto *MeshFile = static_cast<nglMeshFile *>(tlMemAlloc(sizeof(nglMeshFile), 8, 0x1000000u));
+        if (MeshFile == nullptr)
+            return nullptr;
+
+        // tlMemAlloc returns raw/recycled storage.  Clear all pointer-bearing
+        // loader state before tlReadFile/modBindRawPCMesh sees this shell; stale
+        // FirstMesh/FileBuf values can otherwise make an address-reused character
+        // load look like the previous live PCMESH instance.
+        MeshFile->FileBuf.Buf = nullptr;
+        MeshFile->FileBuf.Size = 0;
+        MeshFile->FileBuf.UserData = 0;
+        MeshFile->FirstMesh = nullptr;
+        MeshFile->FirstMaterial = nullptr;
+        MeshFile->FirstMorph = nullptr;
+        MeshFile->field_134 = 0;
+        MeshFile->field_144 = -1;
+
         strcpy(MeshFile->FilePath, nglMeshPath());
         MeshFile->FileName = a1;
         MeshFile->field_120 = 1;

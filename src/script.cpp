@@ -51,12 +51,20 @@ namespace script {
 // level's own script loads.
 // ---------------------------------------------------------------------------
 
-// Registered .pcsx drops, keyed by the engine hash of the file stem. The
-// literal-hash aliases modPCSXRegister adds for hash-named drops share the
-// same Mod::Path, so entries are de-duplicated by path to load each file once.
-static std::vector<std::pair<uint32_t, const Mod *>> collect_pcsx_mods()
+struct external_pcsx_mod
 {
-    std::vector<std::pair<uint32_t, const Mod *>> out;
+    uint32_t hash;
+    const Mod *mod;
+    std::string canonical_name;
+};
+
+// Registered PCSX and converted PS2SX drops. Native PCSX keeps its historical
+// stem-based key. A hash-named PS2SX instead uses the name serialized in the
+// image: that is the string the beta script was compiled against and its hash
+// is validated by modPS2SXRegister before the entry reaches this list.
+static std::vector<external_pcsx_mod> collect_pcsx_mods()
+{
+    std::vector<external_pcsx_mod> out;
 
     for (const auto &[hash, mod] : Mods)
     {
@@ -65,15 +73,27 @@ static std::vector<std::pair<uint32_t, const Mod *>> collect_pcsx_mods()
         // script_executable::load). Chunk entries deliberately carry no Data.
         const bool is_mash  = (mod.Type == MOD_TYPE_PCSX_FILE && !mod.Data.empty());
         const bool is_chunk = (mod.Type == MOD_TYPE_PCSX_CHUNK);
-        if (!is_mash && !is_chunk)
+        const bool is_ps2sx = (mod.Type == MOD_TYPE_PS2SX_FILE
+                               && !mod.Data.empty());
+        if (!is_mash && !is_chunk && !is_ps2sx)
             continue;
+
+        if (is_ps2sx)
+        {
+            std::string embedded_name;
+            if (!modPS2SXHashToString(hash, &embedded_name))
+                continue;
+            out.push_back({hash, &mod, std::move(embedded_name)});
+            continue;
+        }
 
         const uint32_t stem_hash =
                 to_hash(transformToLower(mod.Path.stem().string()).c_str());
         if (hash != stem_hash)
             continue;               // literal-hash alias of a drop already listed
 
-        out.emplace_back(hash, &mod);
+        out.push_back({hash, &mod,
+                       transformToLower(mod.Path.stem().string())});
     }
 
     return out;
@@ -117,38 +137,61 @@ int load_external_pcsx_scripts(void *owner_slot)
     }
 
     int loaded = 0;
-    for (const auto &[hash, mod] : mods)
+    for (const auto &external : mods)
     {
-        const std::string stem = transformToLower(mod->Path.stem().string());
+        const uint32_t hash = external.hash;
+        const Mod *mod = external.mod;
+        const std::string &name = external.canonical_name;
+
+        // These two bootstrap scripts are requested, run and cleared by
+        // game::load_this_level before the scene is built. Their overrides
+        // are already served at that point; loading them a second time here
+        // would rerun global/static variable initialization mid-level.
+        if (hash == to_hash("init_gv") || hash == to_hash("init_sv"))
+            continue;
 
         if (is_script_loaded(hash))
         {
-            sp_log("[mod] pcsx \"%s\" is already loaded, left alone", stem.c_str());
+            sp_log("[mod] external script \"%s\" is already loaded, left alone",
+                   name.c_str());
             continue;
         }
 
-        const resource_key key {string_hash {stem.c_str()}, RESOURCE_KEY_TYPE_SCRIPT};
+        const resource_key key {string_hash {name.c_str()}, RESOURCE_KEY_TYPE_SCRIPT};
+
+        if (key.m_hash.source_hash_code != hash)
+        {
+            sp_log("[mod] external script \"%s\" hash mismatch: expected "
+                   "0x%08X, got 0x%08X, ignored", name.c_str(), hash,
+                   key.m_hash.source_hash_code);
+            continue;
+        }
 
         // Sanity: this must resolve through modPCSXGetOverride. If it does
         // not, the drop's stem does not hash to the key the engine would use
         // and loading it would fetch nothing.
         if (!script_manager::is_loadable(key))
         {
-            sp_log("[mod] pcsx \"%s\" (0x%08X) is not loadable - stem/hash mismatch?",
-                   stem.c_str(), hash);
+            sp_log("[mod] external script \"%s\" (0x%08X) is not loadable",
+                   name.c_str(), hash);
             continue;
         }
 
         const resource_key no_owner {};
         if (script_manager::load(key, 0u, owner_slot, no_owner) == nullptr)
         {
-            sp_log("[mod] pcsx \"%s\": script_manager::load failed", stem.c_str());
+            sp_log("[mod] external script \"%s\": script_manager::load failed",
+                   name.c_str());
             continue;
         }
 
-        sp_log("[mod] loaded external pcsx script \"%s\" (0x%08X, %s)",
-               stem.c_str(), hash,
-               mod->Type == MOD_TYPE_PCSX_CHUNK ? "chunk format" : "mash image");
+        const char *format = mod->Type == MOD_TYPE_PCSX_CHUNK
+                           ? "pcsx chunk"
+                           : mod->Type == MOD_TYPE_PS2SX_FILE
+                                 ? "translated ps2sx mash"
+                                 : "pcsx mash";
+        sp_log("[mod] loaded external script \"%s\" (0x%08X, %s)",
+               name.c_str(), hash, format);
         ++loaded;
     }
 
@@ -171,10 +214,12 @@ int find_pcsx_function(string_hash name, script_object **owner_out)
 
     for (auto &entry : (*execs))
     {
-        // Only the externally loaded .pcsx scripts: a retail exec's functions
+        // Only externally loaded PCSX/PS2SX scripts: a retail exec's functions
         // are already reachable through the object the caller passed in.
-        if (getMod(entry.first.field_0.m_hash.source_hash_code,
-                   MOD_TYPE_PCSX_FILE) == nullptr)
+        const uint32_t scriptHash =
+                entry.first.field_0.m_hash.source_hash_code;
+        if (getMod(scriptHash, MOD_TYPE_PCSX_FILE) == nullptr
+            && getMod(scriptHash, MOD_TYPE_PS2SX_FILE) == nullptr)
             continue;
 
         auto *exec = entry.second.exec;

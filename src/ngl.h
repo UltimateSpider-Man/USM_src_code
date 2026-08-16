@@ -430,12 +430,56 @@ extern vector4d sub_411750(const vector4d &a2, const vector4d &a3);
 //0x0076F500
 bool nglLoadMeshFileInternal(const tlFixedString &name, nglMeshFile *MeshFile, const char *ext);
 
-#ifdef OPENUSM_XBPACK_MODE
+// ---------------------------------------------------------------------------
+// Raw .PCMESH mods (ngl.cpp)
+//
+// A .pcmesh dropped under the mod root is a native from-disk mesh-file image
+// ("PCM " tag, version 0x601) - the same bytes nglLoadMeshFileInternal parses.
+// enumerate_mods registers them under TLRESOURCE_TYPE_MESH_FILE, keyed by
+// to_hash(stem) (and the relative path, and a literal-hash stem), so
+// extra/VENOM.PCMESH replaces the "venom" mesh file.
+//
+// The final substitution point is nglMeshFile::FileBuf inside
+// nglLoadMeshFileInternalPC. resource_manager may expose validated raw PCMESH
+// bytes for RESOURCE_KEY_TYPE_MESH so tlReadFile can succeed even for a loose
+// external-only file, but resource_directory must NEVER stuff those bytes into
+// TLRESOURCE_TYPE_MESH_FILE::field_8: that field holds a live nglMeshFile
+// object, not the serialized file image.  modBindRawPCMesh always rebinds the
+// FileBuf to a private writable copy before NGL rebases it in place.
+// ---------------------------------------------------------------------------
+
+// Mesh-file format version this build parses.
+inline constexpr uint32_t MOD_PCMESH_VERSION = 0x601;
+
+// Content-based PCMESH detector used by enumeration, resource_manager,
+// tlresource_directory and the NGL parser bridge.  preferredType is normally
+// TLRESOURCE_TYPE_MESH_FILE (or TLRESOURCE_TYPE_NONE when the caller only
+// wants detection).  Invalid/wrong-flavor input returns TLRESOURCE_TYPE_NONE.
+extern int modPCMESHDetectTLType(const uint8_t *raw, size_t size, int preferredType);
+
+// Structural gate: "PCM " tag/version, exact 12-byte directory records, the
+// packed uint24 object size + uint8 type field, object extents/alignment,
+// MATERIAL/MESH tlFixedString name offsets, and an unre-based image.
+extern bool modPCMESHImageUsable(const uint8_t *bytes, size_t size);
+
+// Validated PRISTINE master bytes of the .PCMESH registered for this
+// mesh-file name hash, or nullptr. Const on purpose: the parse rebases its
+// buffer in place and one name can back several live nglMeshFiles, so the
+// writable copy is made per-consumer by modBindRawPCMesh.
+extern const uint8_t *modPCMESHGetOverride(uint32_t nameHash, int *sizeOut);
+
+// Replace MeshFile->FileBuf with an engine-owned, 16-byte-aligned writable
+// copy of the registered .PCMESH override. The copy is allocated with tlMemAlloc
+// so the normal tlReleaseFile/nglMeshFile release path owns it safely.
+extern bool modBindRawPCMesh(const tlFixedString &FileName, nglMeshFile *MeshFile, const char *ext);
+
+
+
+// Defined in src/ngl_xbox.cpp, inside its OPENUSM_XBPACK_MODE block.
 bool nglLoadMeshFileInternalXbox(const tlFixedString &name,
                                  nglMeshFile *MeshFile,
                                  const char *ext);
 void ngl_xbpack_patch();
-#endif
 
 //0x0076F340
 void nglRebaseMesh(uint32_t a1, uint32_t a2, nglMesh *Mesh);

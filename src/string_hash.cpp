@@ -11,6 +11,10 @@
 
 #include <stdio.h>
 
+// script_object.cpp owns the embedded-name table for converted beta PS2SX
+// images. Keep this dependency narrow so hashing does not need script types.
+extern const char *modPS2SXHashName(uint32_t nameHash);
+
 namespace ai {
 Var<string_hash> cat_id_idle_walk_run{0x0096C1E8};
 
@@ -94,6 +98,11 @@ const char *string_hash::to_string() const {
             if ((str = string_hash_dictionary::lookup_string(*this)) != nullptr) {
                 return str;
             }
+        }
+
+        if (const char *externalName =
+                    modPS2SXHashName(this->source_hash_code)) {
+            return externalName;
         }
 
         sprintf(string_hash::ghetto_string(), "0x%08x", this->source_hash_code);

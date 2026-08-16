@@ -28,6 +28,8 @@ typedef enum {
 
     MENU_L3,
     MENU_R3,
+	MENU_L1,
+	MENU_L2,
 
     MENU_L3_LEFT, MENU_L3_RIGHT, MENU_L3_UP, MENU_L3_DOWN,
     MENU_R3_LEFT, MENU_R3_RIGHT, MENU_R3_UP, MENU_R3_DOWN,
@@ -39,6 +41,7 @@ typedef enum {
     MENU_PUNCH,         // logical: mapped from Square
     MENU_KICK,          // DS4 Triangle (btn 3) -> USM Kick
     MENU_BLACK_BUTTON,  // DS4 R1       (btn 5) -> USM BlackButton (Xbox-era "black")
+    MENU_R2,            // DS4 R2       (btn 7) -> manual suit switch
 
     MENU_KEY_MAX
 } MenuKey;

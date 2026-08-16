@@ -1,5 +1,6 @@
 #include "entity.h"
 
+#include "als_animation_logic_system_shared.h"
 #include "collision_geometry.h"
 #include "common.h"
 #include "conglom.h"
@@ -7,15 +8,218 @@
 #include "fixed_vector.h"
 #include "func_wrapper.h"
 #include "memory.h"
+#include "mash_info_struct.h"
 #include "moved_entities.h"
 #include "region.h"
 #include "time_interface.h"
+#include "tl_system.h"
 #include "trace.h"
 #include "utility.h"
 #include "vtbl.h"
 #include "wds.h"
 
 #include <cassert>
+#include <cstring>
+#include <unordered_map>
+
+
+// ---------------------------------------------------------------------------
+// Loose .ALS resource overrides
+//
+// ALS bytes are different from .ENT bytes: there is no generic_mash_header.
+// The stream starts with the 0x1C animation_logic_system_shared object image,
+// followed by the unique mash stream. The retail als_resource_handler obtains
+// writable pack memory, un-mashes that stream in place, then constructs the
+// shared ALS object. Reproduce exactly that lifetime for extra/**/*.als.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+#pragma pack(push, 1)
+struct mod_als_root_disk {
+    uint32_t vector_field_0;
+    int32_t vector_size;
+    uint32_t vector_data_cookie;
+    int32_t vector_capacity;
+    uint8_t vector_flag;
+    uint8_t padding[3];
+    uint32_t state_machine_cookie;
+    uint32_t meta_anim_table_cookie;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(mod_als_root_disk) == 0x1Cu,
+              "ALS root disk layout changed");
+
+struct mod_als_runtime_image {
+    const Mod *source = nullptr;
+    uint8_t *copy = nullptr;
+    int size = 0;
+};
+
+std::unordered_map<uint32_t, mod_als_runtime_image> &modAlsRuntimeImages()
+{
+    static std::unordered_map<uint32_t, mod_als_runtime_image> images;
+    return images;
+}
+
+void modAlsEraseTypedBinding(uint32_t hash)
+{
+    auto range = Mods.equal_range(hash);
+    for (auto it = range.first; it != range.second; )
+    {
+        if (it->second.Type == MOD_TYPE_ALS_FILE)
+            it = Mods.erase(it);
+        else
+            ++it;
+    }
+}
+
+} // namespace
+
+bool modAlsImageUsable(const uint8_t *bytes, size_t size)
+{
+    if (bytes == nullptr || size < sizeof(mod_als_root_disk))
+        return false;
+
+    mod_als_root_disk root{};
+    std::memcpy(&root, bytes, sizeof(root));
+
+    // mVector<layer_state_machine_shared> has a signed count. Real ALS files
+    // normally have only a handful of layers; this generous cap rejects
+    // random files while leaving room for custom systems.
+    if (root.vector_size < 0 || root.vector_size > 0x100)
+        return false;
+
+    if (root.vector_capacity < root.vector_size || root.vector_capacity > 0x1000)
+        return false;
+
+    // field_10 is a bool; the remaining bytes are mash padding (commonly A1).
+    if (root.vector_flag > 1u)
+        return false;
+
+    if (root.vector_size > 0 && root.vector_data_cookie == 0u)
+        return false;
+
+    // Immediately after the 0x1C root, PC mash_info_struct reads one 32-bit
+    // pointer slot per layer before reading the layer objects themselves.
+    const size_t minimumStream =
+        sizeof(mod_als_root_disk) + sizeof(uint32_t) * (size_t)root.vector_size;
+    if (minimumStream > size)
+        return false;
+
+    // An ALS with no layers and neither optional root is almost certainly not
+    // an animation-logic resource.
+    if (root.vector_size == 0 &&
+        root.state_machine_cookie == 0u &&
+        root.meta_anim_table_cookie == 0u)
+        return false;
+
+    return true;
+}
+
+bool modAlsRegister(const std::filesystem::path &path,
+                    std::vector<uint8_t> &&fileData)
+{
+    if (!modAlsImageUsable(fileData.data(), fileData.size()))
+    {
+        sp_log("[mod][als] \"%s\": invalid ALS mash stream, ignored",
+               path.filename().string().c_str());
+        return false;
+    }
+
+    const std::string stem = transformToLower(path.stem().string());
+    const uint32_t hash = to_hash(stem.c_str());
+
+    uint32_t literal = 0;
+    const bool hasLiteral = modParseLiteralHash(stem, &literal) && literal != hash;
+
+    modAlsEraseTypedBinding(hash);
+    if (hasLiteral)
+        modAlsEraseTypedBinding(literal);
+
+    // A new registration invalidates which pristine Mod should feed a future
+    // runtime image. Existing live ALS images deliberately remain allocated:
+    // actors may still reference them.
+    modAlsRuntimeImages().erase(hash);
+    if (hasLiteral)
+        modAlsRuntimeImages().erase(literal);
+
+    const unsigned fileSize = static_cast<unsigned>(fileData.size());
+    sp_log("[mod][als] registered \"%s\" -> \"%s\" "
+           "(0x%08X, %u bytes, raw animation_logic_system_shared mash)",
+           path.filename().string().c_str(), stem.c_str(), hash, fileSize);
+
+    Mods.emplace(hash, Mod{path, MOD_TYPE_ALS_FILE, std::move(fileData)});
+
+    if (hasLiteral)
+    {
+        const Mod *registered = getMod(hash, MOD_TYPE_ALS_FILE);
+        if (registered != nullptr)
+        {
+            Mods.emplace(literal,
+                         Mod{registered->Path, MOD_TYPE_ALS_FILE, registered->Data});
+            sp_log("[mod][als] \"%s\" also bound as literal hash 0x%08X",
+                   stem.c_str(), literal);
+        }
+    }
+
+    return true;
+}
+
+uint8_t *modAlsGetOverride(uint32_t alsHash, int *sizeOut)
+{
+    Mod *mod = getMod(alsHash, MOD_TYPE_ALS_FILE);
+    if (mod == nullptr || mod->Data.empty() ||
+        !modAlsImageUsable(mod->Data.data(), mod->Data.size()))
+        return nullptr;
+
+    auto &slot = modAlsRuntimeImages()[alsHash];
+
+    if (slot.copy == nullptr || slot.source != mod)
+    {
+        if (mod->Data.size() > 0x7FFFFFFFu)
+            return nullptr;
+
+        void *raw = tlMemAlloc(static_cast<uint32_t>(mod->Data.size()),
+                               16u, 0x2000000u);
+        if (raw == nullptr)
+            return nullptr;
+
+        std::memcpy(raw, mod->Data.data(), mod->Data.size());
+
+        auto *alsShared =
+            bit_cast<als::animation_logic_system_shared *>(raw);
+
+        // Match als_resource_handler::_handle_resource(LOAD): parse the raw
+        // stream in writable memory, then run the from-mash constructor/fixups.
+        mash_info_struct mash{static_cast<uint8_t *>(raw),
+                              static_cast<int>(mod->Data.size())};
+        mash.unmash_class(alsShared, nullptr);
+        mash_info_struct::construct_class(alsShared);
+
+        // The root object must remain at the image base; if it does not, the
+        // stream/layout is not the PC-compatible ALS format this bridge serves.
+        if (alsShared != raw)
+        {
+            sp_log("[mod][als] 0x%08X: root rebased away from image base, rejected",
+                   alsHash);
+            tlMemFree(raw);
+            return nullptr;
+        }
+
+        slot.source = mod;
+        slot.copy = static_cast<uint8_t *>(raw);
+        slot.size = static_cast<int>(mod->Data.size());
+
+        sp_log("[mod][als] prepared writable ALS 0x%08X (%d bytes)",
+               alsHash, slot.size);
+    }
+
+    if (sizeOut != nullptr)
+        *sizeOut = slot.size;
+    return slot.copy;
+}
 
 VALIDATE_SIZE(entity, 0x68u);
 

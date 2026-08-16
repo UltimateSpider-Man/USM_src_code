@@ -8,6 +8,7 @@
 
 #include "config.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <vector>
@@ -34,6 +35,72 @@ struct motion_effect_struct;
 namespace ai {
 struct ai_core;
 }
+
+// ---------------------------------------------------------------------------
+// PS2 beta-preview .ENT on-disk structures
+//
+// These are serialized 32-bit records, not live PC classes.  In the beta
+// preview format mashable_vector writes its metadata before the 32-bit data
+// slot, while the PC retail layout stores the data slot first.  Keeping the
+// disk records explicit prevents us from reinterpret-casting PS2 bytes as
+// live PC objects before the compatibility translator has normalized them.
+// ---------------------------------------------------------------------------
+namespace ps2_beta_preview_ent {
+
+inline constexpr uint32_t MASH_VTABLE_MARKER = 0x7ACE5BADu;
+inline constexpr uint32_t ACTOR_SYNC_MARKER = 0x5BADF00Du;
+
+inline constexpr uint16_t ENTITY_CLASS_ACTOR = 3u;
+inline constexpr uint16_t ENTITY_CLASS_CONGLOMERATE = 5u;
+
+inline constexpr std::size_t GENERIC_HEADER_SIZE = 0x10u;
+inline constexpr std::size_t ENTITY_BASE_DISK_SIZE = 0x44u;
+inline constexpr std::size_t ACTOR_DISK_SIZE = 0xBCu;
+inline constexpr std::size_t CONGLOMERATE_DISK_SIZE = 0x12Cu;
+inline constexpr std::size_t PC_ACTOR_SIZE = 0xC0u;
+inline constexpr std::size_t PC_CONGLOMERATE_SIZE = 0x130u;
+
+#pragma pack(push, 1)
+struct mashable_vector_disk {
+    uint16_t size;
+    uint8_t shared;
+    uint8_t from_mash;
+    uint32_t data;
+};
+
+struct entity_base_disk {
+    uint32_t vtable;
+    uint32_t flags;
+    uint32_t ext_flags;
+    uint32_t rel_po;
+    uint32_t name_hash;
+    uint32_t abs_po;
+    uint32_t motion_effect;
+    uint32_t handle;
+    uint32_t parent;
+    uint32_t child;
+    uint32_t next_sibling;
+    int16_t proximity_map_cell_reference_count;
+    uint8_t timer;
+    uint8_t padding_2F;
+    uint32_t adopted_children;
+    uint32_t conglom_root;
+    uint32_t sound_and_pfx;
+    int16_t region_idx;
+    int16_t bone_idx;
+    int8_t field_40;
+    int8_t field_41;
+    int8_t rel_po_idx;
+    int8_t proximity_map_reference_count;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(mashable_vector_disk) == 0x08u,
+              "PS2 beta mashable_vector descriptor changed");
+static_assert(sizeof(entity_base_disk) == ENTITY_BASE_DISK_SIZE,
+              "PS2 beta entity_base disk structure changed");
+
+} // namespace ps2_beta_preview_ent
 
 
 
@@ -524,6 +591,13 @@ extern int DEBUG_foster_conglom_warning;
 
 // Structural gate: header safety key, entity class_id, mash-data offset.
 extern bool modEntImageUsable(const uint8_t *bytes, size_t size);
+
+// True for a registered image that originated from the PS2 beta-preview
+// serializer.  The registration path normalizes top-level PC-visible fields,
+// while entity_mash temporarily selects the beta actor stride for child
+// objects during un-mash.
+extern bool modEntIsPS2BetaPreviewHash(uint32_t classHash);
+extern bool modEntIsPS2BetaPreviewImage(const void *image);
 
 // Validate + register one .ent under to_hash(stem) (and its literal-hash
 // stem, if the name parses as one). Called by enumerate_mods().

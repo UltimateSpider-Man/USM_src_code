@@ -2066,6 +2066,29 @@ struct BuiltSection {
     // requires the section's material name to match whiteNames.
     bool whiteBlank  = false;
     bool whiteByName = false;
+    // USM_BLACKSUIT retail rule for usperson/us_character. A genuinely
+    // untextured white piece has no diffuse-name field at all; a body texture
+    // that is only not resident yet still has a diffuse name. This avoids
+    // turning the dark body white during hero-switch/load-order windows.
+    bool whiteNoDiffuseName = false;
+    // Permanent character-body colour. The importer marks the sections and
+    // ngl.cpp applies tintRGBA through a PRIVATE material clone (field_28), so
+    // the original texture, UV detail, toon shading and highlights remain.
+    bool permanentTint = false;
+    float tintRGBA[4] = { 1.f, 1.f, 1.f, 1.f };
+    // USM_BLACKSUIT uses the same generic tint path but needs two extra rules:
+    // use a distinct clone-cache key/log label, and preserve retail sections
+    // with no diffuse NAME as intentional WHITE (eye lenses + chest spider).
+    bool permanentTintBlackSuit = false;
+    bool permanentTintKeepBlankWhite = false;
+    // VENOM_EDDIE blank/reveal colour. Some reveal/cocoon sections have NO
+    // diffuse texture and therefore render flat white. When enabled, ngl.cpp
+    // binds the engine white texture on a private material clone and uses this
+    // pink-blue multiplier, so only the previously-white geometry is recoloured.
+    // Eddie's human head (section 11) and named mouth/teeth/tongue/eye pieces
+    // are excluded engine-side. Explicit sidecar white=N still wins.
+    bool venomEddieBlankTint = false;
+    float blankTintRGBA[4] = { 1.f, 1.f, 1.f, 1.f };
     // keyword list for whiteByName; shared, not copied per section
     std::shared_ptr<const std::vector<std::string>> whiteNames;
 };
@@ -5517,6 +5540,35 @@ buildSectionsForMesh(Scene &sc,
 
     auto out = buildSectionsForMeshRaw(sc, meshNameIn, origs, origRef);
 
+    // Retail USM_BLACKSUIT has intentionally untextured white geometry (eye
+    // lenses + chest spider) next to a textured dark-purple body. The engine
+    // will use field_18 (diffuse NAME) to distinguish an intentional blank from
+    // a texture that is merely not resident yet. white=off disables this rule.
+    auto containsCI = [](const std::string &hay, const char *needle) {
+        std::string h = hay, n = needle != nullptr ? needle : "";
+        for (auto &c : h) c = char(std::toupper(uint8_t(c)));
+        for (auto &c : n) c = char(std::toupper(uint8_t(c)));
+        return !n.empty() && h.find(n) != std::string::npos;
+    };
+    // Detect the black-suit asset independently of white=auto: its purple-blue
+    // body colour is now a built-in mesh rule and must be applied even when a
+    // mod has no geometry mapping or disables the automatic white-name policy.
+    const bool blackSuitAsset =
+        containsCI(meshNameIn, "USM_BLACKSUIT")
+        || containsCI(sc.srcName, "USM_BLACKSUIT");
+    const bool blackSuitWhiteAuto = sc.cfg.whiteAuto && blackSuitAsset;
+
+    // VENOM_EDDIE is a morph-driven reveal asset: section 11 is Eddie's human
+    // head (the documented sidecar example is tex11=VENOM_EDDIE).  Even when an
+    // exporter gives that piece a material, replacing its vertex/index buffers
+    // makes the retail facial/reveal morph stream address the wrong topology.
+    // Keep a dedicated flag here so the post-map safety below can preserve the
+    // original head geometry while still letting the imported texture family
+    // recolour it.
+    const bool venomEddieAsset =
+        containsCI(meshNameIn, "VENOM_EDDIE")
+        || containsCI(sc.srcName, "VENOM_EDDIE");
+
     // The raw mapper returns an EMPTY vector whenever it cannot map geometry:
     // a scene with no usable mesh, a foreign scene that produced no buckets, a
     // target with no replaceable section. That verdict is about GEOMETRY, but
@@ -5529,6 +5581,7 @@ buildSectionsForMesh(Scene &sc,
     const bool texOnly = out.empty() && !origs.empty()
                       && (!sc.cfg.whiteSections.empty()
                           || sc.cfg.whiteBlank
+                          || blackSuitAsset
                           || !sc.cfg.texPin.empty()
                           || !sc.cfg.texDefault.empty());
     if (texOnly) {
@@ -5538,6 +5591,52 @@ buildSectionsForMesh(Scene &sc,
              "section keeps its vanilla geometry",
              meshNameIn.c_str(), unsigned(sc.cfg.whiteSections.size()),
              unsigned(sc.cfg.texPin.size()), sc.cfg.texDefault.c_str());
+    }
+
+    // -----------------------------------------------------------------------
+    //  VENOM_EDDIE head safety
+    // -----------------------------------------------------------------------
+    // The human Eddie head is section 11 in the exported asset.  It is part of
+    // the retail morph/reveal system, so swapping in an FBX-rebuilt topology can
+    // freeze or distort it even if the rest of the character imports correctly.
+    // Preserve the vanilla section buffers/palette/morphs and use the FBX only
+    // as a texture source.  roundtrip=0 is the explicit escape hatch when a mod
+    // intentionally wants to replace the head geometry.  Explicit sidecar
+    // keep=/hide=/tex11= processing runs after this block and therefore still
+    // wins.
+    if (venomEddieAsset && sc.cfg.roundtripEps > 0.0
+        && out.size() > 11 && origs.size() > 11) {
+        BuiltSection head;
+        if (out[11])
+            head = std::move(*out[11]);
+
+        head.keepGeometry        = true;
+        head.hide                = false;
+        head.vertices.clear();
+        head.indices.clear();
+        head.palette.clear();
+        head.keepOriginalPalette = true;
+        head.blankOnly           = false;
+        head.autoStems           = false;
+        // Treat the head family as an exclusive/pinned lookup.  This also tells
+        // ngl.cpp not to paint a missing Eddie face with a body/sibling sheet.
+        head.texExclusive        = true;
+        head.source = "VENOM_EDDIE head safety (vanilla morph geometry)";
+
+        head.textureCandidates.clear();
+        detail::pushUniqueTex(head.textureCandidates, "VENOM_EDDIE");
+        const std::vector<std::string> headStems =
+            detail::sceneColorStems(sc, meshNameIn);
+        for (const std::string &s : headStems)
+            if (containsCI(s, "VENOM_EDDIE"))
+                detail::pushUniqueTex(head.textureCandidates, s);
+        detail::attachTexPayloads(head, sc);
+
+        out[11] = std::move(head);
+        logf("[modmesh] %s sec11: VENOM_EDDIE head safety - vanilla geometry, "
+             "palette and morphs kept; texture isolated to VENOM_EDDIE family "
+             "(roundtrip=0 forces imported head geometry)",
+             meshNameIn.c_str());
     }
 
     // sidecar per-section overrides, applied over every tier's result.
@@ -5718,7 +5817,7 @@ buildSectionsForMesh(Scene &sc,
             // undo a hide (explicit hide= or the blank=hide policy): give the
             // vanilla piece back instead of the degenerate triangle, then
             // paint it white
-            b.hide = true;
+            b.hide = false;              // white= REVEALS a hidden piece
             b.keepGeometry = true;
             b.vertices.clear();
             b.indices.clear();
@@ -5764,8 +5863,9 @@ buildSectionsForMesh(Scene &sc,
         }
         for (auto &o : out)
             if (o && !o->hide && !o->forceWhite) {
-                o->whiteBlank  = sc.cfg.whiteBlank;
+                o->whiteBlank  = o->whiteBlank || sc.cfg.whiteBlank;
                 o->whiteByName = sc.cfg.whiteAuto;
+                o->whiteNoDiffuseName = blackSuitWhiteAuto;
                 o->whiteNames  = names;
             }
         std::string kw;
@@ -5781,6 +5881,107 @@ buildSectionsForMesh(Scene &sc,
              carriers,
              sc.cfg.whiteBlank ? "" : ". Names: ",
              sc.cfg.whiteBlank ? "" : kw.c_str());
+    }
+
+    // -----------------------------------------------------------------------
+    //  USM_BLACKSUIT permanent purple-blue body tint
+    // -----------------------------------------------------------------------
+    // Match the uploaded retail/reference look with a stable blue-violet
+    // material multiplier.  This is deliberately mesh-name driven: no sidecar
+    // setting and no replacement texture are required.  Every section receives
+    // a colour-only carrier so the rule also works when the FBX maps no geometry.
+    //
+    // The reference hue is approximately R:G:B = 0.75:0.52:1.00; the multiplier
+    // below keeps enough brightness for the glossy/toon highlights while staying
+    // visibly purple-blue instead of black/magenta.
+    if (blackSuitAsset) {
+        constexpr float kTintR = 0.66f;
+        constexpr float kTintG = 0.46f;
+        constexpr float kTintB = 0.88f;
+        unsigned tinted = 0;
+        for (size_t si = 0; si < out.size(); ++si) {
+            if (!out[si]) {
+                BuiltSection t;
+                t.keepGeometry = true;                 // colour-only carrier
+                t.texMode = sc.cfg.tex;                // preserve texture= policy
+                t.source = "USM_BLACKSUIT permanent purple-blue tint";
+                out[si] = std::move(t);
+            }
+
+            BuiltSection &b = *out[si];
+            if (b.hide || b.forceWhite)
+                continue;
+
+            b.permanentTint = true;
+            b.permanentTintBlackSuit = true;
+            b.permanentTintKeepBlankWhite = true;
+            b.tintRGBA[0] = kTintR;
+            b.tintRGBA[1] = kTintG;
+            b.tintRGBA[2] = kTintB;
+            b.tintRGBA[3] = 1.0f;
+            ++tinted;
+        }
+
+        logf("[modmesh] %s: permanent USM_BLACKSUIT PURPLE-BLUE tint enabled "
+             "on %u section(s): RGB %.2f %.2f %.2f; retail no-diffuse eye/spider "
+             "sections remain WHITE",
+             meshNameIn.c_str(), tinted, kTintR, kTintG, kTintB);
+    }
+
+    // -----------------------------------------------------------------------
+    //  VENOM_EDDIE permanent purple-blue body tint
+    // -----------------------------------------------------------------------
+    // The reference build uses a dark purple-blue symbiote body.  Make that
+    // colour deterministic at the mesh level instead of depending on whichever
+    // FBX texture/fallback happened to win.  This is a MATERIAL multiplier, not
+    // a replacement texture, so UV detail, ink/toon shading and highlights stay.
+    //
+    // RGB was chosen to reproduce the uploaded reference under the game's normal
+    // character lighting: (0.58, 0.36, 0.72).  The engine side clones the
+    // material before changing field_28, preventing shared mouth/head materials
+    // from being recoloured accidentally.  Section 11 is Eddie's human head and
+    // is always excluded.  Explicit forceWhite sections also stay white.
+    if (venomEddieAsset) {
+        constexpr float kTintR = 0.58f;
+        constexpr float kTintG = 0.36f;
+        constexpr float kTintB = 0.72f;
+        unsigned tinted = 0;
+        for (size_t si = 0; si < out.size(); ++si) {
+            if (si == 11)                              // Eddie human head
+                continue;
+            if (!out[si]) {
+                BuiltSection t;
+                t.keepGeometry = true;                 // colour-only carrier
+                t.texMode = sc.cfg.tex;                // preserve texture= policy
+                t.source = "VENOM_EDDIE permanent purple-blue tint";
+                out[si] = std::move(t);
+            }
+            BuiltSection &b = *out[si];
+            if (b.hide || b.forceWhite)
+                continue;
+            b.permanentTint = true;
+            b.tintRGBA[0] = kTintR;
+            b.tintRGBA[1] = kTintG;
+            b.tintRGBA[2] = kTintB;
+            b.tintRGBA[3] = 1.0f;
+
+            // The screenshot's white shoulder/cocoon piece is a BLANK material,
+            // not a separate white texture. Mark every non-head VENOM_EDDIE
+            // section as eligible; ngl.cpp applies this only when field_1C is
+            // actually null, so textured purple body pieces are unaffected.
+            // A red+blue-heavy multiplier produces the requested pink/blue
+            // violet while preserving the character shader's toon lighting.
+            b.venomEddieBlankTint = true;
+            b.blankTintRGBA[0] = 0.78f;
+            b.blankTintRGBA[1] = 0.24f;
+            b.blankTintRGBA[2] = 0.98f;
+            b.blankTintRGBA[3] = 1.0f;
+            ++tinted;
+        }
+        logf("[modmesh] %s: permanent VENOM_EDDIE body tint enabled on %u "
+             "section(s): RGB %.2f %.2f %.2f; blank white/reveal pieces use "
+             "PINK-BLUE RGB 0.78 0.24 0.98 (section 11/head excluded)",
+             meshNameIn.c_str(), tinted, kTintR, kTintG, kTintB);
     }
 
     // -----------------------------------------------------------------------
@@ -5809,10 +6010,11 @@ buildSectionsForMesh(Scene &sc,
                              : b.keepGeometry ? "KEEP-GEOM"
                                               : "replaced";
             logf("[modmesh]   sec%02u: %-9s verts=%u tris=%u src=\"%s\" "
-                 "tex=[%s]%s", unsigned(si), what,
+                 "tex=[%s]%s%s", unsigned(si), what,
                  unsigned(b.vertices.size() / 16),
                  unsigned(b.indices.size() / 3), b.source.c_str(),
-                 tex.c_str(), b.texExclusive ? " PINNED" : "");
+                 tex.c_str(), b.texExclusive ? " PINNED" : "",
+                 b.permanentTint ? " PURPLE-BLUE" : "");
         }
         std::set<std::string> stems;
         for (const auto &m : sc.matTexStem)  if (!m.second.empty()) stems.insert(m.second);

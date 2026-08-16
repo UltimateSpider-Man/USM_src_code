@@ -5,6 +5,11 @@
 
 #include <list.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <vector>
+
 struct region;
 struct generic_mash_header;
 struct generic_mash_data_ptrs;
@@ -16,6 +21,85 @@ struct nglMesh;
 
 template<typename T, uint32_t N>
 struct fixed_vector;
+
+namespace ps2_beta_preview_ent {
+
+// Serialized PS2 beta-preview entity.  All pointer-looking fields are 32-bit
+// disk values; they are rebased or replaced by the mash loader on PC.
+#pragma pack(push, 1)
+struct entity_disk {
+    entity_base_disk base;
+    uint32_t signaller_state;
+    uint32_t regions[2];
+    uint32_t extended_regions;
+    uint32_t collision_geometry;
+    uint32_t time_interface;
+    uint32_t field_5C;
+    uint32_t field_60;
+    uint32_t field_64;
+};
+
+struct actor_disk {
+    entity_disk base;
+    uint32_t damage_interface;
+    uint32_t physical_interface;
+    uint32_t skeleton;
+    uint32_t anim_controller;
+    uint32_t advanced_entity_ptrs;
+    uint32_t base_ai_data;
+    uint32_t interactable_interface;
+    uint32_t facial_expression_interface;
+    uint32_t field_88;
+    uint32_t player_controller;
+    uint8_t mesh_buffers[0x10];
+    uint32_t traffic_light_interface;
+    int16_t field_A4;
+    int16_t field_A6;
+    int16_t field_A8;
+    int16_t field_AA;
+    float field_AC[3];
+    uint32_t field_B8;
+};
+
+// A standalone beta actor serializes only 0xBC bytes.  The derived
+// conglomerate keeps four bytes of base tail padding so its vectors remain at
+// 0xC0, but its final PC-only variant-interface slot at 0x12C is absent.
+struct conglomerate_disk {
+    actor_disk base;
+    uint32_t actor_tail_padding;
+    mashable_vector_disk members;
+    mashable_vector_disk skin_bones;
+    mashable_vector_disk member_abs_po;
+    mashable_vector_disk all_rel_po;
+    mashable_vector_disk all_model_po;
+    mashable_vector_disk field_E8;
+    mashable_vector_disk field_F0;
+    uint32_t light_manager;
+    uint32_t actor_list;
+    uint32_t light_list;
+    uint32_t field_104;
+    float field_108;
+    float field_10C;
+    uint32_t field_110;
+    uint32_t als_res_data;
+    uint32_t skeleton_interface;
+    uint32_t animation_interface;
+    uint32_t script_data_interface;
+    uint32_t tentacle_interface;
+    uint32_t decal_data_interface;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(entity_disk) == 0x68u,
+              "PS2 beta entity disk structure changed");
+static_assert(sizeof(actor_disk) == ACTOR_DISK_SIZE,
+              "PS2 beta actor disk structure changed");
+static_assert(offsetof(conglomerate_disk, members) == 0xC0u,
+              "PS2 beta conglomerate vector offset changed");
+static_assert(sizeof(conglomerate_disk) == CONGLOMERATE_DISK_SIZE,
+              "PS2 beta conglomerate disk structure changed");
+
+} // namespace ps2_beta_preview_ent
 
 struct entity : signaller {
     using base_type = vhandle_type<signaller>;
@@ -198,6 +282,25 @@ struct entity : signaller {
 
     static inline _std::list<entity *> *& found_entities = var<_std::list<entity *> *>(0x0095A6E0);
 };
+
+
+// ---------------------------------------------------------------------------
+// Loose .ALS mods (entity.cpp)
+//
+// ALS is the animation-logic-system resource referenced by conglomerate
+// als_res_data. A file such as extra/VENOM.ALS is a raw mashed
+// animation_logic_system_shared stream (no generic_mash_header). Registration
+// keeps a pristine copy; the runtime getter creates one 16-byte aligned
+// writable image, un-mashes/constructs it exactly like als_resource_handler,
+// and resource_manager serves that live shared object for
+// RESOURCE_KEY_TYPE_ALS_FILE.
+// ---------------------------------------------------------------------------
+extern bool modAlsImageUsable(const uint8_t *bytes, size_t size);
+
+extern bool modAlsRegister(const std::filesystem::path &path,
+                           std::vector<uint8_t> &&fileData);
+
+extern uint8_t *modAlsGetOverride(uint32_t alsHash, int *sizeOut);
 
 extern void entity_patch();
 

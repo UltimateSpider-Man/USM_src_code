@@ -243,33 +243,44 @@ void script_executable::un_mash(generic_mash_header *header, void *a3, generic_m
             
             rebase(a4->field_0, 4u);
 
-            static auto *start_debug = a4->field_0;
+            auto *const start_debug = a4->field_0;
+            const int serializedImageSize = this->sx_exe_image_size;
+            const bool convertedPS2SX = modPS2SXIsRuntimeImage(header);
 
-            [this, &a4]() {
+            [this, &a4, convertedPS2SX]() {
+                // A converted PS2SX image already contains translated beta
+                // bytecode.  A coincidental scripts/<name>.pcsxl beside the
+                // game must not replace it with a different ABI image.
                 if constexpr (1)
                 {
-                    filespec v98 {mString {this->field_0.to_string()}};
-                    v98.m_dir = mString {"scripts\\"};
-                    v98.m_ext = mString {".pc"} + "sxl";
-
-                    os_file v85 {};
-                    v85.open(v98.fullname(), os_file::FILE_READ);
-                    if ( v85.is_open() )
+                    if (!convertedPS2SX)
                     {
-                        sp_log("found pcsxl file %s", v98.fullname().c_str());
-                        this->sx_exe_image_size = v85.get_size();
-                        this->sx_exe_image = new uint16_t[this->sx_exe_image_size / 2];
-                        assert(sx_exe_image != nullptr);
+                        filespec v98 {mString {this->field_0.to_string()}};
+                        v98.m_dir = mString {"scripts\\"};
+                        v98.m_ext = mString {".pc"} + "sxl";
 
-                        v85.read(this->sx_exe_image, this->sx_exe_image_size);
-                        return;
+                        os_file v85 {};
+                        v85.open(v98.fullname(), os_file::FILE_READ);
+                        if ( v85.is_open() )
+                        {
+                            sp_log("found pcsxl file %s", v98.fullname().c_str());
+                            this->sx_exe_image_size = v85.get_size();
+                            this->sx_exe_image = new uint16_t[this->sx_exe_image_size / 2];
+                            assert(sx_exe_image != nullptr);
+
+                            v85.read(this->sx_exe_image, this->sx_exe_image_size);
+                            return;
+                        }
                     }
                 }
 
                 this->sx_exe_image = CAST(this->sx_exe_image, a4->field_0);
             }();
 
-            a4->field_0 += this->sx_exe_image_size;
+            // The cursor belongs to the serialized mash, even when the
+            // optional .pcsxl branch above changes the runtime image size.
+            assert(serializedImageSize >= 0);
+            a4->field_0 += serializedImageSize;
 
             rebase(a4->field_0, 4u);
 

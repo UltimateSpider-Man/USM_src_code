@@ -63,6 +63,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <unordered_set>
 
 #include "game.h"
@@ -2786,6 +2787,15 @@ static bool modReadWholeFile(const std::filesystem::path &p,
                std::istreambuf_iterator<char>());
     return !out.empty();
 }
+// Explicit mods/<stem> texture lookup. This lets the same-stem fast path
+// distinguish a true no-op from an intentional recolor (USM_BLACKSUIT.png).
+static Mod *modFindTextureOverride(const std::string &stem)
+{
+    std::string low;
+    low.reserve(stem.size());
+    for (char c : stem) low.push_back(char(std::tolower(uint8_t(c))));
+    return getMod(to_hash(low.c_str()), TLRESOURCE_TYPE_TEXTURE);
+}
 
 // ---------------------------------------------------------------------------
 // Mod texture caches, and why they need an epoch.
@@ -2938,6 +2948,32 @@ static void modSectionMaterialNames(nglMeshSection *S,
         out[1] = S->Material->Name->to_string();
 }
 
+// Character-material family check used by the mod texture/color fixes.
+// Both retail shader names use the same 64-byte skinned row and material
+// convention: field_18 is the diffuse texture NAME, field_1C is the resolved
+// texture object. During hero switches field_1C can be null while field_18
+// still correctly says USM_BLACKSUIT.
+static bool modIsUSPersonCharacterSection(nglMeshSection *S)
+{
+    if (S == nullptr || S->Material == nullptr || S->Material->m_shader == nullptr)
+        return false;
+    tlFixedString n = S->Material->m_shader->GetName();
+    const char *p = n.to_string();
+    return p != nullptr
+        && (strncmp(p, "usperson", 8u) == 0
+            || strncmp(p, "us_character", 12u) == 0);
+}
+
+static bool modCharacterMaterialHasDiffuseName(nglMeshSection *S)
+{
+    if (!modIsUSPersonCharacterSection(S) || S->Material == nullptr)
+        return false;
+    tlFixedString *nm = S->Material->field_18;
+    if (nm == nullptr)
+        return false;
+    const char *p = nm->to_string();
+    return p != nullptr && *p != '\0';
+}
 // Does either name read like a piece that is meant to be white? Substring
 // match, case-insensitive, against the sidecar's list (white_names=) or the
 // importer's default set.
@@ -2973,6 +3009,25 @@ static bool modBlankShouldStayWhite(nglMeshSection *S,
                "drawing WHITE (no salvage, no donor borrow)\n", sectionIndex);
         return true;
     }
+    // USM_BLACKSUIT: a null field_1C can mean either "intentional white" or
+    // "body texture not resident yet". field_18 resolves that ambiguity.
+    if (B.whiteNoDiffuseName && modIsUSPersonCharacterSection(S)
+        && !modCharacterMaterialHasDiffuseName(S))
+    {
+        sp_log("[modmesh] sec%d: USM_BLACKSUIT usperson/us_character material "
+               "has NO diffuse name - keeping intentional eye/spider geometry "
+               "WHITE\n", sectionIndex);
+        return true;
+    }
+
+    // A character material that HAS a diffuse name is not an intentional white
+    // piece, even if field_1C is temporarily null and the MATERIAL name happens
+    // to contain a broad white keyword such as SPIDER. Let the normal resolver
+    // load field_18 instead of whitening the whole suit/body during load order.
+    if (B.whiteByName && modIsUSPersonCharacterSection(S)
+        && modCharacterMaterialHasDiffuseName(S))
+        return false;
+
     if (!B.whiteByName || !B.whiteNames)
         return false;
     const char *nm = nullptr, *key = nullptr;
@@ -2985,10 +3040,179 @@ static bool modBlankShouldStayWhite(nglMeshSection *S,
     return true;
 }
 
+// Permanent character-body tint (VENOM_EDDIE / USM_BLACKSUIT).
+//
+// The character shaders multiply the diffuse texture by material field_28.
+// Apply the requested purple-blue there instead of replacing the texture: this
+// preserves authored UV detail and lets the normal toon/light pass produce the
+// blue-violet highlights visible in the reference screenshots.
+//
+// Materials are shared aggressively by retail meshes, so this MUST use a
+// private clone. Different character families use different clone-cache keys so
+// a USM_BLACKSUIT recolour can never leak into a VENOM_EDDIE material.
+static bool modApplyPermanentTint(nglMeshSection *S,
+                                  const modmesh::BuiltSection &B,
+                                  int sectionIndex)
+{
+    if (!B.permanentTint || B.forceWhite || S == nullptr || S->Material == nullptr)
+        return false;
+    if (!modIsUSPersonCharacterSection(S))
+        return false;
+
+    // Keep non-body facial/oral/white parts authored.  Use the RETAIL section /
+    // material / diffuse names here rather than the FBX candidate list: the
+    // venom_eddie exporter is known to label several forearm/hand pieces with
+    // VENOM_MOUTH even though the target section is body geometry.
+    auto containsCI = [](const char *text, const char *key) {
+        if (text == nullptr || key == nullptr || *key == '\0') return false;
+        std::string a(text), b(key);
+        for (auto &c : a) c = char(std::toupper(uint8_t(c)));
+        for (auto &c : b) c = char(std::toupper(uint8_t(c)));
+        return a.find(b) != std::string::npos;
+    };
+    auto isNonBodyName = [&](const char *nm) {
+        static const char *skip[] = {
+            "MOUTH", "TEETH", "TOOTH", "TONGUE", "GUM",
+            "EYE", "LENS", "SALIVA"
+        };
+        for (const char *k : skip)
+            if (containsCI(nm, k)) return true;
+
+        // Extra white-emblem vocabulary belongs only to USM_BLACKSUIT; keep the
+        // existing VENOM_EDDIE material filter unchanged.
+        if (B.permanentTintBlackSuit) {
+            static const char *blackSuitSkip[] = {
+                "SPIDER", "LOGO", "EMBLEM", "WHITE"
+            };
+            for (const char *k : blackSuitSkip)
+                if (containsCI(nm, k)) return true;
+        }
+        return false;
+    };
+
+    const char *matNames[2];
+    modSectionMaterialNames(S, matNames);
+    const char *diffuseName = nullptr;
+    if (S->Material->field_18 != nullptr)
+        diffuseName = S->Material->field_18->to_string();
+
+    const char *family = B.permanentTintBlackSuit
+        ? "USM_BLACKSUIT" : "VENOM_EDDIE";
+
+    if (isNonBodyName(matNames[0]) || isNonBodyName(matNames[1])
+        || isNonBodyName(diffuseName))
+    {
+        sp_log("[modmesh] sec%d: %s permanent tint skipped for "
+               "non-body material \"%s\" / diffuse \"%s\"\n",
+               sectionIndex, family,
+               matNames[1] != nullptr ? matNames[1]
+                                      : (matNames[0] != nullptr ? matNames[0] : "?"),
+               diffuseName != nullptr ? diffuseName : "?");
+        return false;
+    }
+
+    nglMaterialBase *mat = S->Material;
+    const char *cloneKey = B.permanentTintBlackSuit
+        ? "\x01usm_blacksuit_purpleblue"
+        : "\x01venom_eddie_purpleblue";
+    if (auto *c = modCloneMaterialForPin(mat, cloneKey); c != nullptr) {
+        S->Material = c;
+        mat = c;
+    }
+
+    mat->field_28[0] = B.tintRGBA[0];
+    mat->field_28[1] = B.tintRGBA[1];
+    mat->field_28[2] = B.tintRGBA[2];
+    mat->field_28[3] = B.tintRGBA[3];
+
+    sp_log("[modmesh] sec%d: %s permanent PURPLE-BLUE tint "
+           "(%.2f %.2f %.2f %.2f)\n",
+           sectionIndex, family, B.tintRGBA[0], B.tintRGBA[1],
+           B.tintRGBA[2], B.tintRGBA[3]);
+    return true;
+}
+
 // Bind pure white to this section and stop. No candidate search, no salvage,
 // no donor borrow: sidecar white= exists precisely because those heuristics
 // are wrong for geometry that is white on purpose (the black suit's eye
 // lenses and chest spider).
+// VENOM_EDDIE: recolour only geometry that would otherwise be flat WHITE.
+//
+// The marked shoulder/cocoon region in the reference screenshot is an
+// untextured reveal section (Material::field_1C == nullptr).  A normal body
+// tint cannot make that reliable because the blank-repair/white-policy path may
+// subsequently replace or neutralize the material.  Resolve it deterministically:
+// clone the section material, bind nglwhite, then multiply it by a vivid
+// pink+blue violet. Textured body sections never enter this function.
+static bool modApplyVenomEddieBlankTint(nglMeshSection *S,
+                                        const modmesh::BuiltSection &B,
+                                        int sectionIndex)
+{
+    if (!B.venomEddieBlankTint || S == nullptr || S->Material == nullptr)
+        return false;
+
+    nglMaterialBase *mat = S->Material;
+    if (mat->field_1C != nullptr)                 // only the WHITE/blank piece
+        return false;
+    if (!modIsUSPersonCharacterSection(S))
+        return false;
+
+    // Never paint authored face/oral/eye parts. The marked cocoon/shoulder
+    // material is blank/unnamed and therefore passes this filter.
+    auto containsCI = [](const char *text, const char *key) {
+        if (text == nullptr || key == nullptr || *key == '\0') return false;
+        std::string a(text), b(key);
+        for (auto &c : a) c = char(std::toupper(uint8_t(c)));
+        for (auto &c : b) c = char(std::toupper(uint8_t(c)));
+        return a.find(b) != std::string::npos;
+    };
+    auto protectedPart = [&](const char *nm) {
+        static const char *skip[] = {
+            "EDDIE", "HEAD", "FACE", "SKIN",
+            "MOUTH", "TEETH", "TOOTH", "TONGUE", "GUM",
+            "EYE", "LENS", "SALIVA"
+        };
+        for (const char *k : skip)
+            if (containsCI(nm, k)) return true;
+        return false;
+    };
+
+    const char *names[2];
+    modSectionMaterialNames(S, names);
+    const char *diffuseName = nullptr;
+    if (mat->field_18 != nullptr)
+        diffuseName = mat->field_18->to_string();
+    if (protectedPart(names[0]) || protectedPart(names[1])
+        || protectedPart(diffuseName))
+        return false;
+
+    nglTexture *white = modWhiteTexture();
+    if (white == nullptr) {
+        sp_log("[modmesh] sec%d: VENOM_EDDIE pink-blue blank tint waiting for "
+               "nglwhite\n", sectionIndex);
+        return false;
+    }
+
+    if (auto *c = modCloneMaterialForPin(mat, "\x01venom_eddie_pinkblue_blank");
+        c != nullptr) {
+        S->Material = c;
+        mat = c;
+    }
+
+    mat->field_1C = white;
+    mat->field_28[0] = B.blankTintRGBA[0];
+    mat->field_28[1] = B.blankTintRGBA[1];
+    mat->field_28[2] = B.blankTintRGBA[2];
+    mat->field_28[3] = B.blankTintRGBA[3];
+    modAppliedTex[mat] = ModAppliedTex{ 0u, white };
+
+    sp_log("[modmesh] sec%d: VENOM_EDDIE WHITE reveal/cocoon -> PINK-BLUE "
+           "(%.2f %.2f %.2f %.2f)\n",
+           sectionIndex, B.blankTintRGBA[0], B.blankTintRGBA[1],
+           B.blankTintRGBA[2], B.blankTintRGBA[3]);
+    return true;
+}
+
 static bool modApplyForcedWhite(nglMeshSection *S, int sectionIndex)
 {
     auto *mat = S != nullptr ? S->Material : nullptr;
@@ -3004,6 +3228,15 @@ static bool modApplyForcedWhite(nglMeshSection *S, int sectionIndex)
     if (auto *c = modCloneMaterialForPin(mat, "\x01white"); c != nullptr) {
         S->Material = c;
         mat = c;
+    }
+    // usperson/us_character multiply diffuse by material color. A white texture
+    // on a cloned purple body material would still be purple, so neutralize only
+    // this private forced-white clone. Body materials remain untouched.
+    if (modIsUSPersonCharacterSection(S)) {
+        mat->field_28[0] = 1.0f;
+        mat->field_28[1] = 1.0f;
+        mat->field_28[2] = 1.0f;
+        mat->field_28[3] = 1.0f;
     }
     if (mat->field_1C != white) {
         mat->field_1C = white;
@@ -3029,6 +3262,13 @@ static void modRetargetSectionTextureInner(nglMeshSection *S,
         modApplyForcedWhite(S, sectionIndex);
         return;
     }
+
+    // VENOM_EDDIE screenshot fix: before white=auto, numbered texture salvage
+    // or sibling-donor logic can touch the material, turn an actually BLANK
+    // shoulder/cocoon section into the requested pink-blue violet. Textured
+    // body sections return false here and continue through the normal pipeline.
+    if (modApplyVenomEddieBlankTint(S, B, sectionIndex))
+        return;
 
     // sidecar tex<N>=STEM: an explicit instruction outranks every policy below
     const bool pinned = B.texExclusive && !B.textureCandidates.empty();
@@ -3108,16 +3348,26 @@ static void modRetargetSectionTextureInner(nglMeshSection *S,
     // extraction; identity of the target needs no sniffing at all.
     //
     // Sidecar texture=mod (texMode 2) still forces the mod's own bytes.
+    bool sameStemUserOverride = false;
     if (B.texMode != 2 && !pinned) {
         for (const std::string &nm : names) {
             if (nm.empty() || nm.size() >= 60)
                 continue;
             nglTexture *res = nglGetTexture(tlFixedString{ nm.c_str() });
             if (res != nullptr && res == mat->field_1C) {
+                // Same stem + a real file in mods/ means intentional recolor.
+                // Let usableModBytes validate it instead of returning early.
+                if (modFindTextureOverride(nm) != nullptr) {
+                    sameStemUserOverride = true;
+                    sp_log("[modmesh] texture \"%s\" is already resident but mods/ contains "
+                           "a same-stem override - validating the user recolor\n", nm.c_str());
+                    continue;
+                }
+                if (sameStemUserOverride)
+                    continue;
                 sp_log("[modmesh] texture \"%s\" is already the section's own "
                        "texture - retarget skipped, vanilla colors kept "
-                       "(sidecar texture=mod forces the mod file)\n",
-                       nm.c_str());
+                       "(sidecar texture=mod forces the mod file)\n", nm.c_str());
                 return;
             }
         }
@@ -3140,11 +3390,26 @@ static void modRetargetSectionTextureInner(nglMeshSection *S,
             return true;
         return nglLoadTexture(tlFixedString{ nm.c_str() }) != nullptr;
     };
+    const bool characterShader = modIsUSPersonCharacterSection(S);
     auto usableModBytes = [&](const std::string &nm,
                               const uint8_t *d, size_t n) -> bool {
         if (B.texMode == 2) return true;
-        if (!modDDSIsIndexedOrLuma(d, n) && !modDDSLooksGrayscale(d, n))
+        const bool indexedOrLuma = modDDSIsIndexedOrLuma(d, n);
+        const bool grayscale     = modDDSLooksGrayscale(d, n);
+        if (!indexedOrLuma && !grayscale)
             return true;
+
+        // Palette/luminance pack extractions do not carry the character palette.
+        // On usperson/us_character this makes USM_BLACKSUIT grey/white and lets
+        // time-of-day lighting tint it. Reject in auto mode even before the retail
+        // texture becomes resident. texture=mod remains the explicit opt-in.
+        if (characterShader && indexedOrLuma) {
+            sp_log("[modmesh] texture \"%s\": palette/luminance DDS rejected for "
+                   "usperson/us_character - preserving retail character colors "
+                   "(texture=mod overrides)\n", nm.c_str());
+            return false;
+        }
+
         if (!engineHasTexture(nm)) return true;
         sp_log("[modmesh] texture \"%s\": mod file is a palette/luminance/"
                "grayscale DDS (pack extraction) - keeping the engine's own "
@@ -3209,11 +3474,8 @@ static void modRetargetSectionTextureInner(nglMeshSection *S,
         //    that is what lets a recolored VENOM_EDDIE_03.png darken a
         //    piece whose embedded texture ships pale.
         if (tex == nullptr) {
-            std::string low;
-            low.reserve(nm.size());
-            for (char c : nm) low.push_back(char(std::tolower(uint8_t(c))));
             std::vector<uint8_t> bytes;
-            if (Mod *tm = getMod(to_hash(low.c_str()), TLRESOURCE_TYPE_TEXTURE);
+            if (Mod *tm = modFindTextureOverride(nm);
                 tm != nullptr && readModFile(tm, bytes) && !bytes.empty()
                 && usableModBytes(nm, bytes.data(), bytes.size()))
             {
@@ -3357,6 +3619,27 @@ static void modRetargetSectionTexture(nglMeshSection *S,
                    ? "bound" : "NONE (draws white)");
     }
 
+    // USM_BLACKSUIT: retail eye lenses and the chest spider are sections with
+    // no diffuse NAME. Keep them hard-white before the body tint or any blank
+    // salvage/donor fallback can repaint them. An explicit tex<N>= pin still
+    // wins, because it is an intentional section override.
+    const bool pinned = B.texExclusive && !B.textureCandidates.empty();
+    if (B.permanentTintKeepBlankWhite && !B.forceWhite && !pinned
+        && modIsUSPersonCharacterSection(S)
+        && !modCharacterMaterialHasDiffuseName(S))
+    {
+        sp_log("[modmesh] sec%d: USM_BLACKSUIT intentional no-diffuse section "
+               "preserved WHITE before permanent tint\n", sectionIndex);
+        modApplyForcedWhite(S, sectionIndex);
+        return;
+    }
+
+    // Colour first so every later path (already-bound texture, texture=keep,
+    // numbered salvage, sibling donor or an explicit pin) inherits the same
+    // permanent character-body multiplier. forceWhite is excluded inside the
+    // helper and will neutralize its own private clone below.
+    modApplyPermanentTint(S, B, sectionIndex);
+
     modRetargetSectionTextureInner(S, B, modPath, sectionIndex);
 
     // sidecar white=: the section is finished. Neither the numbered-variant
@@ -3423,12 +3706,21 @@ static void modRetargetSectionTexture(nglMeshSection *S,
     // (candidates, mod files, embedded bytes, loose files, resident set,
     // engine loader, numbered variants), so stop resolving NAMES and take a
     // TEXTURE that provably exists: the diffuse of another section of this
-    // same mesh. The donor with the most vertices is the body sheet, which
-    // is exactly what the venom_eddie reveal pieces should wear when they
-    // are ever on screen; environment/ink sheets (SPHRMAP & friends, mostly
-    // white hatching) are never borrowed. texture=keep still wins: the user
-    // asked for the material to stay untouched, white included.
-    if (B.texMode != 1 && Mesh != nullptr && Mesh->Sections != nullptr) {
+    // same mesh. The donor with the most vertices is normally the body sheet.
+    //
+    // An EXCLUSIVE texture request (a sidecar tex<N>= pin, or the automatic
+    // VENOM_EDDIE section-11 head safety) must NOT take this path.  Borrowing
+    // the body sheet for Eddie's face is precisely the black/purple/white-head
+    // failure we are trying to avoid: if the VENOM_EDDIE family cannot resolve,
+    // leave the section unresolved and report it instead of silently painting
+    // it with unrelated body pixels. texture=keep still wins as before.
+    if (B.texExclusive && mat->field_1C == nullptr)
+        sp_log("[modmesh] sec%d: exclusive texture family unresolved - sibling "
+               "donor disabled (will not paint this section with the body sheet)\n",
+               sectionIndex);
+
+    if (B.texMode != 1 && !B.texExclusive
+        && Mesh != nullptr && Mesh->Sections != nullptr) {
         auto envSheet = [](const char *nm) -> bool {
             if (nm == nullptr) return false;
             std::string u = nm;
@@ -4150,6 +4442,235 @@ modBuildSectionsForMesh(Mod *mod, nglMesh *Mesh)
 
 
 // --------------------------------------------------------------------------
+// Raw PCMESH detection / registry access.
+//
+// PC .PCMESH files are serialized 32-bit NGL images.  Do not cast the file to
+// the live C++ classes here: pointers in the image are 32-bit offsets until
+// nglLoadMeshFileInternal rebases them.  Read the exact on-disk structures.
+//
+// nglDirectoryEntry is 12 bytes on disk:
+//   +0x00  uint24 object_size   (little endian)
+//   +0x03  uint8  type          (MATERIAL=1, MESH=2, MORPH=3)
+//   +0x04  uint32 object_offset
+//   +0x08  uint32 name_offset   (tlFixedString*, still an offset)
+//
+// VENOM.PCMESH demonstrates the size/type packing directly: its first mesh
+// entry starts with 46 96 00 02 => object_size=0x9646, type=MESH.  The next
+// object begins at align16(object_offset + object_size).
+// --------------------------------------------------------------------------
+
+#pragma pack(push, 1)
+struct modPCMESHSerializedHeader
+{
+    char tag[4];
+    uint32_t version;
+    uint32_t directoryCount;
+    uint32_t directoryOffset;
+    uint32_t rebasedBase;
+};
+
+struct modPCMESHSerializedDirectoryEntry
+{
+    uint8_t objectSizeLo;
+    uint8_t objectSizeMid;
+    uint8_t objectSizeHi;
+    uint8_t type;
+    uint32_t objectOffset;
+    uint32_t nameOffset;
+
+    uint32_t objectSize() const
+    {
+        return uint32_t(objectSizeLo)
+             | (uint32_t(objectSizeMid) << 8u)
+             | (uint32_t(objectSizeHi) << 16u);
+    }
+};
+
+struct modPCMESHSerializedFixedString
+{
+    uint32_t hash;
+    char text[28];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(modPCMESHSerializedHeader) == 0x14,
+              "serialized PCMESH header must be 0x14 bytes");
+static_assert(sizeof(modPCMESHSerializedDirectoryEntry) == 0x0C,
+              "serialized PCMESH directory entry must be 0x0C bytes");
+static_assert(sizeof(modPCMESHSerializedFixedString) == 0x20,
+              "serialized tlFixedString must be 0x20 bytes");
+
+static bool modPCMESHRangeInside(size_t size, uint32_t offset, uint32_t bytes)
+{
+    const size_t off = static_cast<size_t>(offset);
+    const size_t len = static_cast<size_t>(bytes);
+    return off <= size && len <= size - off;
+}
+
+int modPCMESHDetectTLType(const uint8_t *raw, size_t size, int preferredType)
+{
+    if (preferredType != TLRESOURCE_TYPE_NONE
+        && preferredType != TLRESOURCE_TYPE_MESH_FILE)
+        return TLRESOURCE_TYPE_NONE;
+
+    if (raw == nullptr || size < sizeof(modPCMESHSerializedHeader))
+        return TLRESOURCE_TYPE_NONE;
+
+    modPCMESHSerializedHeader header{};
+    std::memcpy(&header, raw, sizeof(header));
+
+    if (std::memcmp(header.tag, "PCM ", 4u) != 0)
+        return TLRESOURCE_TYPE_NONE;
+    if (header.version != MOD_PCMESH_VERSION
+        || header.directoryCount == 0u
+        || header.rebasedBase != 0u)
+        return TLRESOURCE_TYPE_NONE;
+
+    // The directory itself is serialized data too.  Validate it with
+    // subtraction-based range checks so corrupt count/offset values cannot
+    // wrap size_t and pass the detector.
+    if (header.directoryOffset < sizeof(modPCMESHSerializedHeader))
+        return TLRESOURCE_TYPE_NONE;
+    if ((header.directoryOffset & 3u) != 0u)
+        return TLRESOURCE_TYPE_NONE;
+
+    if (size_t(header.directoryCount) >
+        (std::numeric_limits<size_t>::max() /
+         sizeof(modPCMESHSerializedDirectoryEntry)))
+        return TLRESOURCE_TYPE_NONE;
+    const size_t dirBytes = size_t(header.directoryCount)
+                          * sizeof(modPCMESHSerializedDirectoryEntry);
+    if (size_t(header.directoryOffset) > size
+        || dirBytes > size - size_t(header.directoryOffset))
+        return TLRESOURCE_TYPE_NONE;
+
+    const size_t directoryEnd = size_t(header.directoryOffset) + dirBytes;
+    uint32_t previousObjectEnd = 0u;
+
+    for (uint32_t i = 0; i < header.directoryCount; ++i)
+    {
+        const size_t entryOffset = size_t(header.directoryOffset)
+                                 + size_t(i) * sizeof(modPCMESHSerializedDirectoryEntry);
+
+        modPCMESHSerializedDirectoryEntry entry{};
+        std::memcpy(&entry, raw + entryOffset, sizeof(entry));
+
+        const TypeDirectoryEntry type = static_cast<TypeDirectoryEntry>(entry.type);
+        if (type != TypeDirectoryEntry::MATERIAL
+            && type != TypeDirectoryEntry::MESH
+            && type != TypeDirectoryEntry::MORPH)
+            return TLRESOURCE_TYPE_NONE;
+
+        const uint32_t objectSize = entry.objectSize();
+        if (objectSize == 0u)
+            return TLRESOURCE_TYPE_NONE;
+
+        // The live loader rebases field_4 into an nglMaterialBase/nglMesh/
+        // nglMorphSet.  Require enough serialized bytes for that base object.
+        uint32_t minimumObjectSize = 0u;
+        switch (type)
+        {
+        case TypeDirectoryEntry::MATERIAL:
+            minimumObjectSize = 0x50u; // sizeof(nglMaterialBase) on PC
+            break;
+        case TypeDirectoryEntry::MESH:
+            minimumObjectSize = 0x40u; // sizeof(nglMesh) on PC
+            break;
+        case TypeDirectoryEntry::MORPH:
+            minimumObjectSize = 0x14u; // sizeof(nglMorphSet) on PC
+            break;
+        default:
+            return TLRESOURCE_TYPE_NONE;
+        }
+        if (objectSize < minimumObjectSize)
+            return TLRESOURCE_TYPE_NONE;
+
+        // Object payloads start after the directory and are 16-byte aligned in
+        // the native PC packer output.  Their *size* is not necessarily aligned
+        // (0x58 and 0x9646 occur in VENOM.PCMESH), so use the packed uint24 size
+        // and only align when comparing with the following object's start.
+        if (size_t(entry.objectOffset) < directoryEnd
+            || (entry.objectOffset & 0x0Fu) != 0u
+            || !modPCMESHRangeInside(size, entry.objectOffset, objectSize))
+            return TLRESOURCE_TYPE_NONE;
+
+        if (i != 0u)
+        {
+            const uint64_t alignedPrevious =
+                (uint64_t(previousObjectEnd) + 0x0Full) & ~0x0Full;
+            if (uint64_t(entry.objectOffset) < alignedPrevious)
+                return TLRESOURCE_TYPE_NONE; // overlapping/out-of-order payloads
+        }
+
+        const uint64_t end64 = uint64_t(entry.objectOffset) + uint64_t(objectSize);
+        if (end64 > 0xFFFFFFFFull)
+            return TLRESOURCE_TYPE_NONE;
+        previousObjectEnd = static_cast<uint32_t>(end64);
+
+        // MATERIAL and MESH both begin with tlFixedString *Name.  In the
+        // serialized image that member is still a file offset, and the
+        // directory entry duplicates it in field_8/nameOffset.  Validate the
+        // actual relationship present in VENOM.PCMESH before NGL rebases it.
+        // MORPH has a different first-member layout (tlHashString by value), so
+        // do not incorrectly apply the pointer equality rule to morph payloads.
+        if (type == TypeDirectoryEntry::MATERIAL
+            || type == TypeDirectoryEntry::MESH)
+        {
+            if (entry.nameOffset == 0u
+                || !modPCMESHRangeInside(size, entry.nameOffset,
+                                         sizeof(modPCMESHSerializedFixedString)))
+                return TLRESOURCE_TYPE_NONE;
+
+            uint32_t objectNameOffset = 0u;
+            std::memcpy(&objectNameOffset, raw + entry.objectOffset,
+                        sizeof(objectNameOffset));
+            if (objectNameOffset != entry.nameOffset)
+                return TLRESOURCE_TYPE_NONE;
+
+            modPCMESHSerializedFixedString name{};
+            std::memcpy(&name, raw + entry.nameOffset, sizeof(name));
+            if (std::memchr(name.text, '\0', sizeof(name.text)) == nullptr)
+                return TLRESOURCE_TYPE_NONE;
+        }
+        else if (entry.nameOffset != 0u
+                 && !modPCMESHRangeInside(size, entry.nameOffset, 4u))
+        {
+            return TLRESOURCE_TYPE_NONE;
+        }
+    }
+
+    return TLRESOURCE_TYPE_MESH_FILE;
+}
+
+bool modPCMESHImageUsable(const uint8_t *bytes, size_t size)
+{
+    return modPCMESHDetectTLType(bytes, size, TLRESOURCE_TYPE_MESH_FILE)
+        == TLRESOURCE_TYPE_MESH_FILE;
+}
+
+const uint8_t *modPCMESHGetOverride(uint32_t nameHash, int *sizeOut)
+{
+    if (sizeOut != nullptr)
+        *sizeOut = 0;
+
+    Mod *mod = getMod(nameHash, TLRESOURCE_TYPE_MESH_FILE);
+    if (mod == nullptr || mod->Data.empty())
+        return nullptr;
+
+    if (modPCMESHDetectTLType(mod->Data.data(), mod->Data.size(),
+                              TLRESOURCE_TYPE_MESH_FILE)
+        != TLRESOURCE_TYPE_MESH_FILE)
+        return nullptr;
+
+    if (mod->Data.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return nullptr;
+
+    if (sizeOut != nullptr)
+        *sizeOut = static_cast<int>(mod->Data.size());
+    return mod->Data.data();
+}
+
+// --------------------------------------------------------------------------
 // Raw .PCMESH overrides ("mods/VENOM.PCMESH").
 //
 // A drop-in mesh file is the same "PCM " 0x601 binary nglLoadMeshFileInternal
@@ -4177,25 +4698,22 @@ bool modBindRawPCMesh(nglMeshFile *MeshFile, const char *ext)
         return false;
     }
 
-    constexpr uint32_t version = 0x601;
-
-    // Validate the master copy before touching FileBuf so a malformed drop-in
-    // falls back to the vanilla buffer instead of failing the whole load.
-    // field_10 must be 0: a from-disk file holds offsets, not live pointers.
-    auto *Header = bit_cast<const nglMeshFileHeader *>(mod->Data.data());
-    if (mod->Data.size() < sizeof(nglMeshFileHeader) ||
-        strncmp(Header->Tag, "PCM ", 4u) != 0 ||
-        Header->Version != version ||
-        Header->NDirectoryEntries == 0 ||
-        Header->field_10 != 0)
+    // Validate through the same content detector used at enumeration, the
+    // tlresource bridge and resource_manager.  Never trust extension alone.
+    if (modPCMESHDetectTLType(mod->Data.data(), mod->Data.size(),
+                              TLRESOURCE_TYPE_MESH_FILE)
+        != TLRESOURCE_TYPE_MESH_FILE)
     {
-        sp_log("[mod] \"%s%s\": rejecting replacement \"%s\" (not a from-disk PCM %x mesh file), keeping the original.",
+        sp_log("[mod] \"%s%s\": rejecting replacement \"%s\" "
+               "(not a pristine PCM %x mesh file), keeping the original.",
                MeshFile->FileName.to_string(),
                ext,
                mod->Path.filename().string().c_str(),
-               version);
+               MOD_PCMESH_VERSION);
         return false;
     }
+
+    const auto *Header = bit_cast<const nglMeshFileHeader *>(mod->Data.data());
 
     struct raw_copy {
         const Mod *source;
@@ -4235,20 +4753,61 @@ static bool nglLoadMeshFileInternalPC(const tlFixedString &FileName,
                                       const char *ext)
 {
     TRACE("nglLoadMeshFileInternal", FileName.to_string());
+	
+
 
     if constexpr (1)
     {
+        if (MeshFile == nullptr)
+        {
+            sp_log("[mod][pcmesh] nglLoadMeshFileInternalPC(\"%s\"): null MeshFile",
+                   FileName.to_string());
+            return false;
+        }
+
+        // A newly-created nglMeshFile used by the debug-menu character switch can
+        // arrive here before its filename has been copied into the object.
+        // modBindRawPCMesh() in this source looks the override up through MeshFile,
+        // so seed the canonical key before asking it for extra/VENOM.PCMESH.
+        if (MeshFile->FileName.m_hash == 0)
+            MeshFile->FileName = FileName;
+
+        // Bind the raw override ONCE.  The old code called this twice, which made
+        // the lifetime/re-entry state ambiguous when switching Spider-Man -> Venom.
+        const bool usingRawPCMesh = modBindRawPCMesh(MeshFile, ext);
+
+        // Buf == nullptr really means missing.
+        //
+        // Size == 0 can mean "unknown size" for an existing packed/worldly
+        // nglMeshFile, so do NOT reject it during boot.
+        if (MeshFile->FileBuf.Buf == nullptr)
+        {
+            sp_log("[mod][pcmesh] mesh file data missing: %s%s%s",
+                   nglMeshPath(),
+                   FileName.to_string(),
+                   ext != nullptr ? ext : "");
+            return false;
+        }
+
+        // Only reject when a size is actually known and is too small.
+        if (MeshFile->FileBuf.Size != 0u &&
+            MeshFile->FileBuf.Size < sizeof(nglMeshFileHeader))
+        {
+            sp_log("[mod][pcmesh] mesh file data too small: %s%s%s (%u bytes)",
+                   nglMeshPath(),
+                   FileName.to_string(),
+                   ext != nullptr ? ext : "",
+                   static_cast<unsigned>(MeshFile->FileBuf.Size));
+            return false;
+        }
+
 #       if MOD_MESH_SUPPORT
             // Two separate replacement routes:
-            //   raw    - "VENOM.PCMESH" drop-in in native format: rebind FileBuf
-            //            here and let the parser below consume it untouched;
-            //   import - "VENOM.FBX"/.OBJ: parsed by the native importer
-            //            (mod_mesh_import.h) and applied per section further
-            //            down, the original buffer stays bound.
-            // Raw wins when both exist for one name; replacementMesh must stay
-            // null for raw mods so the import path is never fed PCM bytes.
+            //   raw    - "VENOM.PCMESH" native drop-in, already bound above;
+            //   import - "VENOM.FBX"/.OBJ handled by mod_mesh_import.
+            // Never pass raw PCMESH bytes into the FBX/OBJ importer path.
             Mod* replacementMesh = nullptr;
-            if (!modBindRawPCMesh(MeshFile, ext))
+            if (!usingRawPCMesh)
                 replacementMesh = getMod(MeshFile->FileName.m_hash, TLRESOURCE_TYPE_MESH);
             // A mesh file load IS the reload event: the materials this pass is
             // about to resolve are new objects on addresses the previous
@@ -4274,6 +4833,37 @@ static bool nglLoadMeshFileInternalPC(const tlFixedString &FileName,
 #       endif
 
         nglMeshFileHeader *Header = CAST(Header, MeshFile->FileBuf.Buf);
+
+        // Loose PCMESH parsing is destructive: offsets become live pointers and
+        // vertex data is rewritten in place.  The load tail stores the live image
+        // address in field_10.  Debug-menu Venom selection may request the same
+        // nglMeshFile again; rebasing that live image a second time corrupts the
+        // directory/mesh pointers and normally crashes on the loading screen.
+        if (usingRawPCMesh && Header->field_10 != 0)
+        {
+            const uint32_t liveBuf =
+                bit_cast<uint32_t>(MeshFile->FileBuf.Buf);
+
+            if (static_cast<uint32_t>(Header->field_10) == liveBuf)
+            {
+                sp_log("[mod][pcmesh] %s%s already parsed/rebased; "
+                       "skip duplicate debug-menu load",
+                       FileName.to_string(),
+                       ext != nullptr ? ext : "");
+                return true;
+            }
+
+            // A raw private image must either be pristine (field_10 == 0) or be
+            // this exact live image.  Anything else is stale/recycled state; do
+            // not feed it to PTR_OFFSET/nglRebaseHeader.
+            sp_log("[mod][pcmesh] %s%s rejected: stale PCMESH relocation base "
+                   "0x%08X, current buffer 0x%08X",
+                   FileName.to_string(),
+                   ext != nullptr ? ext : "",
+                   static_cast<unsigned>(Header->field_10),
+                   static_cast<unsigned>(liveBuf));
+            return false;
+        }
 
         MeshFile->field_134 = (int) Header;
         MeshFile->field_144 = -1;
@@ -4459,6 +5049,18 @@ static bool nglLoadMeshFileInternalPC(const tlFixedString &FileName,
                     PTR_OFFSET(Base, MeshSection->MaterialName);
 
                     MeshSection->Material = nglGetMaterialInFile(*MeshSection->MaterialName, MeshFile);
+                    if (MeshSection->Material == nullptr)
+                    {
+                        sp_log("[mod][pcmesh] %s%s: section %u references a missing material; skipping section",
+                               FileName.to_string(),
+                               ext != nullptr ? ext : "",
+                               static_cast<unsigned>(idx_Section));
+                        return; // skip this std::for_each directory-entry callback safely
+                    }
+
+                    if (MeshSection->Material->m_shader == nullptr)
+                        MeshSection->Material->m_shader = &gEmptyShader();
+
                     if (!MeshSection->Material->m_shader->CheckVertexDefVersion(MeshSection))
                     {
                         tlFixedString v111 = MeshSection->Material->m_shader->GetName();

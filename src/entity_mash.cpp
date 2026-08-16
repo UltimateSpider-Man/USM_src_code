@@ -88,6 +88,23 @@ entity_base *parse_entity_mash(_std::vector<entity *> *ent_vec_ptr,
 
         construct_v_table_lookup();
 
+        // PS2 beta-preview actors serialize 0xBC bytes: the PC-only
+        // resource_pack_slot* at actor+0xBC is not present.  A derived beta
+        // conglomerate still starts its own fields at 0xC0, so registration
+        // expands only the top conglomerate to the PC 0x130 layout.  Its
+        // nested class-3 members must keep the beta 0xBC stride while the
+        // conglomerate un-masher walks the unique stream.
+        const bool ps2BetaPreview = modEntIsPS2BetaPreviewImage(a3);
+        const int savedActorSize = ent_size_lookup()[
+            ps2_beta_preview_ent::ENTITY_CLASS_ACTOR];
+
+        if (ps2BetaPreview)
+        {
+            assert(savedActorSize == (int)ps2_beta_preview_ent::PC_ACTOR_SIZE);
+            ent_size_lookup()[ps2_beta_preview_ent::ENTITY_CLASS_ACTOR] =
+                (int)ps2_beta_preview_ent::ACTOR_DISK_SIZE;
+        }
+
         auto *header = static_cast<generic_mash_header *>(a3);
 
         if (!a9) {
@@ -111,6 +128,12 @@ entity_base *parse_entity_mash(_std::vector<entity *> *ent_vec_ptr,
                         0x1Cu,
                         4u,
                         a8);
+
+        if (ps2BetaPreview)
+        {
+            ent_size_lookup()[ps2_beta_preview_ent::ENTITY_CLASS_ACTOR] =
+                savedActorSize;
+        }
 #else
         auto v6 = parse_generic_object_mash(ent_ptr,
                                             a3,

@@ -35,6 +35,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <unordered_set>
 
 VALIDATE_SIZE(entity_base, 0x44u);
 VALIDATE_OFFSET(entity_base, my_abs_po, 0x14);
@@ -1652,6 +1653,154 @@ void check_po(entity_base *e)
 // per-entity fetch and are out of scope on purpose.
 // ---------------------------------------------------------------------------
 
+namespace {
+
+std::unordered_set<uint32_t> s_ps2BetaPreviewEntHashes;
+std::unordered_set<const void *> s_ps2BetaPreviewEntImages;
+
+uint32_t modEntReadU32(const uint8_t *p)
+{
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+bool modEntBetaVectorDescriptorUsable(const uint8_t *object,
+                                      size_t objectBytes,
+                                      size_t offset,
+                                      bool expectedShared)
+{
+    using namespace ps2_beta_preview_ent;
+
+    if (offset + sizeof(mashable_vector_disk) > objectBytes)
+        return false;
+
+    mashable_vector_disk desc{};
+    std::memcpy(&desc, object + offset, sizeof(desc));
+
+    // Beta preview stores [size:16 | shared:8 | from_mash:8][data:32].
+    // Retail PC stores [data:32][size:16 | shared:8 | from_mash:8].
+    // The seven conglomerate vectors in the supplied preview entity all
+    // originate from the mash, and the final two are shared.
+    return desc.from_mash == 1u &&
+           desc.shared == static_cast<uint8_t>(expectedShared) &&
+           desc.size < 0x4000u;
+}
+
+bool modEntHasPS2BetaPreviewLayout(const std::vector<uint8_t> &fileData)
+{
+    using namespace ps2_beta_preview_ent;
+
+    if (fileData.size() < GENERIC_HEADER_SIZE + CONGLOMERATE_DISK_SIZE + 4u)
+        return false;
+
+    const auto *header = bit_cast<const generic_mash_header *>(fileData.data());
+    if (header->class_id != ENTITY_CLASS_CONGLOMERATE)
+        return false;
+
+    const uint8_t *object = fileData.data() + GENERIC_HEADER_SIZE;
+    const size_t objectBytes = fileData.size() - GENERIC_HEADER_SIZE;
+
+    constexpr size_t vectorOffsets[] = {
+        0xC0u, 0xC8u, 0xD0u, 0xD8u, 0xE0u, 0xE8u, 0xF0u
+    };
+    constexpr bool vectorShared[] = {
+        false, false, false, false, false, true, true
+    };
+
+    for (size_t i = 0; i < (sizeof(vectorOffsets) / sizeof(vectorOffsets[0])); ++i)
+    {
+        if (!modEntBetaVectorDescriptorUsable(object, objectBytes,
+                                              vectorOffsets[i], vectorShared[i]))
+            return false;
+    }
+
+    return true;
+}
+
+bool modEntNormalizePS2BetaPreview(std::vector<uint8_t> &fileData)
+{
+    using namespace ps2_beta_preview_ent;
+
+    if (!modEntHasPS2BetaPreviewLayout(fileData))
+        return false;
+
+    const auto *initialHeader =
+        bit_cast<const generic_mash_header *>(fileData.data());
+    const bool hasSkeletonInterface = (initialHeader->field_E & 0x40u) != 0;
+
+    // With a skeleton interface the preview places that 0x14-byte interface
+    // immediately at beta object+0x12C.  Without it, those four bytes are the
+    // normal alignment gap before the first 16-aligned PO vector and can be
+    // reused directly as the missing PC variant-interface slot.
+    const size_t betaObjectEnd = GENERIC_HEADER_SIZE + CONGLOMERATE_DISK_SIZE;
+    if (hasSkeletonInterface &&
+        modEntReadU32(fileData.data() + betaObjectEnd) != MASH_VTABLE_MARKER)
+    {
+        return false;
+    }
+
+    constexpr size_t vectorOffsets[] = {
+        0xC0u, 0xC8u, 0xD0u, 0xD8u, 0xE0u, 0xE8u, 0xF0u
+    };
+
+    // Translate each beta descriptor from:
+    //     [size/shared/from_mash][data]
+    // to the PC mashable_vector in-memory image:
+    //     [data][size/shared/from_mash]
+    for (const size_t offset : vectorOffsets)
+    {
+        uint8_t *desc = fileData.data() + GENERIC_HEADER_SIZE + offset;
+        uint32_t betaMeta = modEntReadU32(desc + 0);
+        uint32_t betaData = modEntReadU32(desc + 4);
+        std::memcpy(desc + 0, &betaData, sizeof(betaData));
+        std::memcpy(desc + 4, &betaMeta, sizeof(betaMeta));
+    }
+
+    // PS2 preview conglomerate ends at 0x12C and has no PC
+    // m_variant_interface slot.  Add that four-byte slot so the PC parser can
+    // use its normal 0x130 top-level stride.
+    if (hasSkeletonInterface)
+    {
+        fileData.insert(fileData.begin() + betaObjectEnd, 4u, 0u);
+
+        // The skeleton interface is 0x14 bytes.  Moving its start from 0x13C
+        // to 0x140 makes its end 0x154; PC's following mashable_vector<po>
+        // aligns to 16 bytes and therefore expects the next data at 0x160.
+        // Add 12 bytes after the interface so every later unique-stream
+        // alignment remains identical, shifted by a full 0x10.
+        constexpr size_t skeletonInterfaceSize = 0x14u;
+        const size_t pcSkeletonEnd = betaObjectEnd + 4u + skeletonInterfaceSize;
+        fileData.insert(fileData.begin() + pcSkeletonEnd, 12u, 0u);
+    }
+    else
+    {
+        // Beta's 0x12C object is followed by the four bytes of padding needed
+        // to align the first PO vector to 0x140.  PC needs exactly those same
+        // bytes for m_variant_interface, so consume the padding in place and
+        // leave every mash-data offset untouched.
+        if (betaObjectEnd + 4u > fileData.size())
+            return false;
+        std::memset(fileData.data() + betaObjectEnd, 0, 4u);
+    }
+
+    auto *header = bit_cast<generic_mash_header *>(fileData.data());
+    if (hasSkeletonInterface)
+        header->field_8 += 0x10;
+    header->safety_key = header->generate_safety_key();
+
+    return true;
+}
+
+void modEntEraseTypedBinding(uint32_t hash)
+{
+    auto range = Mods.equal_range(hash);
+    for (auto it = range.first; it != range.second; )
+        it = (it->second.Type == MOD_TYPE_ENT_FILE) ? Mods.erase(it) : std::next(it);
+}
+
+} // namespace
+
 bool modEntImageUsable(const uint8_t *bytes, size_t size)
 {
     if (bytes == nullptr || size < sizeof(generic_mash_header) + 4)
@@ -1678,6 +1827,19 @@ bool modEntImageUsable(const uint8_t *bytes, size_t size)
     return true;
 }
 
+bool modEntIsPS2BetaPreviewHash(uint32_t classHash)
+{
+    return s_ps2BetaPreviewEntHashes.find(classHash) !=
+           s_ps2BetaPreviewEntHashes.end();
+}
+
+bool modEntIsPS2BetaPreviewImage(const void *image)
+{
+    return image != nullptr &&
+           s_ps2BetaPreviewEntImages.find(image) !=
+               s_ps2BetaPreviewEntImages.end();
+}
+
 bool modEntRegister(const std::filesystem::path &path,
                     std::vector<uint8_t> &&fileData)
 {
@@ -1690,21 +1852,58 @@ bool modEntRegister(const std::filesystem::path &path,
         return false;
     }
 
+    const bool ps2BetaPreview = modEntHasPS2BetaPreviewLayout(fileData);
+    if (ps2BetaPreview)
+    {
+        const auto *oldHeader = bit_cast<const generic_mash_header *>(fileData.data());
+        const int oldMashDataOffset = oldHeader->field_8;
+
+        if (!modEntNormalizePS2BetaPreview(fileData) ||
+            !modEntImageUsable(fileData.data(), fileData.size()))
+        {
+            sp_log("[mod] ent \"%s\": PS2 beta-preview translation failed, ignored",
+                   path.filename().string().c_str());
+            return false;
+        }
+
+        sp_log("[mod] ent \"%s\": PS2 beta-preview layout translated "
+               "(conglomerate 0x%X->0x%X, child actor 0x%X, mash 0x%X->0x%X)",
+               path.filename().string().c_str(),
+               (unsigned)ps2_beta_preview_ent::CONGLOMERATE_DISK_SIZE,
+               (unsigned)ps2_beta_preview_ent::PC_CONGLOMERATE_SIZE,
+               (unsigned)ps2_beta_preview_ent::ACTOR_DISK_SIZE,
+               (unsigned)oldMashDataOffset,
+               (unsigned)bit_cast<const generic_mash_header *>(fileData.data())->field_8);
+    }
+
     // A dumped-from-memory image may carry a live IN_USE flag; the flag is
     // outside the checksummed bits, so clearing it keeps the header valid.
     auto *header = bit_cast<generic_mash_header *>(fileData.data());
     header->field_4 &= ~_MASH_FLAG_IN_USE;
 
     const uint32_t hash = to_hash(stem.c_str());
+    uint32_t literal = 0;
+    const bool hasLiteral = modParseLiteralHash(stem, &literal) && literal != hash;
 
     // Re-registration (enumerate_mods() reruns): replace, don't stack.
+    modEntEraseTypedBinding(hash);
+    s_ps2BetaPreviewEntHashes.erase(hash);
+    if (hasLiteral)
     {
-        auto range = Mods.equal_range(hash);
-        for (auto it = range.first; it != range.second; )
-            it = (it->second.Type == MOD_TYPE_ENT_FILE) ? Mods.erase(it) : std::next(it);
+        modEntEraseTypedBinding(literal);
+        s_ps2BetaPreviewEntHashes.erase(literal);
     }
 
-    sp_log("[mod] registered ent override \"%s\" -> \"%s\" (%u bytes, key 0x%08X, class %u)",
+    if (ps2BetaPreview)
+    {
+        s_ps2BetaPreviewEntHashes.insert(hash);
+        if (hasLiteral)
+            s_ps2BetaPreviewEntHashes.insert(literal);
+    }
+
+    sp_log("[mod] registered %s ent override \"%s\" -> \"%s\" "
+           "(%u bytes, key 0x%08X, class %u)",
+           ps2BetaPreview ? "PS2 beta-preview" : "PC",
            path.filename().string().c_str(), stem.c_str(),
            (unsigned)fileData.size(), hash, (unsigned)header->class_id);
 
@@ -1712,8 +1911,7 @@ bool modEntRegister(const std::filesystem::path &path,
 
     // Hash-named drops ("extra/0x1189AB87.ent") also bind under the literal
     // value, mirroring the mesh/texture/wav stem convention.
-    if (uint32_t literal = 0;
-        modParseLiteralHash(stem, &literal) && literal != hash)
+    if (hasLiteral)
     {
         const Mod *just = getMod(hash, MOD_TYPE_ENT_FILE);
         if (just != nullptr)
@@ -1733,16 +1931,32 @@ uint8_t *modEntGetOverride(uint32_t classHash, int *sizeOut)
     if (mod == nullptr || mod->Data.empty())
         return nullptr;
 
+    const bool ps2BetaPreview = modEntIsPS2BetaPreviewHash(classHash);
+
     // One immortal, 16-aligned, writable copy per mod image, reused for
     // every spawn: the first parse un-mashes it in place and flags it
     // IN_USE; every later spawn takes parse_generic_mash_init's clone
     // branch - exactly a retail pack image's lifecycle, except this one
-    // never unloads. The bytes in Mods stay pristine as the master copy.
+    // never unloads. PS2 beta-preview actor records are the one exception:
+    // the PC runtime writes m_resource_context at actor+0xBC, which is where
+    // the beta serializer put the actor sync word. Once a beta image has
+    // been consumed we therefore allocate a fresh pristine image for the
+    // next fetch rather than cloning the already-unmashed bytes. Old copies
+    // remain immortal because live entities contain pointers into them.
+    // The bytes in Mods always stay pristine as the master copy.
     struct entImage { const Mod *source; void *copy; };
     static std::unordered_map<uint32_t, entImage> s_images;
 
     auto &slot = s_images[classHash];
-    if (slot.copy == nullptr || slot.source != mod)
+    bool betaImageAlreadyConsumed = false;
+    if (ps2BetaPreview && slot.copy != nullptr && slot.source == mod)
+    {
+        const auto *runtimeHeader =
+            bit_cast<const generic_mash_header *>(slot.copy);
+        betaImageAlreadyConsumed = runtimeHeader->is_flagged(_MASH_FLAG_IN_USE);
+    }
+
+    if (slot.copy == nullptr || slot.source != mod || betaImageAlreadyConsumed)
     {
         void *copy = tlMemAlloc((uint32_t)mod->Data.size(), 16u, 0x2000000u);
         if (copy == nullptr)
@@ -1751,6 +1965,9 @@ uint8_t *modEntGetOverride(uint32_t classHash, int *sizeOut)
         slot.source = mod;
         slot.copy = copy;   // the previous copy (if any) stays alive: live
                             // entities keep pointers into it
+
+        if (ps2BetaPreview)
+            s_ps2BetaPreviewEntImages.insert(copy);
     }
 
     if (sizeOut != nullptr)

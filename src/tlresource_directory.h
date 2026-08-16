@@ -25,3 +25,6 @@ struct tlresource_directory : tlResourceDirectory<T0, T1> {
 };
 
 extern void tlresource_directory_patch();
+
+
+extern void tlresource_directory2_patch();
