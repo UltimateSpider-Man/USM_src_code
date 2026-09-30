@@ -18,11 +18,17 @@ mash_info_struct::mash_info_struct(mash::mode_t a2, uint8_t *a3, int size, bool 
     this->field_C = 0;
     assert(mode == mash::UNMASH_MODE);
 
-    this->header = CAST(this->header, a5 ? a3 : nullptr);
-
     this->mash_image_ptr[mash::NORMAL_BUFFER] = a3;
     this->buffer_size_used[mash::NORMAL_BUFFER] = 0;
 
+#ifdef OPENUSM_XBPACK_V10
+    this->header = nullptr;
+    this->m_index = size;
+    this->mash_image_ptr[mash::SHARED_BUFFER] = &a3[size];
+    this->buffer_size_used[mash::SHARED_BUFFER] = 0;
+    this->m_size = 0;
+#else
+    this->header = CAST(this->header, a5 ? a3 : nullptr);
     this->m_index = (a5 ? this->header->field_8 : size);
     this->mash_image_ptr[mash::SHARED_BUFFER] = &a3[this->m_index];
     this->buffer_size_used[mash::SHARED_BUFFER] = 0;
@@ -31,6 +37,7 @@ mash_info_struct::mash_info_struct(mash::mode_t a2, uint8_t *a3, int size, bool 
     {
         this->advance_buffer(mash::NORMAL_BUFFER, 16);
     }
+#endif
 }
 
 void mash_info_struct::advance_buffer(mash::buffer_type buffer, int how_many_bytes)

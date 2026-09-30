@@ -122,4 +122,10 @@ namespace inverse_kinematics {
     extern quaternion* __cdecl quat_blend(
         quaternion* quat, quaternion* quatA, float* weightA, quaternion* quatB, vector4d* weights);
 
+#ifdef OPENUSM_XBPACK_V10
+    extern int __stdcall LegsIK_BuildBoneMatrices_v10(
+        matrix4x4 *matrices, int name, void *skel_data, void *pose_data);
+#endif
+
+    extern int LegsIK_BuildPerInstData(int mask);
 }

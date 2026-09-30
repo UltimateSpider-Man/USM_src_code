@@ -10,6 +10,8 @@
 #include "variable.h"
 
 #include <cassert>
+#include <filesystem>
+#include <unordered_map>
 
 struct nflFile {
     int m_fileSize;
@@ -1005,9 +1007,52 @@ nflDriver *nfsGetMediaDriver(int a1)
     return result;
 }
 
+namespace nflSystem {
+    std::unordered_map<std::string, std::filesystem::path> ModFileOverrides;
+}
+
 nflFileID nflSystem::openFile(nflMediaID a1, const char *a2, nfdFileFlags Flags, uint32_t *p_fileSize)
 {
     //sp_log("Open file %s", a2);
+
+    // ---------------------------------------------------------------------
+    // Mods: low-level file override
+    // ---------------------------------------------------------------------
+    // If a file exists in mods/ with the same relative path (case-insensitive),
+    // redirect the open request to that file on disk.
+    //
+    // Examples:
+    //   Engine asks:  "data\\sound\\ui\\click.wbk"
+    //   Mod provides: "mods\\data\\sound\\ui\\click.wbk"
+    //
+    // NOTE: This does *not* magically make NSL accept WAV in place of WBK.
+    // It simply allows you to override *whatever* file the engine is trying
+    // to open (including .WBK wavebanks) and also lets your own code open
+    // mod WAV files via nflOpenFile("mods\\...\\file.wav").
+{
+    auto normalize = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c){ return (char)std::tolower(c); });
+        std::replace(s.begin(), s.end(), '/', '\\');
+        while (s.rfind(".\\", 0) == 0) s.erase(0, 2);
+        return s;
+    };
+
+    const std::string req0 = normalize(a2 ? std::string(a2) : std::string());
+    std::string req1 = req0;
+    if (req1.rfind("data\\", 0) == 0) req1.erase(0, 5);
+
+    auto it = nflSystem::ModFileOverrides.find(req0);
+    if (it == nflSystem::ModFileOverrides.end())
+        it = nflSystem::ModFileOverrides.find(req1);
+
+    if (it != nflSystem::ModFileOverrides.end()) {
+        thread_local std::string s_override;
+        s_override = it->second.string();
+        a2 = s_override.c_str();
+    }
+}
+   
 
     if constexpr (1)
     {

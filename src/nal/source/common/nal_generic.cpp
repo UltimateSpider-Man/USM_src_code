@@ -11,12 +11,26 @@ namespace nalGeneric {
 VALIDATE_SIZE(nalGenericSkeleton, 0xE4);
 VALIDATE_SIZE(nalComponentInfo, 0x30);
 VALIDATE_OFFSET(nalGenericSkeleton, field_64, 0x64);
+VALIDATE_OFFSET(nalGenericSkeleton, m_pose_alignment, 0x94);
 
 VALIDATE_SIZE(nalGenericPose, 0xC);
 
 nalGenericSkeleton::nalGenericSkeleton()
 {
     vtbl_ptr() = (int) std::addressof(bit_cast<int *>(this)[0]);
+}
+
+uint32_t nalGenericSkeleton::GetPoseAlignment() const
+{
+    return static_cast<uint32_t>(m_pose_alignment);
+}
+
+bool nalGenericSkeleton::UsesXboxV10PoseLayout() const
+{
+    // PC and Xbox Generic skeletons share the same version/type identifiers.
+    // The serialized pose alignment is the format-owned discriminator: retail
+    // PC layouts use 4, while Xbox v10 layouts with bridged components use 16.
+    return field_4 == 0x00010200u && GetPoseAlignment() == 16u;
 }
 
 void nalGenericSkeleton::Process()
@@ -32,7 +46,7 @@ void nalGenericSkeleton::Process()
         this->field_78 = v6;
         auto v7 = v5 + v6 + 3;
         auto v8 = 5 * this->field_7C;
-        auto v9 = this->field_94;
+        auto v9 = this->m_pose_alignment;
         v7 &= 0xFFFFFFFC;
         this->field_84 = v7;
         auto v10 = (v7 + 8 * v8 + 3) & 0xFFFFFFFC;
@@ -159,4 +173,3 @@ void nalGenericSkeleton::GetComponentHandle<unsigned char>(
 }
 
 } // namespace nalGeneric
-

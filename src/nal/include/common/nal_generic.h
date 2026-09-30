@@ -88,7 +88,7 @@ struct nalGenericSkeleton {
     int field_88;
     nalComponentInfo *field_8C;
     int field_90;
-    int field_94;
+    int m_pose_alignment;
     int field_98;
     int field_9C;
     int field_A0;
@@ -135,6 +135,10 @@ struct nalGenericSkeleton {
     void Process();
 
     void Release();
+
+    uint32_t GetPoseAlignment() const;
+
+    bool UsesXboxV10PoseLayout() const;
 
     bool CheckVersion() {
         return this->field_4 == 0x10200;

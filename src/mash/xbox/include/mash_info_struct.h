@@ -42,18 +42,43 @@ struct mash_info_struct {
 
     mash_info_struct(mash::mode_t a2, uint8_t *a3, int size, bool a5);
 
+    mash_info_struct(uint8_t *image, int size)
+        : mash_info_struct(mash::UNMASH_MODE, image, size, true)
+    {
+    }
+
     int get_header_size();
 
     void advance_buffer(mash::buffer_type, int);
 
+    void advance_buffer(int how_many_bytes)
+    {
+        advance_buffer(mash::NORMAL_BUFFER, how_many_bytes);
+    }
+
     //0x004208F0
     uint8_t *read_from_buffer(mash::buffer_type, int a2, int a3);
+
+    uint8_t *read_from_buffer(int size, int align)
+    {
+        return read_from_buffer(mash::NORMAL_BUFFER, size, align);
+    }
 
     //0x0041F7C0
     void align_buffer(mash::buffer_type, int a2);
 
+    void align_buffer(int align)
+    {
+        align_buffer(mash::NORMAL_BUFFER, align);
+    }
+
     //0x0041F780
     void deductive_align_buffer(mash::buffer_type);
+
+    void deductive_align_buffer()
+    {
+        deductive_align_buffer(mash::NORMAL_BUFFER);
+    }
 
     template<typename T>
     void unmash_class(T *&a2, void *a3, mash::buffer_type buffer)
@@ -79,6 +104,12 @@ struct mash_info_struct {
         }
     }
 #endif
+
+    template<typename T>
+    void unmash_class(T *&a2, void *a3)
+    {
+        unmash_class(a2, a3, mash::NORMAL_BUFFER);
+    }
 
     template<typename T>
     void unmash_class_in_place(T &a1, void *a2)

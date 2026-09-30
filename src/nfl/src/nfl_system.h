@@ -8,6 +8,11 @@
 
 #define PC_VERSION 1 
 
+#pragma once
+#include <filesystem>
+#include <unordered_map>
+#include <string>
+
 struct resource_pack_header;
 struct resource_pack_streamer;
 
@@ -216,6 +221,7 @@ struct nflInitParams {
 namespace nflSystem {
 //0x0079E180
 nflFileID openFile(nflMediaID a1, const char *a2, nfdFileFlags a3, uint32_t *a4);
+    extern std::unordered_map<std::string, std::filesystem::path> ModFileOverrides;
 
 void closeFile(nflFileID a1);
 
@@ -308,3 +314,5 @@ extern void nfl_system_patch();
 
 //0x0079E830
 extern void nflCancelRequest(nflRequestID a1);
+
+
