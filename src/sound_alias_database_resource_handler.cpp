@@ -8,6 +8,7 @@
 #include "worldly_pack_slot.h"
 #include "sound_alias_database.h"
 #include "sound_manager.h"
+#include "mash_config.h"
 #include "mash_info_struct.h"
 #include "trace.h"
 
@@ -57,21 +58,21 @@ bool sound_alias_database_resource_handler::_handle_resource(worldly_resource_ha
         }
         else
         {
-#ifndef TARGET_XBOX
-            mash_info_struct v7 {resource, a3->m_size};
-#else
+#if OPENUSM_XBOX_MASH_FORMAT
             mash_info_struct v7 {mash::UNMASH_MODE, resource, a3->m_size, true};
+#else
+            mash_info_struct v7 {resource, a3->m_size};
 #endif
 
             sound_alias_database *new_resource = nullptr;
             v7.unmash_class(new_resource, nullptr
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                 , mash::NORMAL_BUFFER
 #endif 
                     );
             mash_info_struct::construct_class(new_resource);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
             a3->m_offset += v7.get_header_size();
 #endif
 
@@ -97,6 +98,12 @@ void sound_alias_database_resource_handler_patch() {
         set_vfunc(0x00888B18, address);
     }
 
+    FUNC_ADDRESS(address, &sound_alias_database_resource_handler::_handle_resource);
+    set_vfunc(0x00888B20, address);
+}
+
+void sound_alias_database_resource_handler_xbpack_patch()
+{
     FUNC_ADDRESS(address, &sound_alias_database_resource_handler::_handle_resource);
     set_vfunc(0x00888B20, address);
 }

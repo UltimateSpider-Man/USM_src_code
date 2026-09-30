@@ -1,11 +1,12 @@
 #include "skeleton_interface.h"
 
 #include "common.h"
+#include "conglom.h"
 #include "entity_base.h"
 #include "oldmath_po.h"
 #include "trace.h"
 
-#ifdef TARGET_XBOX
+#if defined(TARGET_XBOX) || defined(OPENUSM_XBPACK_MODE)
 #include "mash_info_struct.h"
 #endif
 
@@ -16,7 +17,7 @@ skeleton_interface::skeleton_interface()
 
 }
 
-#ifdef TARGET_XBOX
+#if defined(TARGET_XBOX) || defined(OPENUSM_XBPACK_MODE)
 void skeleton_interface::unmash(mash_info_struct *a2, void *a3)
 {
     assert("abs_po == (po *)mash::CUSTOM_MASH_SENTRY");
@@ -40,5 +41,6 @@ void skeleton_interface::connect_bone_abs_po(int bone_idx, entity_base *new_bone
     assert(new_bone->my_abs_po == new_bone->my_rel_po);
 
     new_bone->my_abs_po = &this->abs_po[bone_idx];
-    this->field_8 |= 0x10000000u;
+    assert(this->field_4 != nullptr);
+    this->field_4->field_8 |= 0x10000000u;
 }

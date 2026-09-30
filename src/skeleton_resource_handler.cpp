@@ -4,6 +4,7 @@
 #include "entity.h"
 #include "func_wrapper.h"
 #include "nal_system.h"
+#include "mod_nal_overrides.h"
 #include "trace.h"
 #include "string_hash_dictionary.h"
 #include "utility.h"
@@ -48,7 +49,7 @@ bool skeleton_resource_handler::_handle_resource(worldly_resource_handler::eBeha
         ++this->field_C;
         return false;
     } else {
-        return (bool) THISCALL(0x0055F8E0, this, a2, a3);
+        return modNalHandleSkeletonResource(this, int(a2), a3);
     }
 }
 

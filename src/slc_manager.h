@@ -26,11 +26,9 @@ struct slc_manager {
 
     //0x0059EC00
     static void un_mash_all_funcs();
-	
-	
+
+    static bool using_xbox_v14();
 };
-
-
 
 #if !STANDALONE_SYSTEM
 extern _std::vector<script_library_class *> *& slc_manager_class_array;
@@ -46,3 +44,7 @@ inline std::set<script_library_class *> *slc_manager_classes = nullptr;
 extern void register_standard_script_libs();
 
 extern void slc_manager_patch();
+
+// Restores the character-lineup name list for standalone PC pack indexes.
+// This is deliberately narrower than slc_manager_patch().
+extern void character_packname_list_patch();

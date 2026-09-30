@@ -111,6 +111,28 @@ void *get_game_var_address(const mString &a1, bool *a2, script_library_class **a
         }
     }
 
+#ifdef OPENUSM_XBPACK_V10
+    if (result == nullptr && a1 == "g_game_paused") {
+        static int game_paused = 0;
+        return &game_paused;
+    }
+
+    if (result == nullptr && a1 == "gv_message_log_next") {
+        static float message_log_next = 0.0f;
+        return &message_log_next;
+    }
+
+    if (result == nullptr && a1 == "gv_message_log_title") {
+        static float message_log_title[128] {};
+        return message_log_title;
+    }
+
+    if (result == nullptr && a1 == "gv_message_log_body") {
+        static float message_log_body[128] {};
+        return message_log_body;
+    }
+#endif
+
     if (result == nullptr && a3 == nullptr) {
         mString v1{"unknown game/shared var "};
         v1 += a1;
@@ -968,12 +990,27 @@ int register_callback(
 
 void *parse_generic_mash_init_hook(generic_mash_header *&header, void *a2, bool *allocated_mem, generic_mash_data_ptrs *a4, unsigned int struct_size, unsigned int *virtual_table_lookup, unsigned int *size_table_lookup, unsigned int num_table_entries, unsigned int base_class_size, void *a10)
 {
-#ifdef TARGET_XBOX
+#if defined(TARGET_XBOX) || defined(OPENUSM_XBPACK_MODE)
     struct_size = 0x60;
 #endif
 
     return parse_generic_mash_init(header, a2, allocated_mem, a4, struct_size, virtual_table_lookup,
             size_table_lookup, num_table_entries, base_class_size, a10);
+}
+
+void script_manager_xbpack_patch()
+{
+#ifdef OPENUSM_XBPACK_MODE
+    REDIRECT(0x005B0834, parse_generic_mash_init_hook);
+#ifdef OPENUSM_XBPACK_V10
+    FUNC_ADDRESS(address, &script_executable::un_mash);
+    REDIRECT(0x005B0850, address);
+
+    void * (*get_game_var)(const mString &, bool *, script_library_class **) =
+        &script_manager::get_game_var_address;
+    SET_JUMP(0x005A09B0, get_game_var);
+#endif
+#endif
 }
 
 void script_manager_patch()

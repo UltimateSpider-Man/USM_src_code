@@ -5,6 +5,8 @@
 #include <list.hpp>
 #include <map.hpp>
 
+#include <cstdint>
+
 #if STANDALONE_SYSTEM
 #include <map>
 #endif
@@ -116,3 +118,4 @@ namespace script_manager {
 }
 
 extern void script_manager_patch();
+extern void script_manager_xbpack_patch();

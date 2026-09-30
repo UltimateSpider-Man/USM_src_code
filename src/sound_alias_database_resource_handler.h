@@ -16,3 +16,4 @@ struct sound_alias_database_resource_handler : base_engine_resource_handler {
 };
 
 extern void sound_alias_database_resource_handler_patch();
+extern void sound_alias_database_resource_handler_xbpack_patch();

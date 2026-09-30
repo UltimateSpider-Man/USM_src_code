@@ -111,12 +111,16 @@ spiderman_camera::spiderman_camera(const string_hash &a2, entity *a3) : game_cam
 
 void * spiderman_camera::operator new(size_t size)
 {
-    return _aligned_malloc(size, 4);
+    using aligned_malloc_t = void *(__cdecl *)(size_t, size_t);
+    auto aligned_malloc = *bit_cast<aligned_malloc_t *>(0x0086F354);
+    return aligned_malloc(size, 4);
 }
 
 void spiderman_camera::operator delete(void *ptr)
 {
-    _aligned_free(ptr);
+    using aligned_free_t = void (__cdecl *)(void *);
+    auto aligned_free = *bit_cast<aligned_free_t *>(0x0086F328);
+    aligned_free(ptr);
 }
 
 void spiderman_camera::sub_4B3260(bool a2)
