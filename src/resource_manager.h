@@ -164,4 +164,4 @@ extern void resource_manager_patch();
 extern void resource_manager2_patch();
 
 extern void modScanNalOverrides();
-
+extern void resource_manager_xbpack_patch();

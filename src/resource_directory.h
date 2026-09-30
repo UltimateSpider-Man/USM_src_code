@@ -119,3 +119,4 @@ public:
 };
 
 extern void resource_directory_patch();
+extern void resource_directory_xbpack_patch();

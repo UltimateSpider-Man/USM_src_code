@@ -2,6 +2,8 @@
 
 #include <list.hpp>
 
+#include <cstdint>
+
 struct script_executable;
 struct mString;
 

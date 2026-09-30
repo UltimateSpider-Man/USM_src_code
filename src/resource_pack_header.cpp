@@ -7,8 +7,46 @@
 #include "variables.h"
 
 #include <cassert>
+#include <cstdio>
+#include <windows.h>
 
 VALIDATE_SIZE(resource_pack_header, 0x2Cu);
+
+namespace
+{
+    void debug_version_mismatch(const char *relation,
+                                const resource_key &key,
+                                const resource_versions &actual,
+                                const resource_versions &expected)
+    {
+        char buffer[512];
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "resource_pack_header::verify: pack hash=0x%08X type=%d actual=%u.%u.%u.%u.%u is %s "
+                      "than expected=%u.%u.%u.%u.%u platform=%d\n",
+                      key.m_hash.source_hash_code,
+                      static_cast<int>(key.m_type),
+                      actual.field_0,
+                      actual.field_4,
+                      actual.field_8,
+                      actual.field_C,
+                      actual.field_10,
+                      relation,
+                      expected.field_0,
+                      expected.field_4,
+                      expected.field_8,
+                      expected.field_C,
+                      expected.field_10,
+                      static_cast<int>(g_platform));
+        OutputDebugStringA(buffer);
+        sp_log("%s", buffer);
+    }
+
+    bool should_assert_resource_version_mismatch()
+    {
+        return g_platform != NL_PLATFORM_XBOX;
+    }
+}
 
 resource_pack_header::resource_pack_header() : field_0() {
     this->field_14 = 0;
@@ -36,11 +74,12 @@ bool resource_pack_header::verify(resource_key a2) const
     {
         //sp_log("0x%08X %d", a2.field_0, a2.m_type);
 
-        static constexpr resource_versions v20 = {RESOURCE_PACK_VERSION,
-                                                  RESOURCE_ENTITY_MASH_VERSION,
-                                                  RESOURCE_NONENTITY_MASH_VERSION,
-                                                  RESOURCE_AUTO_MASH_VERSION,
-                                                  RESOURCE_RAW_MASH_VERSION};
+        if (g_platform == NL_PLATFORM_XBOX &&
+            supports_xbox_version(this->field_0)) {
+            return true;
+        }
+
+        const resource_versions v20 = expected_resource_versions(g_platform);
 
         bool v29 = false, v28 = false;
 
@@ -64,9 +103,10 @@ bool resource_pack_header::verify(resource_key a2) const
                    v2,
                    v19.c_str(),
                    v18.c_str());
-#ifndef TARGET_XBOX
-            assert(0);
-#endif
+            debug_version_mismatch("newer", a2, this->field_0, v20);
+            if (should_assert_resource_version_mismatch()) {
+                assert(0);
+            }
 
             return false;
         } else if (v28) {
@@ -81,9 +121,10 @@ bool resource_pack_header::verify(resource_key a2) const
                    v19.c_str(),
                    v18.c_str());
 
-#ifndef TARGET_XBOX
-            assert(0);
-#endif
+            debug_version_mismatch("older", a2, this->field_0, v20);
+            if (should_assert_resource_version_mismatch()) {
+                assert(0);
+            }
 
             return false;
         } else {

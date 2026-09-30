@@ -13,6 +13,7 @@
 #include <cstdlib>
 
 VALIDATE_SIZE(resource_amalgapak_header, 0x38);
+VALIDATE_SIZE(resource_amalgapak_header_xbox, 0x38);
 
 resource_amalgapak_header::resource_amalgapak_header() {
     this->clear();
@@ -34,11 +35,7 @@ void resource_amalgapak_header::clear() {
 }
 
 bool resource_amalgapak_header::verify([[maybe_unused]] const mString &a2) {
-    static constexpr resource_versions v20 = {RESOURCE_PACK_VERSION,
-                                              RESOURCE_ENTITY_MASH_VERSION,
-                                              RESOURCE_NONENTITY_MASH_VERSION,
-                                              RESOURCE_AUTO_MASH_VERSION,
-                                              RESOURCE_RAW_MASH_VERSION};
+    static constexpr resource_versions v20 = PC_RETAIL_RESOURCE_VERSIONS;
 
     bool v29 = false, v28 = false;
 
@@ -142,18 +139,17 @@ bool resource_amalgapak_header_xbox::verify([[maybe_unused]] const mString &a2) 
 
 
 void resource_amalgapak_header_patch() {
-
-	
-	{
-       FUNC_ADDRESS(address, &resource_amalgapak_header::verify);
-      // REDIRECT(0x00537762, address);
-	  // REDIRECT(0x0053DF4A, address);
-    }
-	
+#ifdef OPENUSM_XBPACK_MODE
     {
        FUNC_ADDRESS(address, &resource_amalgapak_header_xbox::verify);
        REDIRECT(0x00537762, address);
-	   REDIRECT(0x0053DF4A, address);
+       REDIRECT(0x0053DF4A, address);
     }
-	
+#else
+    {
+       FUNC_ADDRESS(address, &resource_amalgapak_header::verify);
+       REDIRECT(0x00537762, address);
+       REDIRECT(0x0053DF4A, address);
+    }
+#endif
 }

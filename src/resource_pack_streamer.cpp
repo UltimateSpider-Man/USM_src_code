@@ -442,8 +442,7 @@ void resource_pack_streamer::frame_advance_idle([[maybe_unused]] Float a2)
                 if ( m_head->_Next != m_head ) {
                     v6->_Prev->_Next = v6->_Next;
                     v6->_Next->_Prev = v6->_Prev;
-                    CDECL_CALL(0x0082207C);
-                    //operator delete(v6);
+                    CDECL_CALL(0x0082207C, v6);
                     --this->field_6C.m_size;
                 }
             }

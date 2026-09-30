@@ -3,6 +3,8 @@
 #include "binary_search_array_cmp.h"
 #include "common.h"
 #include "core_ai_resource.h"
+#include "cut_scene.h"
+#include "cut_scene_segment.h"
 #include "base_ai_res_state_graph.h"
 #include "entity_base.h"
 #include "entity.h"
@@ -15,12 +17,16 @@
 #include "memory.h"
 #include "mash_info_struct.h"
 #include "nal_system.h"
+#include "mod_nal_overrides.h"
 #include "nfl_system.h"
 #include "ngl.h"
 #include "nlPlatformEnum.h"
 #include "os_file.h"
 #include "os_developer_options.h"
 #include "debug_menu.h"
+#ifdef OPENUSM_XBPACK_V10
+#include "exe_allocator.h"
+#endif
 #include "resource_amalgapak_header.h"
 #include "resource_directory.h"
 #include "return_address.h"
@@ -28,8 +34,12 @@
 #include "utility.h"
 #include "variables.h"
 #include "worldly_pack_slot.h"
+#include "xbpack.h"
 #include "osassert.h"
 
+#include <algorithm>
+#include <new>
+#include <vector>
 #include <cassert>
 #include <cstring>
 #include <numeric>
@@ -306,10 +316,11 @@ uint8_t *modPanelGetOverride(uint32_t hash, int *sizeOut)
 //   SLF       -> RESOURCE_KEY_TYPE_SLF_LIST
 //
 // COLL is modified in-place by cg_mesh::_un_mash (the last signature byte is
-// changed to 'Z'). CUT is un-mashed in place by cut_scene_resource_handler,
-// and PCMESHDEF is a generic-mash image. Keep Mod::Data pristine and hand the
-// engine aligned writable copies. SLF itself is read-only, but using the same
-// copy path keeps external-only resource ownership uniform.
+// changed to 'Z'). CUT is converted into a constructed retail-PC cut_scene by
+// modCutGetOverride, and PCMESHDEF is a generic-mash image. Keep Mod::Data
+// pristine and hand the engine aligned writable copies. SLF itself is
+// read-only, but using the same copy path keeps external-only resource
+// ownership uniform.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -330,12 +341,38 @@ struct mod_cut_vector_disk {
     uint8_t from_mash;
     uint8_t padding[3];
 };
+
+// The host executable's cut_scene unmash routine consumes the retail-PC
+// 0x10-byte mash cursor even when the main OpenUSM build is reading Xbox v10
+// packs through the larger dual-buffer cursor. A loose .CUT is explicitly a
+// retail-PC resource island, so keep that ABI local and never pass it through
+// the Xbox cursor wrapper.
+struct mod_pc_mash_info {
+    uint8_t *image;
+    int32_t used;
+    int32_t size;
+    int32_t field_C;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(mod_coll_header_disk) == 0x10u,
               "COLL header disk layout changed");
 static_assert(sizeof(mod_cut_vector_disk) == 0x14u,
               "CUT mVector disk layout changed");
+static_assert(sizeof(mod_pc_mash_info) == 0x10u,
+              "retail PC mash cursor layout changed");
+
+struct mod_cut_runtime_image {
+    const Mod *source = nullptr;
+    uint8_t *copy = nullptr;
+    int size = 0;
+};
+
+std::unordered_map<uint32_t, mod_cut_runtime_image> &modCutRuntimeImages()
+{
+    static std::unordered_map<uint32_t, mod_cut_runtime_image> images;
+    return images;
+}
 
 bool modCutVectorUsable(const mod_cut_vector_disk &vec)
 {
@@ -343,7 +380,7 @@ bool modCutVectorUsable(const mod_cut_vector_disk &vec)
         return false;
     if (vec.capacity < vec.size || vec.capacity > 0x10000)
         return false;
-    if (vec.from_mash > 1u)
+    if (vec.from_mash != 1u)
         return false;
     if (vec.size > 0 && vec.data_cookie == 0u)
         return false;
@@ -447,6 +484,12 @@ bool modCutRegister(const std::filesystem::path &path,
                path.filename().string().c_str());
         return false;
     }
+    const uint32_t hash = to_hash(
+        transformToLower(path.stem().string()).c_str());
+    // Existing game objects may still point into an older copy. Do not free it
+    // during re-enumeration; dropping the cache entry makes the next request
+    // construct from the newly registered pristine bytes.
+    modCutRuntimeImages().erase(hash);
     return modRegisterSerializedResource(path, std::move(fileData),
                                          MOD_TYPE_CUT_FILE, "cut");
 }
@@ -456,7 +499,148 @@ uint8_t *modCutGetOverride(uint32_t hash, int *sizeOut)
     Mod *mod = getMod(hash, MOD_TYPE_CUT_FILE);
     if (mod == nullptr || !modCutImageUsable(mod->Data.data(), mod->Data.size()))
         return nullptr;
-    return modGetFreshSerializedOverride(hash, MOD_TYPE_CUT_FILE, sizeOut, "cut");
+
+    auto &slot = modCutRuntimeImages()[hash];
+    if (slot.copy == nullptr || slot.source != mod)
+    {
+        if (mod->Data.size() > 0x7FFFFFFFu)
+            return nullptr;
+
+        void *raw = tlMemAlloc(static_cast<uint32_t>(mod->Data.size()),
+                               16u, 0x2000000u);
+        if (raw == nullptr)
+            return nullptr;
+        std::memcpy(raw, mod->Data.data(), mod->Data.size());
+
+        auto *scene = static_cast<cut_scene *>(raw);
+        mod_pc_mash_info pcMash {
+            static_cast<uint8_t *>(raw),
+            static_cast<int32_t>(sizeof(cut_scene)),
+            static_cast<int32_t>(mod->Data.size()),
+            0,
+        };
+
+        // Equivalent to retail mash_info_struct::unmash_class<cut_scene>:
+        // the root object already occupies [0, sizeof(cut_scene)), then the
+        // stock routine rebases its nested vectors/strings from that cursor.
+        THISCALL(0x00742930, scene, &pcMash, nullptr);
+
+        struct scene_binding {
+            int segmentIndex;
+            int sceneIndex;
+            uint32_t hash;
+            nalSceneAnim *sceneAnim;
+        };
+        std::vector<scene_binding> bindings;
+
+        bool bindingsUsable = pcMash.used >= static_cast<int32_t>(sizeof(cut_scene))
+                           && pcMash.used <= pcMash.size
+                           && scene->segments.m_size > 0
+                           && scene->segments.m_size <= 0x1000
+                           && scene->segments.m_data != nullptr;
+        for (int segmentIndex = 0;
+             bindingsUsable && segmentIndex < scene->segments.m_size;
+             ++segmentIndex)
+        {
+            cut_scene_segment *segment = scene->segments.m_data[segmentIndex];
+            if (segment == nullptr || segment->field_10.m_size <= 0
+                || segment->field_10.m_size > 0x1000
+                || segment->field_10.m_data == nullptr)
+            {
+                bindingsUsable = false;
+                break;
+            }
+
+            for (int sceneIndex = 0; sceneIndex < segment->field_10.m_size;
+                 ++sceneIndex)
+            {
+                const uintptr_t serializedHash = reinterpret_cast<uintptr_t>(
+                    segment->field_10.m_data[sceneIndex]);
+                if (serializedHash == 0 || serializedHash > UINT32_MAX)
+                {
+                    bindingsUsable = false;
+                    break;
+                }
+
+                const uint32_t dependencyHash =
+                    static_cast<uint32_t>(serializedHash);
+                nalSceneAnim *externalScene =
+                    modEnsureExternalSceneAnim(dependencyHash);
+                if (externalScene == nullptr)
+                {
+                    sp_log("[mod][cut] 0x%08X rejected: external scene 0x%08X is unavailable",
+                           hash, dependencyHash);
+                    bindingsUsable = false;
+                    break;
+                }
+
+                bindings.push_back({segmentIndex, sceneIndex,
+                                    dependencyHash, externalScene});
+            }
+        }
+
+        if (!bindingsUsable || bindings.empty())
+        {
+            sp_log("[mod][cut] 0x%08X: invalid or unresolved scene dependency table",
+                   hash);
+            tlMemFree(raw);
+            return nullptr;
+        }
+
+        // The stock constructor resolves scene hashes through a directory hash
+        // method which is a null stub for nalSceneAnim. Let it finish all other
+        // segment construction, then replace only the snapshotted scene slots
+        // with the verified external shells. No constructor code consumes the
+        // resolver result after the segment constructor returns.
+        THISCALL(0x00742890, scene, nullptr);
+
+        for (const scene_binding &binding : bindings)
+        {
+            if (binding.segmentIndex >= scene->segments.m_size
+                || scene->segments.m_data == nullptr)
+            {
+                bindingsUsable = false;
+                break;
+            }
+            cut_scene_segment *segment =
+                scene->segments.m_data[binding.segmentIndex];
+            if (segment == nullptr || binding.sceneIndex >= segment->field_10.m_size
+                || segment->field_10.m_data == nullptr)
+            {
+                bindingsUsable = false;
+                break;
+            }
+            segment->field_10.m_data[binding.sceneIndex] = binding.sceneAnim;
+        }
+
+        if (!bindingsUsable)
+        {
+            sp_log("[mod][cut] 0x%08X: scene binding layout changed during construction",
+                   hash);
+            tlMemFree(raw);
+            return nullptr;
+        }
+
+        if (scene->segments.m_size <= 0 || scene->segments.m_data == nullptr)
+        {
+            sp_log("[mod][cut] 0x%08X: constructed cut_scene has no segments, rejected",
+                   hash);
+            tlMemFree(raw);
+            return nullptr;
+        }
+
+        slot.source = mod;
+        slot.copy = static_cast<uint8_t *>(raw);
+        slot.size = static_cast<int>(mod->Data.size());
+        sp_log("[mod][cut] prepared retail-PC cut_scene 0x%08X "
+               "(%d bytes, %d segments, %u external scene binding(s))",
+               hash, slot.size, scene->segments.m_size,
+               static_cast<unsigned>(bindings.size()));
+    }
+
+    if (sizeOut != nullptr)
+        *sizeOut = slot.size;
+    return slot.copy;
 }
 
 bool modPcmeshdefImageUsable(const uint8_t *bytes, size_t size)
@@ -936,7 +1120,7 @@ uint8_t *modAsgGetOverride(uint32_t asgHash, int *sizeOut)
 // nal_system.cpp: content-based PCANIM flavor detection used to keep
 // RESOURCE_KEY_TYPE_SCENE_ANIM bound to TLRESOURCE_TYPE_SCENE_ANIM.
 int modPCANIMDetectTLType(const uint8_t *raw, size_t size, int preferredType);
-int modPCMESHDetectTLType(const uint8_t *raw, size_t size, int preferredType);
+int modMeshDetectTLType(const uint8_t *raw, size_t size, int preferredType);
 
 // Resource-pack bytes are normally writable pack memory.  A loose external
 // file must not expose its pristine Mod::Data directly because NAL, NGL and
@@ -967,6 +1151,7 @@ static uint8_t *modGetLooseTLBytes(uint32_t hash, int tlType, int *sizeOut)
     Mod *mod = getMod(hash, tlType);
     if (mod == nullptr || mod->Data.empty() || mod->Data.size() > 0x7FFFFFFFu)
         return nullptr;
+    if (modNalConfiguredSource(mod->Path)) return nullptr;
 
     const int size = static_cast<int>(mod->Data.size());
     uint8_t *copy = modCloneExternalSerializedImage(mod->Data.data(), size);
@@ -997,6 +1182,7 @@ static uint8_t *modGetLooseTLBytesByExtension(uint32_t hash, int tlType,
     for (auto it = range.first; it != range.second; ++it)
     {
         Mod &mod = it->second;
+        if (modNalConfiguredSource(mod.Path)) continue;
         if (mod.Type != tlType
             || transformToLower(mod.Path.extension().string()) != wanted
             || mod.Data.empty()
@@ -1025,6 +1211,134 @@ static uint8_t *modGetLooseTLBytesByExtension(uint32_t hash, int tlType,
 }
 
 namespace resource_manager {
+
+extern int &amalgapak_pack_location_count;
+extern resource_pack_location *&amalgapak_pack_location_table;
+
+namespace
+{
+constexpr auto XBOX_AMALGAPAK_LOCATION_SIZE = 0x28u;
+// Actual format of the selected amalgapak. This cannot be inferred from
+// g_platform in PC-hosted XBPACK mode because that runtime remains Xbox while
+// a missing Xbox index may legitimately fall back to amalga_PC.PAK.
+static _nlPlatformEnum selected_amalgapak_platform = NL_PLATFORM_PC;
+
+struct xbox_amalgapak_location {
+    resource_location loc;
+    int field_10;
+    int field_14;
+#ifdef OPENUSM_XBPACK_V10
+    int prerequisite_offset;
+    int prerequisite_count;
+    int field_18;
+    int field_1C;
+#else
+    int field_18;
+    int field_1C;
+    int prerequisite_offset;
+    int prerequisite_count;
+#endif
+};
+
+VALIDATE_SIZE(xbox_amalgapak_location, XBOX_AMALGAPAK_LOCATION_SIZE);
+
+resource_key_type convert_key_type(resource_key_type type)
+{
+    const auto raw_type = static_cast<int>(type);
+    assert(raw_type >= 0 && raw_type < xbpack::type_count);
+    return static_cast<resource_key_type>(xbpack::pc_type(raw_type));
+}
+
+void convert_key(resource_key &key)
+{
+    key.m_type = convert_key_type(key.m_type);
+}
+
+bool has_full_location_table(os_file &file, const resource_amalgapak_header &header)
+{
+    if (header.location_table_size <= 0
+        || header.location_table_size % sizeof(resource_pack_location) != 0)
+        return false;
+
+    std::vector<uint8_t> table(header.location_table_size);
+    file.set_fp(header.field_1C, os_file::FP_BEGIN);
+    if (file.read(table.data(), header.location_table_size) != header.location_table_size)
+        return false;
+
+    for (size_t offset = 0; offset < table.size(); offset += sizeof(resource_pack_location)) {
+        const auto *entry = table.data() + offset;
+        uint32_t hash = 0;
+        std::memcpy(&hash, entry, sizeof(hash));
+
+        const auto *name = reinterpret_cast<const char *>(
+            entry + offsetof(resource_pack_location, m_name));
+        const auto *name_end = static_cast<const char *>(
+            std::memchr(name, 0, sizeof(resource_pack_location::m_name)));
+        if (name_end == nullptr || name_end == name || to_hash(name) != hash)
+            return false;
+    }
+
+    return true;
+}
+
+void load_pack_location_table(os_file &file, const resource_amalgapak_header &pack_file_header)
+{
+    file.set_fp(pack_file_header.field_1C, os_file::FP_BEGIN);
+
+    const auto full_table = selected_amalgapak_platform == NL_PLATFORM_XBOX
+        && has_full_location_table(file, pack_file_header);
+    file.set_fp(pack_file_header.field_1C, os_file::FP_BEGIN);
+
+    if (selected_amalgapak_platform == NL_PLATFORM_XBOX && !full_table) {
+        assert(pack_file_header.location_table_size % XBOX_AMALGAPAK_LOCATION_SIZE == 0);
+
+        amalgapak_pack_location_count =
+            pack_file_header.location_table_size / XBOX_AMALGAPAK_LOCATION_SIZE;
+
+        std::vector<xbox_amalgapak_location> raw_locations(amalgapak_pack_location_count);
+        auto how_many_did_we_get =
+            file.read(raw_locations.data(), pack_file_header.location_table_size);
+        assert(how_many_did_we_get == pack_file_header.location_table_size);
+
+        amalgapak_pack_location_table = static_cast<resource_pack_location *>(arch_memalign(
+            16u, amalgapak_pack_location_count * sizeof(resource_pack_location)));
+        assert(amalgapak_pack_location_table != nullptr);
+
+        for (int i = 0; i < amalgapak_pack_location_count; ++i) {
+            const auto &src = raw_locations[i];
+            auto &dst = amalgapak_pack_location_table[i];
+
+            ::new (static_cast<void *>(&dst)) resource_pack_location();
+            dst.loc = src.loc;
+            convert_key(dst.loc.field_0);
+            dst.field_10 = src.field_10;
+            dst.field_14 = src.field_14;
+            dst.field_18 = src.field_18;
+            dst.field_1C = src.field_1C;
+            dst.prerequisite_offset = src.prerequisite_offset;
+            dst.prerequisite_count = src.prerequisite_count;
+        }
+
+        return;
+    }
+
+    amalgapak_pack_location_count =
+        pack_file_header.location_table_size / sizeof(resource_pack_location);
+
+    amalgapak_pack_location_table =
+        static_cast<resource_pack_location *>(arch_memalign(16u, pack_file_header.location_table_size));
+    assert(amalgapak_pack_location_table != nullptr);
+
+    auto how_many_did_we_get =
+        file.read(amalgapak_pack_location_table, pack_file_header.location_table_size);
+    assert(how_many_did_we_get == pack_file_header.location_table_size);
+
+    if (selected_amalgapak_platform == NL_PLATFORM_XBOX) {
+        for (int i = 0; i < amalgapak_pack_location_count; ++i)
+            convert_key(amalgapak_pack_location_table[i].loc.field_0);
+    }
+}
+}
 
 VALIDATE_SIZE(resource_memory_map, 0x90);
 
@@ -1105,6 +1419,29 @@ make_var(resource_key *, amalgapak_prerequisite_table);
 #undef make_var
 #endif
 
+namespace
+{
+void release_memory_maps()
+{
+    if (memory_maps == nullptr)
+        return;
+
+#ifdef OPENUSM_XBPACK_V10
+    // V10 loads these through the retail executable's MSVCR71 allocator.
+    // Freeing them through the injected DLL's delete[] crosses CRT heaps and
+    // corrupts mission reload/teardown.
+    exe_allocator<resource_memory_map> allocator;
+    for (int i = 0; i < memory_maps_count; ++i)
+        allocator.destroy(&memory_maps[i]);
+    allocator.deallocate(memory_maps, memory_maps_count);
+#else
+    delete[] memory_maps;
+#endif
+
+    memory_maps = nullptr;
+}
+}
+
 //0x005BA9A0
 [[nodiscard]] mString get_amalgapak_filename(_nlPlatformEnum arg4)
 {
@@ -1165,28 +1502,30 @@ void load_amalgapak()
         {
             mString a1 {amalgapak_name.c_str()};
 
-            pack_file_header.verify(a1);
+            if (selected_amalgapak_platform == NL_PLATFORM_XBOX) {
+                // The on-disk header has the same 0x38-byte shape on both
+                // platforms, but the version contract does not.  Calling the
+                // PC member here made a valid v14 Xbox index report itself as
+                // older than the v17 retail-PC code even in XBPACK mode.
+                reinterpret_cast<resource_amalgapak_header_xbox *>(
+                    &pack_file_header)->verify(a1);
+            } else {
+                sp_log("Using native PC amalgapak versions: %s",
+                       pack_file_header.field_0.to_string().c_str());
+            }
         }
 
+#ifndef OPENUSM_XBPACK_MODE
         if constexpr (1)
         {
             pack_file_header.field_18 = 0;
         }
+#endif
 
         amalgapak_base_offset = pack_file_header.field_18;
         using_amalga = (pack_file_header.field_18 != 0);
         amalgapak_signature = pack_file_header.field_14;
-        amalgapak_pack_location_count = pack_file_header.location_table_size /
-            sizeof(resource_pack_location);
-
-        amalgapak_pack_location_table = static_cast<resource_pack_location *>(
-            arch_memalign(16u, pack_file_header.location_table_size));
-        assert(amalgapak_pack_location_table != nullptr);
-
-        file.set_fp(pack_file_header.field_1C, os_file::FP_BEGIN);
-        auto how_many_did_we_get = file.read(amalgapak_pack_location_table,
-                                             pack_file_header.location_table_size);
-        assert(how_many_did_we_get == pack_file_header.location_table_size);
+        load_pack_location_table(file, pack_file_header);
 
         amalgapak_prerequisite_count = static_cast<uint32_t>(
                                              pack_file_header.prerequisite_table_size) >>
@@ -1197,16 +1536,29 @@ void load_amalgapak()
         assert(amalgapak_prerequisite_table != nullptr);
 
         file.set_fp(pack_file_header.field_2C, os_file::FP_BEGIN);
-        how_many_did_we_get = file.read(amalgapak_prerequisite_table,
-                                        pack_file_header.prerequisite_table_size);
+        auto how_many_did_we_get = file.read(amalgapak_prerequisite_table,
+                                             pack_file_header.prerequisite_table_size);
         assert(how_many_did_we_get == pack_file_header.prerequisite_table_size);
+
+        if (selected_amalgapak_platform == NL_PLATFORM_XBOX) {
+            for (int i = 0; i < amalgapak_prerequisite_count; ++i) {
+                convert_key(amalgapak_prerequisite_table[i]);
+            }
+        }
 
         resource_buffer_size = pack_file_header.field_34;
         assert(pack_file_header.memory_map_table_size % sizeof(resource_memory_map) == 0);
 
         memory_maps_count = pack_file_header.memory_map_table_size / sizeof(resource_memory_map);
 
+#ifdef OPENUSM_XBPACK_V10
+        exe_allocator<resource_memory_map> allocator;
+        memory_maps = allocator.allocate(memory_maps_count);
+        for (int i = 0; i < memory_maps_count; ++i)
+            allocator.construct(&memory_maps[i]);
+#else
         memory_maps = new resource_memory_map[memory_maps_count];
+#endif
         file.set_fp(pack_file_header.field_24, os_file::FP_BEGIN);
         how_many_did_we_get = file.read(memory_maps, pack_file_header.memory_map_table_size);
         assert(how_many_did_we_get == pack_file_header.memory_map_table_size);
@@ -1364,10 +1716,9 @@ void reload_amalgapak()
         mem_freealign(amalgapak_prerequisite_table);
         mem_freealign(amalgapak_pack_location_table);
 
-        delete[](memory_maps);
+        release_memory_maps();
         amalgapak_prerequisite_table = nullptr;
         amalgapak_pack_location_table = nullptr;
-        memory_maps = nullptr;
 
         load_amalgapak();
 
@@ -1574,7 +1925,22 @@ bool get_pack_file_stats(const resource_key &a1, resource_pack_location *a2, mSt
                 &i,
                 compare_resource_key_resource_pack_location))
         {
-            return false;
+            for (int j = 0; j < amalgapak_pack_location_count; ++j) {
+                if (amalgapak_pack_location_table[j].loc.field_0.m_hash == a1.m_hash) {
+                    i = j;
+                    break;
+                }
+            }
+
+            if (i < 0 || i >= amalgapak_pack_location_count ||
+                amalgapak_pack_location_table[i].loc.field_0.m_hash != a1.m_hash) {
+                sp_log("Pack lookup failed: hash=0x%08X type=%d platform=%d count=%d",
+                       a1.m_hash.source_hash_code,
+                       a1.m_type,
+                       g_platform,
+                       amalgapak_pack_location_count);
+                return false;
+            }
         }
 
 
@@ -1785,9 +2151,9 @@ void delete_inst() {
         partitions = nullptr;
         if (memory_maps_count > 0) {
             assert(memory_maps != nullptr);
-
-            operator delete[](memory_maps);
         }
+
+        release_memory_maps();
     }
     else
     {
@@ -1993,16 +2359,16 @@ resource_partition *get_partition_pointer(resource_partition_enum which_type)
 }
 
 // openusm: ordered list of platform asset folders to try when opening a
-// standalone pack. Priority = array order. On PC we prefer the Xbox/beta
-// assets and fall back to the native (PC/final) assets per-pack; an Xbox
-// build only ever resolves to its own assets, so behaviour there is
-// unchanged.
+// standalone pack.  Pack formats cannot be mixed inside one process: PC and
+// Xbox builds use different resource-directory and mash layouts.  Keep each
+// release variant locked to the format selected at compile time.
 static int get_pack_search_order(_nlPlatformEnum out[2]) {
     int n = 0;
-    out[n++] = NL_PLATFORM_XBOX;            // beta / Xbox set first
-    if (g_platform != NL_PLATFORM_XBOX) {
-        out[n++] = g_platform;              // native (e.g. PC final) fallback
-    }
+#ifdef OPENUSM_XBPACK_MODE
+    out[n++] = NL_PLATFORM_XBOX;
+#else
+    out[n++] = g_platform;
+#endif
     return n;
 }
 
@@ -2025,6 +2391,32 @@ nflFileID open_pack_ex(const char *name, int *out_data_size) {
 
     _nlPlatformEnum order[2];
     int order_count = get_pack_search_order(order);
+
+#ifdef OPENUSM_XBPACK_MODE
+    // ultimate_release/xbpack builds may carry standalone Xbox packs in the
+    // user-controlled extra folder.  Resolve these before the stock
+    // data\packs\xbox location, but retain the normal pack-name lifecycle:
+    // CHARACTERB_ARENA still loads only when the game asks for that pack.
+    const mString extra_path =
+        mString{"extra\\"} + mString{name} + mString{".XBPACK"};
+    nflFileID extra_handle = nflOpenFile(1, extra_path.c_str());
+    if (extra_handle == NFL_FILE_ID_INVALID)
+        extra_handle = nflOpenFile(2, extra_path.c_str());
+    if (extra_handle != NFL_FILE_ID_INVALID) {
+        if (out_data_size != nullptr) {
+            os_file probe;
+            probe.open(extra_path, os_file::FILE_READ);
+            if (probe.is_open()) {
+                const int size = probe.get_size();
+                if (size > 0)
+                    *out_data_size = size;
+                probe.close();
+            }
+        }
+        sp_log("XBPACK override: %s -> %s", name, extra_path.c_str());
+        return extra_handle;
+    }
+#endif
 
     for (int i = 0; i < order_count; ++i) {
         mString path = make_pack_path(name, order[i]);
@@ -2089,6 +2481,9 @@ mString resolve_amalgapak_filename() {
                 probe.close();
             }
         }
+        sp_log("Probed amalga index: %s (platform=%d, present=%s)",
+               candidate.c_str(), static_cast<int>(order[i]),
+               present ? "yes" : "no");
         if (!present) {
             // Also try a data\-rooted copy, matching load_amalgapak's
             // secondary "data\\" lookup.
@@ -2099,9 +2494,13 @@ mString resolve_amalgapak_filename() {
             if (present) {
                 probe.close();
             }
+            sp_log("Probed rooted amalga index: %s (platform=%d, present=%s)",
+                   rooted.c_str(), static_cast<int>(order[i]),
+                   present ? "yes" : "no");
         }
 
         if (present) {
+            selected_amalgapak_platform = order[i];
             sp_log("Selected amalga index: %s", candidate.c_str());
             return candidate;
         }
@@ -2109,6 +2508,7 @@ mString resolve_amalgapak_filename() {
 
     // Nothing present: return the native-platform name so the existing
     // "Could not open amalgapak file ..." error reports something sane.
+    selected_amalgapak_platform = g_platform;
     return mString{"packs\\amalga"} + mString{suffix[g_platform]};
 #endif
 }
@@ -2205,29 +2605,29 @@ bool get_resource_if_exists(const resource_key &resource_id,
         }
     }
 
-    // Explicit raw PCMESH override.  Unlike DDS/PCSKEL fallback resources,
-    // extra/<name>.PCMESH is a drop-in mesh-file replacement: when it exists it
+    // Explicit raw PCMesh/XBMesh override. Unlike DDS/PCSKEL fallback resources,
+    // extra/<name> is a drop-in mesh-file replacement: when it exists it
     // must win even if the active PCPACK also contains the same mesh key.
     //
-    // Return the PRISTINE Mod::Data bytes here. nglLoadMeshFileInternalPC will
+    // Return the PRISTINE Mod::Data bytes here. nglLoadMeshFileInternal will
     // immediately clone them through tlMemAlloc before the retail parser rebases
     // offsets in place. This keeps the registry immutable and gives FileBuf the
     // same allocator ownership expected by tlReleaseFile().
     if (resource_id.get_type() == RESOURCE_KEY_TYPE_MESH)
     {
         int externalSize = 0;
-        const uint8_t *external = modPCMESHGetOverride(
+        const uint8_t *external = modMeshGetOverride(
             resource_id.m_hash.source_hash_code, &externalSize);
         if (external != nullptr
             && externalSize > 0
-            && modPCMESHDetectTLType(external, static_cast<size_t>(externalSize),
+            && modMeshDetectTLType(external, static_cast<size_t>(externalSize),
                                      TLRESOURCE_TYPE_MESH_FILE)
                 == TLRESOURCE_TYPE_MESH_FILE)
         {
             if (mash_data_size != nullptr)
                 *mash_data_size = externalSize;
             *a3 = const_cast<uint8_t *>(external);
-            sp_log("[mod][resource_manager] PCMESH override selected for %s "
+            sp_log("[mod][resource_manager] native mesh override selected for %s "
                    "(0x%08X, %d bytes; packed=%s)",
                    resource_id.m_hash.to_string(),
                    resource_id.m_hash.source_hash_code, externalSize,
@@ -2394,7 +2794,7 @@ uint8_t *get_resource(const resource_key &resource_id, int *mash_data_size, reso
     if constexpr (1)
     {
         assert(!g_is_the_packer() && "Don't call this function while packing!");
-        assert(resource_id.is_set());
+     //   assert(resource_id.is_set());
         assert(get_resource_context() != nullptr && "Can't get a resource without a context!");
         assert(get_resource_context()->is_data_ready() && "Invalid resource context");
 
@@ -2407,18 +2807,18 @@ uint8_t *get_resource(const resource_key &resource_id, int *mash_data_size, reso
         auto *result = get_resource_context()->get_resource(
             resource_id, actualMashDataSize, a3);
 
-        // Explicit .PCMESH override. The loose file intentionally wins over
+        // Explicit PCMesh/XBMesh override. The loose file intentionally wins over
         // a same-name PCPACK resource. Publish only pristine registry bytes;
         // NGL clones them into engine-owned writable memory before parsing.
         if (resource_id.get_type() == RESOURCE_KEY_TYPE_MESH)
         {
             int externalSize = 0;
-            const uint8_t *external = modPCMESHGetOverride(
+            const uint8_t *external = modMeshGetOverride(
                 resource_id.m_hash.source_hash_code, &externalSize);
 
             if (external != nullptr
                 && externalSize > 0
-                && modPCMESHDetectTLType(external, static_cast<size_t>(externalSize),
+                && modMeshDetectTLType(external, static_cast<size_t>(externalSize),
                                          TLRESOURCE_TYPE_MESH_FILE)
                     == TLRESOURCE_TYPE_MESH_FILE)
             {
@@ -2428,7 +2828,7 @@ uint8_t *get_resource(const resource_key &resource_id, int *mash_data_size, reso
                 if (a3 != nullptr)
                     *a3 = nullptr;
 
-                sp_log("[mod][resource_manager] serving PCMESH override \"%s\" "
+                sp_log("[mod][resource_manager] serving native mesh override \"%s\" "
                        "(hash 0x%08X, %d bytes; replaced packed=%s); "
                        "NGL will clone+parse it",
                        resource_id.m_hash.to_string(),
@@ -2893,4 +3293,13 @@ void resource_manager2_patch()
 
 
     
+}
+
+void resource_manager_xbpack_patch()
+{
+#ifdef OPENUSM_XBPACK_MODE
+    SET_JUMP(0x00537650, resource_manager::load_amalgapak);
+    SET_JUMP(0x0052A820, resource_manager::get_pack_file_stats);
+    SET_JUMP(0x0055DEA0, compare_resource_key_resource_pack_location);
+#endif
 }
