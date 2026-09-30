@@ -316,83 +316,60 @@ void mouselook_controller::_frame_advance(Float time_inc)
     {
         THISCALL(0x00528BB0, this, time_inc);
 
-        // -------------------------------------------------------------
-        //   Debug user-camera extras: L3 zoom / R3 move
-        // -------------------------------------------------------------
-        //   Uses the DualShock 4 / DirectInput hook in main.cpp which
-        //   populates controllerKeys[] every poll. Active only when the
-        //   debug menu has set "Camera: User".
-        //
-        //   Hold L3  + L3_UP   -> dolly zoom IN  (camera forward)
-        //   Hold L3  + L3_DOWN -> dolly zoom OUT (camera backward)
-        //
-        //   Hold R3  + R3_LEFT  -> strafe camera left
-        //   Hold R3  + R3_RIGHT -> strafe camera right
-        //   Hold R3  + R3_UP    -> lift camera up
-        //   Hold R3  + R3_DOWN  -> lift camera down
-        // -------------------------------------------------------------
+        // DirectInput user-camera controls.  The MENU_L3_* and MENU_R3_*
+        // slots already describe stick direction, so no L3/R3 click is
+        // required.  Left stick translates the camera and right stick looks.
         if (g_game_ptr != nullptr && g_game_ptr->is_user_camera_enabled())
         {
-            const bool l3_held = (controllerKeys[MENU_L3] != 0);
-            const bool r3_held = (controllerKeys[MENU_R3] != 0);
+            const auto held = [](MenuKey key) {
+                return controllerKeys[key] != 0;
+            };
 
-            if (l3_held || r3_held)
+            const float dolly_axis = float(held(MENU_L3_UP))
+                                   - float(held(MENU_L3_DOWN));
+            const float strafe_axis = float(held(MENU_L3_RIGHT))
+                                    - float(held(MENU_L3_LEFT));
+            const float pitch_axis = float(held(MENU_R3_UP))
+                                   - float(held(MENU_R3_DOWN));
+            const float yaw_axis = float(held(MENU_R3_RIGHT))
+                                 - float(held(MENU_R3_LEFT));
+
+            if (dolly_axis != 0.0f || strafe_axis != 0.0f
+                || pitch_axis != 0.0f || yaw_axis != 0.0f)
             {
-                auto *user_cam = entity_handle_manager::find_entity(
-                    entity_id_USER_CAM, entity_flavor_t::CAMERA, false);
+                auto *im = input_mgr::instance;
+                float speed = 10.0f;
+                if (AXIS_MAX == im->get_control_state(26, (device_id_t)-1)) {
+                    speed *= 4.0f;
+                }
+                if (AXIS_MAX == im->get_control_state(27, (device_id_t)-1)) {
+                    speed *= 0.25f;
+                }
 
-                if (user_cam != nullptr)
+                if (dolly_axis != 0.0f || strafe_axis != 0.0f)
                 {
-                    // Speed modifiers from the existing user-cam buttons:
-                    //   axis 26 = USERCAM_FAST, axis 27 = USERCAM_SLOW
-                    auto *im = input_mgr::instance;
-                    float speed = 10.0f;
-                    if (AXIS_MAX == im->get_control_state(26, (device_id_t)-1)) speed *= 4.0f;
-                    if (AXIS_MAX == im->get_control_state(27, (device_id_t)-1)) speed *= 0.25f;
-
-                    const float dt   = float(time_inc);
-                    const float step = speed * dt;
-
-                    auto pos = user_cam->get_abs_position();
-                    auto &po = user_cam->get_abs_po();
-
-                    // ---- L3: dolly zoom along camera forward (z facing) ----
-                    if (l3_held)
-                    {
-                        float dolly = 10.0f;
-                        if (controllerKeys[MENU_L3_UP]   != 0) dolly += step;
-                        if (controllerKeys[MENU_L3_DOWN] != 0) dolly -= step;
-
-                        if (dolly != 0.0f)
-                        {
-                            const auto &fwd = po.get_z_facing();
-                            pos = pos + fwd * dolly;
-                        }
+                    auto *user_cam = this->field_10;
+                    if (user_cam == nullptr) {
+                        user_cam = entity_handle_manager::find_entity(
+                            entity_id_USER_CAM, entity_flavor_t::CAMERA, false);
                     }
 
-                    // ---- R3: pan/translate (strafe X + lift Y) ----
-                    if (r3_held)
-                    {
-                        float strafe = 10.0f;
-                        float lift   = 10.0f;
-                        if (controllerKeys[MENU_R3_RIGHT] != 0) strafe += step;
-                        if (controllerKeys[MENU_R3_LEFT]  != 0) strafe -= step;
-                        if (controllerKeys[MENU_R3_UP]    != 0) lift   += step;
-                        if (controllerKeys[MENU_R3_DOWN]  != 0) lift   -= step;
+                    if (user_cam != nullptr) {
+                        const float step = speed * float(time_inc);
+                        auto pos = user_cam->get_abs_position();
+                        auto &po = user_cam->get_abs_po();
 
-                        if (strafe != 0.0f)
-                        {
-                            const auto &right = po.get_x_facing();
-                            pos = pos + right * strafe;
-                        }
-                        if (lift != 0.0f)
-                        {
-                            const auto &up = po.get_y_facing();
-                            pos = pos + up * lift;
-                        }
+                        pos = pos + po.get_z_facing() * (dolly_axis * step);
+                        pos = pos + po.get_x_facing() * (strafe_axis * step);
+                        user_cam->set_abs_position(pos);
                     }
+                }
 
-                    user_cam->set_abs_position(pos);
+                if (this->field_C != nullptr)
+                {
+                    const float look_step = speed * 0.0033333334f;
+                    this->field_C->d_psi_for_next_frame += pitch_axis * look_step;
+                    this->field_C->d_theta_for_next_frame -= yaw_axis * look_step;
                 }
             }
         }

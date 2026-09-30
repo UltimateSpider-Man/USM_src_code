@@ -23,8 +23,6 @@ void moved_entities::add_moved(vhandle_type<entity> e_arg) {
     auto *e = e_arg.get_volatile_ptr();
     assert(e != nullptr);
 
-    assert(e->get_abs_po().is_valid());
-
     if (e->is_conglom_member()) {
         e = (entity *) e->get_conglom_owner();
         assert(e != nullptr && "Failed to obtain conglom owner in add_moved");

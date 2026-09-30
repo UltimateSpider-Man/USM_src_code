@@ -12,6 +12,29 @@
 
 VALIDATE_SIZE(morph_file_resource_handler, 0x14);
 
+#ifdef OPENUSM_XBPACK_V10
+namespace {
+bool __fastcall handle_xbox_morph_file(
+    morph_file_resource_handler *handler, void *,
+    worldly_resource_handler::eBehavior behavior, tlresource_location *location)
+{
+    auto *file = behavior == worldly_resource_handler::UNLOAD
+        ? reinterpret_cast<nglMeshFile *>(location->field_8) : nullptr;
+    using native_handler = bool (__fastcall *)(morph_file_resource_handler *,
+        void *, worldly_resource_handler::eBehavior, tlresource_location *);
+    const bool pending = bit_cast<native_handler>(0x0056C080)(
+        handler, nullptr, behavior, location);
+    if (!pending && file != nullptr) {
+        // Packed morph containers use the same Xbox conversion owner as
+        // meshes. Retain native render deferral, then drop the added owner
+        // before the pack's storage can be reused by another container.
+        modReleaseXboxMeshFileResources(&file->FileBuf, true);
+    }
+    return pending;
+}
+}
+#endif
+
 morph_file_resource_handler::morph_file_resource_handler(worldly_pack_slot *a2)
 {
     this->m_vtbl = 0x00888A84;
@@ -85,4 +108,11 @@ void morph_file_resource_handler_patch() {
         FUNC_ADDRESS(address, &morph_file_resource_handler::_handle_resource);
         set_vfunc(0x00888A90, address);
     }
+}
+
+void morph_file_resource_handler_xbpack_patch()
+{
+#ifdef OPENUSM_XBPACK_V10
+    set_vfunc(0x00888A90, &handle_xbox_morph_file);
+#endif
 }

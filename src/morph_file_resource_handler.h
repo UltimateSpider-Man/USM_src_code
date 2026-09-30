@@ -11,3 +11,4 @@ struct morph_file_resource_handler : base_tl_resource_handler {
 };
 
 extern void morph_file_resource_handler_patch();
+extern void morph_file_resource_handler_xbpack_patch();

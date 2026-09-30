@@ -175,6 +175,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <iomanip>
+#include <sstream>
+#include <limits>
+#include <stdexcept>
+#include <filesystem>
+// Bundled header-only JSON reader; no Assimp DLL or new link dependency.
+#include "../assimp/contrib/rapidjson/include/rapidjson/document.h"
 #include <map>
 #include <memory>
 #include <optional>
@@ -183,6 +191,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "mod_mesh_donor_pose.h"
+#include "mod_mesh_axes.h"
+#include "mod_mesh_donor_surface.h"
+#include "mod_mesh_toolkit.h"
 
 namespace modmesh {
 
@@ -271,7 +283,8 @@ struct Huff {
 };
 
 inline bool inflate_raw(const uint8_t *src, size_t srcLen,
-                        std::vector<uint8_t> &out, size_t expect)
+                        std::vector<uint8_t> &out, size_t expect,
+                        size_t maxOutput = (64u << 20), size_t *consumed = nullptr)
 {
     static const uint16_t LBASE[29] = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,
         35,43,51,59,67,83,99,115,131,163,195,227,258 };
@@ -285,7 +298,8 @@ inline bool inflate_raw(const uint8_t *src, size_t srcLen,
 
     BitReader br(src, srcLen);
     out.clear();
-    if (expect) out.reserve(expect);
+    if (consumed) *consumed = 0;
+    if (expect) out.reserve(std::min(expect, maxOutput));
 
     for (;;) {
         int last  = br.bits(1);
@@ -294,12 +308,13 @@ inline bool inflate_raw(const uint8_t *src, size_t srcLen,
 
         if (btype == 0) {                                  // stored
             br.align();
-            if (br.p + 4 > br.end) return false;
+            if (size_t(br.end - br.p) < 4) return false;
             uint16_t len  = uint16_t(br.p[0] | (br.p[1] << 8));
             uint16_t nlen = uint16_t(br.p[2] | (br.p[3] << 8));
             br.p += 4;
             if (uint16_t(~len) != nlen) return false;
-            if (br.p + len > br.end) return false;
+            if (size_t(len) > size_t(br.end - br.p)
+                || size_t(len) > maxOutput - out.size()) return false;
             out.insert(out.end(), br.p, br.p + len);
             br.p += len;
         } else if (btype == 1 || btype == 2) {
@@ -346,7 +361,10 @@ inline bool inflate_raw(const uint8_t *src, size_t srcLen,
             for (;;) {                                     // block payload
                 int s = lit.decode(br);
                 if (s < 0) return false;
-                if (s < 256) out.push_back(uint8_t(s));
+                if (s < 256) {
+                    if (out.size() >= maxOutput) return false;
+                    out.push_back(uint8_t(s));
+                }
                 else if (s == 256) break;
                 else {
                     s -= 257;
@@ -355,17 +373,17 @@ inline bool inflate_raw(const uint8_t *src, size_t srcLen,
                     int ds  = dist.decode(br);
                     if (ds < 0 || ds >= 30) return false;
                     size_t d = size_t(DBASE[ds]) + size_t(br.bits(DEXT[ds]));
-                    if (br.fail || d > out.size()) return false;
+                    if (br.fail || d > out.size() || size_t(len) > maxOutput - out.size()) return false;
                     size_t from = out.size() - d;
                     for (int i = 0; i < len; ++i)          // may overlap
                         out.push_back(out[from + i]);
                 }
-                if (out.size() > (64u << 20)) return false; // 64 MB sanity cap
             }
         } else return false;
 
         if (last) break;
     }
+    if (consumed) *consumed = size_t(br.p - src);
     return true;
 }
 
@@ -898,6 +916,7 @@ struct GLayer {                         // resolved LayerElement*
 
 struct GCluster {
     std::string          boneName;
+    int64_t              boneModelId = 0;
     std::vector<int64_t> idx;
     std::vector<double>  w;
     // TransformLink row 3 = the bone's GLOBAL bind-pose position, in file
@@ -906,6 +925,9 @@ struct GCluster {
     // jaw/tongue bones shifts every later index), bind positions cannot.
     bool   haveLink = false;
     double linkPos[3] { 0, 0, 0 };
+    std::array<double, 16> linkMatrix{};
+    bool haveTransform = false;
+    std::array<double, 16> transformMatrix{};
 };
 
 struct Geom {
@@ -927,6 +949,9 @@ struct Model {
     V3 rOff{}, rPiv{}, sOff{}, sPiv{};
     V3 geoT{}, geoR{}, geoS{ 1, 1, 1 };
     int rotOrder = 0;
+    // glTF matrix/quaternion nodes retain their exact affine transform.
+    bool matrixOverride = false;
+    M4 localMatrix;
     std::vector<int64_t> geoms;
     std::vector<int64_t> materials;     // in slot order
 };
@@ -973,14 +998,22 @@ struct AnimClip {
 };
 
 struct SidecarCfg {
+    toolkit::Settings toolkit;
     double scale = 1.0, yaw = 0.0;
     V3     offset{};
     bool   fit = true, weld = true;
     // anim=0 skips FBX animation entirely: curve payloads are not even
     // inflated by the binary reader and no clips are baked
-    bool   anim = true;
+    bool   anim = false;                // native gameplay animation is the default
     // bind-pose cluster matching (bone_match=off falls back to Bone_N digits)
     bool   boneMatch = true;
+    bool   retarget = true;
+    bool   custom = false;              // explicitly retain all custom scene objects/materials
+    std::string donorPose;              // explicit unrigged-source pose: empty or arms_down
+    double donorLeftArmPitch = 0.0, donorRightArmPitch = 0.0;
+    bool donorArmPitchSet = false;
+    std::string sourceSkeleton;
+    std::map<std::string, std::string> boneMap; // explicit foreign source joint -> native joint
     int    skin = 0;                    // 0 auto, 1 clusters, 2 transfer, 3 rigid
     int    tex  = 0;                    // 0 auto, 1 keep (never retarget),
                                         // 2 mod (mod files always win)
@@ -1094,6 +1127,7 @@ struct Scene {
     std::map<int64_t, Model> models;
     std::map<int64_t, std::string> materials;   // id -> name
     std::map<int64_t, std::string> matTexStem;  // material id -> texture stem
+    std::map<int64_t, std::array<float, 4>> materialDiffuse;
     // per-stem payloads for the engine-side texture builder:
     // path exactly as written in the file ("VENOM.fbm\\USM_BLACKSUIT.DDS"),
     // and image bytes for FBX-embedded textures (Video nodes with Content)
@@ -1103,7 +1137,10 @@ struct Scene {
     std::vector<AnimClip>    anims;             // baked takes (see above)
     double unitScale = 1.0;     // FBX UnitScaleFactor (cm per file unit)
     double sceneScale = 1.0;    // applied at the root: unitScale / 100 (game = metres)
+    axes::Transform axisTransform;
+    std::vector<std::string> objMaterialLibs;
     bool   isObj = false;
+    bool   isGltf = false;
     SidecarCfg cfg;
     std::string srcName;
 
@@ -1186,11 +1223,37 @@ inline void readLayer(const FbxNode *le, const char *dataName, const char *idxNa
 
 inline void buildScene(const FbxNode &root, Scene &sc)
 {
+    axes::FbxAxes fileAxes;
     if (auto *gs = root.child("GlobalSettings")) {
-        if (auto *p70 = gs->child("Properties70"))
-            for (auto &P : p70->children)
-                if (!P.props.empty() && P.props[0].s == "UnitScaleFactor")
-                    sc.unitScale = P.props.back().d;
+        const auto *properties = gs->child("Properties70");
+        if (!properties) properties = gs->child("Properties60");
+        if (properties) for (const auto &P : properties->children) {
+            if (P.props.size() < 2) continue;
+            const auto &name = P.props[0].s;
+            // Validate the scalar before narrowing it. A malformed string,
+            // fractional value, or large integer must not become a valid
+            // signed axis through truncation/wraparound.
+            const auto &scalar = P.props.back();
+            const bool numeric = scalar.type != 0 && std::strchr("YCIFDLN", scalar.type) != nullptr;
+            const int value = numeric && std::isfinite(scalar.d)
+                && std::floor(scalar.d) == scalar.d && scalar.d >= -1 && scalar.d <= 2
+                ? int(scalar.d) : -2;
+            if (name == "UnitScaleFactor") sc.unitScale = P.props.back().d;
+            else if (name == "UpAxis") fileAxes.upAxis = value;
+            else if (name == "UpAxisSign") fileAxes.upSign = value;
+            else if (name == "FrontAxis") fileAxes.frontAxis = value;
+            else if (name == "FrontAxisSign") fileAxes.frontSign = value;
+            else if (name == "CoordAxis") fileAxes.coordAxis = value;
+            else if (name == "CoordAxisSign") fileAxes.coordSign = value;
+        }
+    }
+    if (!axes::fromFbx(fileAxes, sc.axisTransform))
+        logf("[modmesh] invalid FBX axis metadata; retaining original coordinate system");
+    if (!sc.axisTransform.identity() && sc.cfg.anim) {
+        // The geometry/global binds now use game axes, but imported local
+        // animation channels have no corresponding validated conversion.
+        sc.cfg.anim = false;
+        logf("[modmesh] imported anim=1 disabled after FBX axis conversion: use anim=0 with native gameplay animations, or re-export animation in +X right/+Y up/+Z front coordinates");
     }
     if (sc.unitScale > 1e-9)
         sc.sceneScale = sc.unitScale / 100.0;   // cm file -> metre game
@@ -1273,8 +1336,25 @@ inline void buildScene(const FbxNode &root, Scene &sc)
                 m.geoms.push_back(id);
             sc.models[id] = std::move(m);
         }
-        if (O.name == "Material")
+        if (O.name == "Material") {
             sc.materials[id] = oname;
+            std::array<float, 4> color{{1.f, 1.f, 1.f, 1.f}};
+            if (const auto *properties = O.child("Properties70"))
+                for (const auto &property : properties->children) {
+                    if (property.props.empty()) continue;
+                    const auto &key = property.props.front().s;
+                    if ((key == "DiffuseColor" || key == "BaseColor") && property.props.size() >= 7)
+                        for (size_t channel = 0; channel < 3; ++channel) {
+                            const double value = property.props[property.props.size() - 3 + channel].d;
+                            if (std::isfinite(value)) color[channel] = float(std::clamp(value, 0.0, 1.0));
+                        }
+                    else if (key == "Opacity" && property.props.size() >= 5) {
+                        const double value = property.props.back().d;
+                        if (std::isfinite(value)) color[3] = float(std::clamp(value, 0.0, 1.0));
+                    }
+                }
+            sc.materialDiffuse[id] = color;
+        }
         if (O.name == "Texture" || O.name == "Video") {
             std::string fn;
             if (auto *rf = O.child("RelativeFilename"); rf && !rf->props.empty())
@@ -1318,13 +1398,20 @@ inline void buildScene(const FbxNode &root, Scene &sc)
                 GCluster cl;
                 if (auto *ix = O.child("Indexes"); ix && !ix->props.empty()) cl.idx = ix->props[0].ia;
                 if (auto *w  = O.child("Weights"); w  && !w->props.empty())  cl.w   = w->props[0].fa;
+                if (auto *tm = O.child("Transform"); tm && !tm->props.empty()
+                    && tm->props[0].fa.size() >= 16) {
+                    std::copy_n(tm->props[0].fa.begin(), 16, cl.transformMatrix.begin());
+                    // Serialized FBX Cluster.Transform is mesh-to-bone bind
+                    // space; its global frame is reconstructed with TransformLink.
+                    cl.haveTransform = true;
+                }
                 if (auto *tl = O.child("TransformLink");
                     tl && !tl->props.empty() && tl->props[0].fa.size() >= 16)
                 {
                     const auto &m = tl->props[0].fa;
-                    cl.linkPos[0] = m[12];
-                    cl.linkPos[1] = m[13];
-                    cl.linkPos[2] = m[14];
+                    std::copy_n(m.begin(), 16, cl.linkMatrix.begin());
+                    cl.linkMatrix = sc.axisTransform.convertFbxWorldMatrix(cl.linkMatrix);
+                    for (int d = 0; d < 3; ++d) cl.linkPos[d] = cl.linkMatrix[12+d];
                     cl.haveLink = true;
                 }
                 clusterById[id] = std::move(cl);
@@ -1389,10 +1476,19 @@ inline void buildScene(const FbxNode &root, Scene &sc)
             && !sc.embeddedTex.count(vs->second))
             sc.embeddedTex[vs->second] = vb.second;
 
+    std::map<int64_t, int> diffusePriority;
     for (auto &c : conns)
         if (auto ts = textureStems.find(c.child);
-            ts != textureStems.end() && sc.materials.count(c.parent)
-            && !sc.matTexStem.count(c.parent)) {
+            ts != textureStems.end() && sc.materials.count(c.parent)) {
+            auto property = Scene::normName(c.prop);
+            property.erase(std::remove_if(property.begin(), property.end(),
+                [](char value) { return value == ' ' || value == '_'; }), property.end());
+            const bool color = property == "diffusecolor" || property == "diffuse"
+                || property == "basecolor" || property == "basecolormap" || property == "albedo";
+            if (!property.empty() && !color) continue;
+            const int priority = color ? 2 : 1;
+            if (diffusePriority[c.parent] >= priority) continue;
+            diffusePriority[c.parent] = priority;
             sc.matTexStem[c.parent] = ts->second;
             if (auto tr = textureRel.find(c.child);
                 tr != textureRel.end() && !sc.texRelOfStem.count(ts->second))
@@ -1437,6 +1533,7 @@ inline void buildScene(const FbxNode &root, Scene &sc)
             GCluster cl = cit->second;
             auto bit = boneModelOfCluster.find(clId);
             if (bit != boneModelOfCluster.end()) {
+                cl.boneModelId = bit->second;
                 auto mit = sc.models.find(bit->second);
                 if (mit != sc.models.end())
                     cl.boneName = Scene::normName(mit->second.name);
@@ -1634,6 +1731,7 @@ inline void buildScene(const FbxNode &root, Scene &sc)
 
 inline M4 nodeLocal(const Model &m)
 {
+    if (m.matrixOverride) return m.localMatrix;
     M4 t   = M4::translate(m.T);
     M4 rof = M4::translate(m.rOff);
     M4 rp  = M4::translate(m.rPiv);
@@ -1653,9 +1751,12 @@ inline M4 nodeGlobal(const Scene &sc, const Model &m, int depth = 0)
 {
     M4 local = nodeLocal(m);
     const M4 unit = M4::scale({ sc.sceneScale, sc.sceneScale, sc.sceneScale });
-    if (depth > 64 || m.parent == 0) return unit * local;
+    M4 axis;
+    const auto values = sc.axisTransform.rowMajorMatrix();
+    std::copy(values.begin(), values.end(), axis.m);
+    if (depth > 64 || m.parent == 0) return axis * unit * local;
     auto it = sc.models.find(m.parent);
-    if (it == sc.models.end()) return unit * local;
+    if (it == sc.models.end()) return axis * unit * local;
     return nodeGlobal(sc, it->second, depth + 1) * local;
 }
 
@@ -1795,20 +1896,31 @@ inline bool parse(const char *data, size_t size, Scene &sc)
         while (*s == ' ' || *s == '\t') ++s;
         if (*s == '#' || !*s) continue;
 
-        if (s[0] == 'v' && s[1] == ' ') {
+        if (s[0] == 'v' && (s[1] == ' ' || s[1] == '\t')) {
             double x = 0, y = 0, z = 0;
-            std::sscanf(s + 2, "%lf %lf %lf", &x, &y, &z);
+            if (std::sscanf(s + 2, "%lf %lf %lf", &x, &y, &z) != 3
+                || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
             P.push_back(x); P.push_back(y); P.push_back(z);
-        } else if (s[0] == 'v' && s[1] == 'n') {
+        } else if (s[0] == 'v' && s[1] == 'n' && (s[2] == ' ' || s[2] == '\t')) {
             double x = 0, y = 0, z = 0;
-            std::sscanf(s + 3, "%lf %lf %lf", &x, &y, &z);
+            if (std::sscanf(s + 3, "%lf %lf %lf", &x, &y, &z) != 3
+                || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
             N.push_back(x); N.push_back(y); N.push_back(z);
-        } else if (s[0] == 'v' && s[1] == 't') {
+        } else if (s[0] == 'v' && s[1] == 't' && (s[2] == ' ' || s[2] == '\t')) {
             double u = 0, v = 0;
-            std::sscanf(s + 3, "%lf %lf", &u, &v);
+            if (std::sscanf(s + 3, "%lf %lf", &u, &v) != 2
+                || !std::isfinite(u) || !std::isfinite(v)) return false;
             T.push_back(u); T.push_back(v);
-        } else if ((s[0] == 'o' || s[0] == 'g') && s[1] == ' ') {
+        } else if ((s[0] == 'o' || s[0] == 'g') && (s[1] == ' ' || s[1] == '\t')) {
             beginObject(std::string(s + 2));
+        } else if (!std::strncmp(s, "mtllib", 6) && (s[6] == ' ' || s[6] == '\t')) {
+            std::istringstream names(s + 6);
+            std::string library;
+            while (names >> std::quoted(library)) {
+                if (!library.empty() && library.front() == '#') break;
+                if (sc.objMaterialLibs.size() >= 128) return false;
+                sc.objMaterialLibs.push_back(library);
+            }
         } else if (!std::strncmp(s, "usemtl", 6)) {
             std::string name = s + 6;
             while (!name.empty() && name.front() == ' ') name.erase(name.begin());
@@ -1824,20 +1936,29 @@ inline bool parse(const char *data, size_t size, Scene &sc)
                 if (std::find(mats.begin(), mats.end(), curMat) == mats.end())
                     mats.push_back(curMat);
             }
-        } else if (s[0] == 'f' && s[1] == ' ') {
+        } else if (s[0] == 'f' && (s[1] == ' ' || s[1] == '\t')) {
             if (!g) beginObject("obj");
             std::vector<long> corners;
+            const size_t normalStart = g->nrm.data.size();
             const char *q = s + 2;
             while (*q) {
-                while (*q == ' ') ++q;
-                if (!*q) break;
-                long vi = std::strtol(q, const_cast<char **>(&q), 10);
-                long ti = 0, ni = 0;
+                while (*q == ' ' || *q == '\t') ++q;
+                if (!*q || *q == '#') break;
+                // Never leave q unchanged on malformed tokens/comments: the
+                // old strtol loop could hang the loading thread indefinitely.
+                auto index = [&](long &value) {
+                    char *next = nullptr; value = std::strtol(q, &next, 10);
+                    if (next == q || value == 0) return false;
+                    q = next; return true;
+                };
+                long vi = 0, ti = 0, ni = 0;
+                if (!index(vi)) return false;
                 if (*q == '/') {
                     ++q;
-                    if (*q != '/') ti = std::strtol(q, const_cast<char **>(&q), 10);
-                    if (*q == '/') { ++q; ni = std::strtol(q, const_cast<char **>(&q), 10); }
+                    if (*q != '/' && !index(ti)) return false;
+                    if (*q == '/') { ++q; if (!index(ni)) return false; }
                 }
+                if (*q && *q != ' ' && *q != '\t' && *q != '#') return false;
                 auto fix = [](long i, size_t n) -> long {
                     if (i > 0) return i - 1;
                     if (i < 0) return long(n) + i;
@@ -1846,7 +1967,9 @@ inline bool parse(const char *data, size_t size, Scene &sc)
                 long pv = fix(vi, P.size() / 3);
                 long tv = fix(ti, T.size() / 2);
                 long nv = fix(ni, N.size() / 3);
-                if (pv < 0 || size_t(pv) >= P.size() / 3) continue;
+                if (pv < 0 || size_t(pv) >= P.size() / 3
+                    || (ti && (tv < 0 || size_t(tv) >= T.size() / 2))
+                    || (ni && (nv < 0 || size_t(nv) >= N.size() / 3))) return false;
 
                 if (g->ctrl.size() < P.size())
                     g->ctrl = P;                    // share the global pool
@@ -1865,14 +1988,35 @@ inline bool parse(const char *data, size_t size, Scene &sc)
                     g->uv.data.push_back(0); g->uv.data.push_back(0);
                 }
             }
+            if (corners.size() < 3) return false;
             if (corners.size() >= 3) {
+                // OBJ normals are optional. Supply a polygon normal only for
+                // missing/zero vn values, retaining authored hard edges.
+                // Explicit weld_normals=1 can smooth positional seams later.
+                V3 face{};
+                for (size_t k = 0; k < corners.size(); ++k) {
+                    const size_t a = size_t(corners[k]) * 3;
+                    const size_t b = size_t(corners[(k + 1) % corners.size()]) * 3;
+                    face.x += (P[a+1]-P[b+1])*(P[a+2]+P[b+2]);
+                    face.y += (P[a+2]-P[b+2])*(P[a]+P[b]);
+                    face.z += (P[a]-P[b])*(P[a+1]+P[b+1]);
+                }
+                const double length = std::sqrt(face.x*face.x + face.y*face.y + face.z*face.z);
+                if (length > 1e-12) { face.x/=length; face.y/=length; face.z/=length; }
+                else face = {0,1,0};
+                for (size_t k = 0; k < corners.size(); ++k) {
+                    double *n = g->nrm.data.data() + normalStart + k*3;
+                    if (n[0]*n[0]+n[1]*n[1]+n[2]*n[2] < 1e-24) { n[0]=face.x; n[1]=face.y; n[2]=face.z; }
+                }
                 for (size_t k = 0; k + 1 < corners.size(); ++k)
                     g->pvi.push_back(corners[k]);
                 g->pvi.push_back(~corners.back());
                 int slot = 0;
                 if (curMat >= 0 && m) {
                     auto &mats = m->materials;
-                    slot = int(std::find(mats.begin(), mats.end(), curMat) - mats.begin());
+                    auto entry = std::find(mats.begin(), mats.end(), curMat);
+                    if (entry == mats.end()) { mats.push_back(curMat); slot = int(mats.size()-1); }
+                    else slot = int(entry - mats.begin());
                 }
                 g->matIdx.push_back(slot);
             }
@@ -1987,9 +2131,44 @@ struct OrigMeshRef {
     // matching FBX clusters onto this array by position instead of trusting
     // the Bone_N digits.
     std::vector<float> bonePos;
+    // When the native skeleton names are available, semantic identity wins
+    // over spatial matching (hands and twist helpers can share a bind point).
+    std::vector<std::string> boneNames;
+    // Supplied only after the runtime has matched every native bind matrix
+    // against the corresponding PCMESH. Used by explicit donor-pose helpers.
+    std::vector<int> boneParents;
+    bool donorPoseMetadataValidated = false;
+    // A source skeleton's output order can include helpers omitted from its
+    // PCMESH palette. Verified TransformLink associations keep exported cluster
+    // labels independent of the corrected native skin-bone identities.
+    std::map<std::string, int> clusterBoneIndices;
+    bool rejectImportedSkin = false;
+    // Set by the runtime only when this source has no matching original
+    // PCMESH. Such scenes may consist of separately named body/eye/mouth
+    // objects; all of their material buckets belong to the selected swap.
+    bool customSource = false;
+    // Explicit target selection is independent of the source FBX filename.
+    // Still restrict replacement to this file's own mesh family/LODs.
+    std::string targetFileName;
+    bool exactObjectTarget = false; // a mapping addressed one embedded mesh, not its file
+    std::vector<std::string> targetMeshNames;
+    // Complete embedded-name inventory for explicit static object matching.
+    // Family/LOD defaults remain separate from independent world/HUD pieces.
+    std::vector<std::string> targetFileMeshNames;
 };
 
 struct BuiltSection {
+    // Native target section cloned for this output. Appended outputs must not
+    // merge material slots just because the host has fewer draw sections.
+    size_t                templateSection = 0;
+    // Original exported PCMESH identity survives renaming the FBX. The runtime
+    // uses it to recover native diffuse textures and material colors omitted
+    // by the exporter.
+    std::string           sourceMeshName;
+    int                   sourceSection = -1;
+    std::string           sourceMaterialName;
+    bool                  customMaterial = false;
+    std::array<float, 4>   customDiffuse{{1.f, 1.f, 1.f, 1.f}};
     std::vector<float>    vertices;      // 16 floats / vertex
     std::vector<uint32_t> indices;       // triangle list, game winding
     uint32_t              weightClass = 2; // -> nglMeshSection::field_5C
@@ -2074,6 +2253,9 @@ struct BuiltSection {
     // Permanent character-body colour. The importer marks the sections and
     // ngl.cpp applies tintRGBA through a PRIVATE material clone (field_28), so
     // the original texture, UV detail, toon shading and highlights remain.
+    // Values are shader channel gains, not an encoded final colour, and may be
+    // greater than 1.0 when the authored diffuse needs a controlled exposure
+    // lift (USM_BLACKSUIT uses this to recover its bright violet toon ramp).
     bool permanentTint = false;
     float tintRGBA[4] = { 1.f, 1.f, 1.f, 1.f };
     // USM_BLACKSUIT uses the same generic tint path but needs two extra rules:
@@ -2159,10 +2341,10 @@ struct SkinTable {
             if (mapped < 0) continue;
             const GCluster &cl = g.clusters[ci];
             const bool hasShift = wantShift && ci < clusterShift->size();
-            for (size_t k = 0; k < cl.idx.size(); ++k) {
+            for (size_t k = 0; k < cl.idx.size() && k < cl.w.size(); ++k) {
                 int64_t v = cl.idx[k];
                 double  w = cl.w[k];
-                if (v < 0 || size_t(v) >= n || w <= 0) continue;
+                if (v < 0 || size_t(v) >= n || !std::isfinite(w) || w <= 0) continue;
                 if (hasShift) {
                     const auto &s = (*clusterShift)[ci];
                     sAcc[size_t(v)][0] += w * double(s[0]);
@@ -2206,13 +2388,13 @@ struct SkinTable {
 
 inline void expandGeom(const Geom &g, const M4 &world,
                        const SkinTable *skin,
-                       std::map<int, TriBucket> &buckets)
+                       std::map<int, TriBucket> &buckets, bool axisReflected = false)
 {
     const size_t nCtrl = g.ctrl.size() / 3;
     if (!nCtrl || g.pvi.empty()) return;
 
     M4 nrmM = world.normalMatrix();
-    const bool mirrored = world.det3() < 0;
+    const bool mirrored = (world.det3() < 0) != axisReflected;
 
     size_t polyIdx = 0, pvBase = 0;
     std::vector<int> poly;
@@ -2277,8 +2459,8 @@ inline void expandGeom(const Geom &g, const M4 &world,
             // clockwise-vs-normal convention per triangle afterwards (needed
             // because strip-unrolled exports carry alternating winding)
             B.corners.push_back(corner(0));
-            B.corners.push_back(corner(k));
-            B.corners.push_back(corner(k + 1));
+            B.corners.push_back(corner(axisReflected ? k + 1 : k));
+            B.corners.push_back(corner(axisReflected ? k : k + 1));
         }
     };
 
@@ -2324,7 +2506,8 @@ struct WeldHash {
 };
 
 inline void buildBuffers(const TriBucket &B, bool weld,
-                         std::vector<float> &verts, std::vector<uint32_t> &idx)
+                         std::vector<float> &verts, std::vector<uint32_t> &idx,
+                         bool exactWeld = false)
 {
     verts.clear(); idx.clear();
     idx.reserve(B.corners.size());
@@ -2347,6 +2530,16 @@ inline void buildBuffers(const TriBucket &B, bool weld,
     auto q = [](float f, float s) { return int32_t(std::lround(double(f) * s)); };
     for (auto &c : B.corners) {
         WeldKey k;
+        if (exactWeld) {
+            // Custom geometry can contain intentional sub-pixel edges and
+            // coincident faces with distinct UVs. Merge only identical full
+            // vertex attributes; quantization would change those faces.
+            const float row[16] = { c.px, c.py, c.pz, c.nx, c.ny, c.nz, c.u, c.v,
+                c.bi[0], c.bi[1], c.bi[2], c.bi[3],
+                c.bw[0], c.bw[1], c.bw[2], c.bw[3] };
+            static_assert(sizeof(row) == sizeof(k.v), "exact vertex key size");
+            std::memcpy(k.v, row, sizeof(row));
+        } else {
         k.v[0] = q(c.px, 8192); k.v[1] = q(c.py, 8192); k.v[2] = q(c.pz, 8192);
         k.v[3] = q(c.nx, 1024); k.v[4] = q(c.ny, 1024); k.v[5] = q(c.nz, 1024);
         k.v[6] = q(c.u, 8192);  k.v[7] = q(c.v, 8192);
@@ -2354,6 +2547,7 @@ inline void buildBuffers(const TriBucket &B, bool weld,
         k.v[10] = int32_t(c.bi[2]); k.v[11] = int32_t(c.bi[3]);
         k.v[12] = q(c.bw[0], 4096); k.v[13] = q(c.bw[1], 4096);
         k.v[14] = q(c.bw[2], 4096); k.v[15] = q(c.bw[3], 4096);
+        }
         auto it = map.find(k);
         uint32_t vi;
         if (it != map.end()) vi = it->second;
@@ -2470,12 +2664,12 @@ struct DonorGrid {
         return best;
     }
 
-    // up to K nearest donors (K <= 8), sorted by distance. Same ring search
+    // up to K nearest donors (K <= 16), sorted by distance. Same ring search
     // as nearest(); falls back to a full scan when the rings find nothing.
     int nearestK(const float p[3], int K, const Donor *out[], float outD2[]) const
     {
         if (donors.empty() || K <= 0) return 0;
-        if (K > 8) K = 8;
+        if (K > 16) K = 16;
         int cx = int((p[0] - minB[0]) / cell);
         int cy = int((p[1] - minB[1]) / cell);
         int cz = int((p[2] - minB[2]) / cell);
@@ -2698,6 +2892,25 @@ inline bool normalsMostlyFlat(const TriBucket &B)
             ++flat;
     }
     return tris != 0 && flat * 10 >= tris * 9;
+}
+
+// Custom files use their authored normals for the clockwise game winding.
+// This pass changes only corner order: tiny triangles, coincident faces and
+// disconnected surfaces all remain present. Missing/orthogonal normals fall
+// back to reversing the FBX polygon order. Native strip exports keep the
+// separate connectivity/duplicate-repair pass below.
+inline void orientCustomTriangles(TriBucket &B)
+{
+    for (size_t t = 0; t + 2 < B.corners.size(); t += 3) {
+        const Corner &a = B.corners[t], &b = B.corners[t + 1], &c = B.corners[t + 2];
+        const double x1 = double(b.px) - a.px, y1 = double(b.py) - a.py, z1 = double(b.pz) - a.pz;
+        const double x2 = double(c.px) - a.px, y2 = double(c.py) - a.py, z2 = double(c.pz) - a.pz;
+        const double nx = double(a.nx) + b.nx + c.nx;
+        const double ny = double(a.ny) + b.ny + c.ny;
+        const double nz = double(a.nz) + b.nz + c.nz;
+        const double facing = (y1*z2 - z1*y2)*nx + (z1*x2 - x1*z2)*ny + (x1*y2 - y1*x2)*nz;
+        if (facing >= 0.0) std::swap(B.corners[t + 1], B.corners[t + 2]);
+    }
 }
 
 inline void orientTriangles(TriBucket &B, bool untrustedNormals = false)
@@ -3324,13 +3537,34 @@ inline SidecarCfg loadSidecar(const std::string &meshPath)
             trim(v);
         }
         for (auto &c : k) c = char(std::tolower(uint8_t(c)));
-        if      (k == "scale")    cfg.scale = std::atof(v.c_str());
+        if (toolkit::option(cfg.toolkit, k, v)) continue;
+        if (k == "adapt") {
+            const auto mode = toolkit::lower(v);
+            if (mode == "toolkit") {
+                cfg.custom = true; cfg.skin = 2; cfg.fit = true;
+                cfg.toolkit.fitAxes = 1;
+            } else if (mode == "uniform") cfg.toolkit.fitAxes = 0;
+            else if (mode == "none") cfg.fit = false;
+            else if (mode != "auto") cfg.toolkit.error = "unknown adapt mode: " + v;
+        }
+        else if (k == "scale")    cfg.scale = std::atof(v.c_str());
         else if (k == "yaw")      cfg.yaw = std::atof(v.c_str());
         else if (k == "offset_x") cfg.offset.x = std::atof(v.c_str());
         else if (k == "offset_y") cfg.offset.y = std::atof(v.c_str());
         else if (k == "offset_z") cfg.offset.z = std::atof(v.c_str());
         else if (k == "fit")      cfg.fit = std::atoi(v.c_str()) != 0;
         else if (k == "weld")     cfg.weld = std::atoi(v.c_str()) != 0;
+        else if (k == "donor_pose") {
+            for (auto &c : v) c = char(std::tolower(uint8_t(c)));
+            cfg.donorPose = (v == "off" || v == "none" || v == "0" || v == "no") ? "" : v;
+        }
+        else if (k == "donor_left_arm_pitch" || k == "donor_right_arm_pitch") {
+            char *end = nullptr;
+            double angle = std::strtod(v.c_str(), &end);
+            if (end == v.c_str() || *end) angle = std::nan("");
+            (k == "donor_left_arm_pitch" ? cfg.donorLeftArmPitch : cfg.donorRightArmPitch) = angle;
+            cfg.donorArmPitchSet = true;
+        }
         else if (k == "anim" || k == "animations") {
             for (auto &c : v) c = char(std::tolower(uint8_t(c)));
             cfg.anim = !(v == "off" || v == "0" || v == "no");
@@ -3338,6 +3572,16 @@ inline SidecarCfg loadSidecar(const std::string &meshPath)
         else if (k == "bone_match" || k == "bonematch") {
             for (auto &c : v) c = char(std::tolower(uint8_t(c)));
             cfg.boneMatch = !(v == "off" || v == "0" || v == "no" || v == "names");
+        }
+        else if (k == "skeleton" || k == "source_skeleton") cfg.sourceSkeleton = v;
+        else if (k.compare(0, 5, "bone.") == 0 && k.size() > 5) cfg.boneMap[k.substr(5)] = v;
+        else if (k == "retarget") {
+            for (auto &c : v) c = char(std::tolower(uint8_t(c)));
+            cfg.retarget = !(v == "off" || v == "0" || v == "no");
+        }
+        else if (k == "custom") {
+            for (auto &c : v) c = char(std::tolower(uint8_t(c)));
+            cfg.custom = !(v == "off" || v == "0" || v == "no");
         }
         else if (k == "texture") {
             for (auto &c : v) c = char(std::tolower(uint8_t(c)));
@@ -3507,6 +3751,8 @@ inline SidecarCfg loadSidecar(const std::string &meshPath)
 // ===========================================================================
 //  scene loading + cache
 // ===========================================================================
+#include "mod_mesh_gltf.inc"
+#include "mod_mesh_obj_materials.inc"
 inline std::shared_ptr<Scene> parseScene(const std::string &path,
                                          const void *data, size_t size)
 {
@@ -3524,8 +3770,12 @@ inline std::shared_ptr<Scene> parseScene(const std::string &path,
     const uint8_t *bytes = static_cast<const uint8_t *>(data);
     bool ok = false;
 
-    if (ext == ".obj") {
+    if (!data || !size) return nullptr;
+    if (ext == ".glb" || ext == ".gltf") {
+        ok = gltf::parse(path, bytes, size, *sc);
+    } else if (ext == ".obj") {
         ok = objtxt::parse(reinterpret_cast<const char *>(bytes), size, *sc);
+        if (ok) objtxt::loadMaterials(path, *sc);
         if (ok)
             logf("[modmesh] \"%s\": OBJ, %u object(s)",
                  path.c_str(), unsigned(sc->meshModelOrder.size()));
@@ -3554,7 +3804,7 @@ inline std::shared_ptr<Scene> parseScene(const std::string &path,
                      unsigned(sc->anims.size()));
             } else {
                 logf("[modmesh] \"%s\": not a supported mesh format "
-                     "(binary/ascii FBX 7.x or OBJ)", path.c_str());
+                     "(binary/ascii FBX 7.x, OBJ, glTF 2.0 or GLB 2.0)", path.c_str());
             }
         }
     }
@@ -3601,6 +3851,24 @@ buildSectionsForMeshRaw(Scene &sc,
 
     std::vector<std::optional<BuiltSection>> out(origs.size());
     if (origs.empty()) return {};
+    if (!sc.cfg.toolkit.error.empty()) {
+        logf("[modmesh] toolkit settings rejected: %s", sc.cfg.toolkit.error.c_str());
+        return {};
+    }
+    if (!origRef.customSource && (!sc.cfg.toolkit.pins.empty()
+        || sc.cfg.toolkit.upAxis != "none" || sc.cfg.toolkit.flipUp
+        || sc.cfg.toolkit.dropOutliers || sc.cfg.toolkit.weldNormals)) {
+        logf("[modmesh] toolkit orientation/pins/outlier/normal options require custom=1 or adapt=toolkit");
+        return {};
+    }
+    if (sc.cfg.donorArmPitchSet && sc.cfg.donorPose.empty()) {
+        logf("[modmesh] donor arm pitch rejected: requires donor_pose=arms_down");
+        return {};
+    }
+    if (!sc.cfg.donorPose.empty() && !origRef.customSource) {
+        logf("[modmesh] donor_pose rejected: requires an explicitly custom, unrigged source");
+        return {};
+    }
 
     std::string meshName = meshNameIn;
     for (auto &c : meshName) c = char(std::tolower(uint8_t(c)));
@@ -3700,24 +3968,45 @@ buildSectionsForMeshRaw(Scene &sc,
         if (grid.donors.empty()) return 0;
         size_t nrmHits = 0;
 
-        const Donor *nb[4];
-        float d2[4];
+        const bool posedSurface = !sc.cfg.donorPose.empty();
+        const Donor *nb[16];
+        float d2[16];
         for (auto &c : B.corners) {
             const float p[3] = { c.px, c.py, c.pz };
-            const int n = grid.nearestK(p, 4, nb, d2);
+            int n = grid.nearestK(p, posedSurface ? 16 : 4, nb, d2);
             if (!n) continue;
             if (d2[0] <= 1e-8f) {
                 // bit-exact round trip: copy the authored skin AND normal
                 for (int k = 0; k < 4; ++k) { c.bi[k] = nb[0]->bi[k]; c.bw[k] = nb[0]->bw[k]; }
-                c.nx = nb[0]->n[0]; c.ny = nb[0]->n[1]; c.nz = nb[0]->n[2];
+                if (!posedSurface) {
+                    c.nx = nb[0]->n[0]; c.ny = nb[0]->n[1]; c.nz = nb[0]->n[2];
+                }
                 ++nrmHits;
                 continue;
+            }
+            if (posedSurface) {
+                // Nearby lowered hands and hips are separate surfaces. Use
+                // all positive-facing candidates, continuously weighted by
+                // normal alignment; topology below supplies continuity.
+                const double length = std::sqrt(double(c.nx)*c.nx+double(c.ny)*c.ny+double(c.nz)*c.nz);
+                const Donor *facing[16]; float score[16]; int count = 0;
+                if (length > 1e-8) for (int k = 0; k < n; ++k) {
+                    const auto *d = nb[k];
+                    const double nl = std::sqrt(double(d->n[0])*d->n[0]+double(d->n[1])*d->n[1]+double(d->n[2])*d->n[2]);
+                    if (nl <= 1e-8) continue;
+                    const double dot = (double(c.nx)*d->n[0]+double(c.ny)*d->n[1]+double(c.nz)*d->n[2])/(length*nl);
+                    if (dot > 0) { facing[count] = d; score[count++] = float(double(d2[k])/(dot*dot+1e-12)); }
+                }
+                if (count) {
+                    n = count;
+                    for (int k = 0; k < n; ++k) { nb[k] = facing[k]; d2[k] = score[k]; }
+                } else n = std::min(n,4);
             }
             // foreign vertex: inverse-distance blend of the neighbours'
             // weights in bone space, keep the 4 heaviest. Removes the hard
             // seams a single-nearest copy leaves across bone boundaries.
             struct BW { float b, w; };
-            BW acc[16]; int na = 0;
+            BW acc[64]; int na = 0;
             for (int i = 0; i < n; ++i) {
                 const float wi = 1.f / (d2[i] + 1e-10f);
                 for (int k = 0; k < 4; ++k) {
@@ -3725,7 +4014,7 @@ buildSectionsForMeshRaw(Scene &sc,
                     if (b < 0 || w <= 0) continue;
                     int j = 0;
                     for (; j < na; ++j) if (acc[j].b == b) { acc[j].w += wi * w; break; }
-                    if (j == na && na < 16) acc[na++] = { b, wi * w };
+                    if (j == na && na < 64) acc[na++] = { b, wi * w };
                 }
             }
             std::sort(acc, acc + na, [](const BW &a, const BW &b) { return a.w > b.w; });
@@ -3884,6 +4173,25 @@ buildSectionsForMeshRaw(Scene &sc,
                  origRef.sphereCenter[0], origRef.sphereCenter[1],
                  origRef.sphereCenter[2], r);
         }
+        // Port of usm_pipeline.aligner: put an unrigged custom body inside
+        // THIS target's bind-space bounds on each axis before donor transfer.
+        // Authored foreign-rig palettes never take this geometry-only fit.
+        const bool perAxis = sc.cfg.toolkit.fitAxes == 1
+            || (sc.cfg.toolkit.fitAxes < 0 && origRef.customSource && skinnedRef && alignToDonor);
+        if (sc.cfg.fit && haveOrig && perAxis && origRef.clusterBoneIndices.empty()) {
+            toolkit::Bounds sourceBounds, targetBounds;
+            sourceBounds.add(mnx, mny, mnz); sourceBounds.add(mxx, mxy, mxz);
+            targetBounds.add(omnx, omny, omnz); targetBounds.add(omxx, omxy, omxz);
+            const auto fit = toolkit::fit(sourceBounds, targetBounds);
+            if (fit.valid) {
+                for (auto *part : parts) for (auto &corner : part->corners)
+                    toolkit::apply(fit, corner);
+                logf("[modmesh] toolkit per-axis fit: scale %.6g %.6g %.6g; target bind bounds",
+                     fit.scale[0], fit.scale[1], fit.scale[2]);
+                return;
+            }
+            logf("[modmesh] degenerate per-axis fit; using existing uniform fitting");
+        }
         double origH = omxy - omny;
         bool scaled = false;
 
@@ -3956,7 +4264,11 @@ buildSectionsForMeshRaw(Scene &sc,
 
         if (sc.cfg.fit && haveOrig && newH > 1e-6 && origH > 1e-6) {
             double ratio = newH / origH;
-            if (ratio > 1.25 || ratio < 0.8) {
+            // Explicit custom fitting must align the source joints at the
+            // target's full height before donor skin transfer. The native
+            // round-trip tolerance remains unchanged for existing exports.
+            if ((origRef.customSource && alignToDonor && std::abs(ratio - 1.0) > 1e-4)
+                || ratio > 1.25 || ratio < 0.8) {
                 double s2 = origH / newH;
                 double cx = (mnx + mxx) * 0.5, cz = (mnz + mxz) * 0.5;
                 double ocx = (omnx + omxx) * 0.5, ocz = (omnz + omxz) * 0.5;
@@ -4247,7 +4559,54 @@ buildSectionsForMeshRaw(Scene &sc,
     std::map<std::string, int> bindRemap;
     std::map<std::string, std::array<float, 3>> bindShift;
     bool haveBindRemap = false;
-    if (sc.cfg.boneMatch && origRef.nbones > 0
+    if (!origRef.clusterBoneIndices.empty()) {
+        bindRemap = origRef.clusterBoneIndices;
+        haveBindRemap = true;
+    }
+    if (!origRef.customSource && !haveBindRemap && sc.cfg.boneMatch && origRef.boneNames.size() == size_t(origRef.nbones)
+        && origRef.bonePos.size() >= size_t(origRef.nbones) * 3) {
+        auto boneKey = [](const std::string &name) {
+            std::string key = Scene::normName(name);
+            key.erase(std::remove_if(key.begin(), key.end(),
+                [](char c) { return c == ' ' || c == '_'; }), key.end());
+            if (key.compare(0, 5, "bip01") == 0) key.erase(0, 5);
+            if (key == "lforetwist" || key == "rforetwist") key += '0';
+            if (key == "ltoe0" || key == "rtoe0") key.pop_back();
+            return key;
+        };
+        std::map<std::string, int> namedBones;
+        for (size_t i = 0; i < origRef.boneNames.size(); ++i)
+            if (!origRef.boneNames[i].empty())
+                namedBones.emplace(boneKey(origRef.boneNames[i]), int(i));
+        size_t mapped = 0;
+        for (int64_t mid : sc.meshModelOrder) {
+            const auto mit = sc.models.find(mid);
+            if (mit == sc.models.end()) continue;
+            for (int64_t gid : mit->second.geoms) {
+                const auto git = sc.geoms.find(gid);
+                if (git == sc.geoms.end()) continue;
+                for (const GCluster &cl : git->second.clusters) {
+                    if (bindRemap.count(cl.boneName)) continue;
+                    const auto bone = namedBones.find(boneKey(cl.boneName));
+                    bindRemap[cl.boneName] = bone == namedBones.end() ? -1 : bone->second;
+                    std::array<float, 3> shift{};
+                    if (bone != namedBones.end()) {
+                        ++mapped;
+                        if (cl.haveLink)
+                            for (int axis = 0; axis < 3; ++axis)
+                                shift[axis] = origRef.bonePos[size_t(bone->second) * 3 + axis]
+                                            - float(cl.linkPos[axis] * sc.sceneScale);
+                    }
+                    bindShift[cl.boneName] = shift;
+                }
+            }
+        }
+        haveBindRemap = mapped != 0;
+        if (haveBindRemap)
+            logf("[modmesh] native skeleton names: %u/%u source bones mapped; unmatched influences use native donors",
+                 unsigned(mapped), unsigned(bindRemap.size()));
+    }
+    if (!origRef.customSource && !haveBindRemap && sc.cfg.boneMatch && origRef.nbones > 0
         && origRef.bonePos.size() >= size_t(origRef.nbones) * 3)
     {
         // one link position per distinct cluster name (identical across geoms)
@@ -4432,6 +4791,10 @@ buildSectionsForMeshRaw(Scene &sc,
     auto skinModeFor = [&](const Geom &g, std::vector<int> &remapOut,
                            std::vector<std::array<float,3>> *shiftOut = nullptr) -> int {
         if (sc.cfg.skin == 3) return 3;
+        // A custom rig's spelling or cluster order is not a native bone
+        // index. Only an explicit verified map may use its authored skin;
+        // otherwise transfer the native body's weights after scene fitting.
+        if (origRef.customSource && origRef.clusterBoneIndices.empty()) return 2;
         if (sc.cfg.skin != 2 && !g.clusters.empty()) {
             std::vector<int> remap(g.clusters.size(), -1);
             bool allNamed = true;
@@ -4542,10 +4905,343 @@ buildSectionsForMeshRaw(Scene &sc,
                 st.build(g, remap, shift.empty() ? nullptr : &shift);
                 stp = &st;
             }
-            expandGeom(g, world, stp, buckets);
+            // glTF normals follow the ordinary inverse transpose, including
+            // mirrored nodes. Reverse their polygon winding instead of the
+            // FBX strip-export normal-sign correction in expandGeom().
+            expandGeom(g, world, stp, buckets,
+                sc.isGltf ? world.det3() < 0 : sc.axisTransform.reflected());
         }
         return mode;
     };
+
+    // Custom sources retain every object/material and split complete triangles
+    // before palette compaction. Retail shaders put three constants per bone
+    // at c11 onward and reserve c90 for skin index scale/offset. Consequently
+    // only 26 complete bone matrices fit without overwriting skin controls,
+    // even on hardware exposing more than the vs_1_1 minimum constant count.
+    if (origRef.customSource) {
+        struct Part {
+            const Model *model = nullptr;
+            int materialSlot = 0, skinMode = 2;
+            TriBucket bucket;
+        };
+        std::vector<Part> parts;
+        for (int64_t id : sc.meshModelOrder) {
+            const auto found = sc.models.find(id);
+            if (found == sc.models.end()) continue;
+            std::map<int, TriBucket> buckets;
+            const int mode = expandModel(found->second, buckets);
+            for (auto &entry : buckets)
+                if (!entry.second.corners.empty())
+                    parts.push_back({&found->second, entry.first, mode, std::move(entry.second)});
+        }
+        if (parts.empty()) return {};
+        for (const auto &part : parts) for (const auto &c : part.bucket.corners) {
+            if (!std::isfinite(c.px) || !std::isfinite(c.py) || !std::isfinite(c.pz)
+                || std::abs(c.px) > 1e10f || std::abs(c.py) > 1e10f || std::abs(c.pz) > 1e10f) {
+                logf("[modmesh] custom geometry rejected: nonfinite/excessive transformed position");
+                return {};
+            }
+        }
+        // A material-wide bounds check mirrors the add-on, but discarding
+        // outliers is opt-in: a large sword/wing can be intentional.
+        auto partKey = [](const Part &part) -> int64_t {
+            return part.materialSlot >= 0 && size_t(part.materialSlot) < part.model->materials.size()
+                ? part.model->materials[size_t(part.materialSlot)] : -part.model->id;
+        };
+        std::map<int64_t, toolkit::Bounds> materialBounds;
+        for (const auto &part : parts) for (const auto &c : part.bucket.corners)
+            materialBounds[partKey(part)].add(c.px, c.py, c.pz);
+        const auto badMaterials = toolkit::outliers(materialBounds, sc.cfg.toolkit.outlierFactor);
+        for (auto material : badMaterials)
+            logf("[modmesh] toolkit material %lld exceeds %.3g x median bounds: %s",
+                 static_cast<long long>(material), sc.cfg.toolkit.outlierFactor,
+                 sc.cfg.toolkit.dropOutliers ? "discarded by request" : "retained (drop_outliers=0)");
+        if (sc.cfg.toolkit.dropOutliers) {
+            parts.erase(std::remove_if(parts.begin(), parts.end(), [&](const Part &part) {
+                return std::find(badMaterials.begin(), badMaterials.end(), partKey(part)) != badMaterials.end();
+            }), parts.end());
+            if (parts.empty()) return {};
+        }
+        const bool hasAuthoredParts = std::any_of(parts.begin(), parts.end(), [](const Part &p) { return p.skinMode == 1; });
+        if ((hasAuthoredParts || !origRef.clusterBoneIndices.empty())
+            && (!sc.cfg.toolkit.pins.empty() || sc.cfg.toolkit.upAxis != "none"
+                || sc.cfg.toolkit.flipUp || sc.cfg.toolkit.fitAxes == 1)) {
+            logf("[modmesh] geometry-only toolkit changes cannot alter an authored rig; use adapt=toolkit / skin=transfer explicitly");
+            return {};
+        }
+        if (sc.cfg.toolkit.upAxis != "none" || sc.cfg.toolkit.flipUp) {
+            std::vector<TriBucket *> buckets;
+            for (auto &part : parts) buckets.push_back(&part.bucket);
+            bool flipped = false;
+            const int axis = toolkit::orient(buckets, sc.cfg.toolkit, flipped);
+            logf("[modmesh] toolkit orientation: %c-up -> Y-up, flip=%d%s",
+                 "XYZ"[axis], int(flipped), sc.cfg.toolkit.upAxis == "auto" ? " (heuristic; override with up_axis)" : "");
+        }
+        std::string pinError;
+        if (!toolkit::validatePins(sc.cfg.toolkit, origRef.nbones, origRef.bonePos, pinError)) {
+            logf("[modmesh] toolkit pins rejected: %s", pinError.c_str()); return {};
+        }
+        const bool poseDonors = !sc.cfg.donorPose.empty();
+        donorpose::Plan donorPose;
+        std::string donorPoseError;
+        if (poseDonors) {
+            if (sc.cfg.donorPose != "arms_down" || !anySkinnedOrig
+                || (sc.cfg.skin != 0 && sc.cfg.skin != 2)
+                || !origRef.clusterBoneIndices.empty() || !origRef.donorPoseMetadataValidated) {
+                logf("[modmesh] donor_pose rejected: arms_down requires native validated skeleton metadata and custom skin=transfer");
+                return {};
+            }
+            for (const auto &geometry : sc.geoms)
+                for (const auto &cluster : geometry.second.clusters)
+                    for (double weight : cluster.w) if (weight > 0.0) {
+                        logf("[modmesh] donor_pose rejected: source already has authored skin weights");
+                        return {};
+                    }
+            if (!donorpose::prepareArmsDown(origRef.boneNames, origRef.boneParents,
+                                           origRef.bonePos, donorPose, &donorPoseError,
+                                           sc.cfg.donorLeftArmPitch, sc.cfg.donorRightArmPitch)) {
+                logf("[modmesh] donor_pose rejected: %s", donorPoseError.c_str());
+                return {};
+            }
+        }
+        size_t firstTemplate = 0;
+        while (firstTemplate < origs.size() && !origs[firstTemplate].replaceable()) ++firstTemplate;
+        if (firstTemplate == origs.size()) return {};
+        {
+            std::vector<TriBucket *> buckets;
+            for (auto &part : parts) buckets.push_back(&part.bucket);
+            const bool savedFit = sc.cfg.fit;
+            if (!origRef.clusterBoneIndices.empty()) sc.cfg.fit = false;
+            fitCorners(buckets, /*alignToDonor=*/origRef.clusterBoneIndices.empty());
+            sc.cfg.fit = savedFit;
+        }
+        DonorGrid donor;
+        bool donorReady = false;
+        auto nativeDonor = [&]() -> const DonorGrid & {
+            if (!donorReady) {
+                donor = donorForSection(firstTemplate, true);
+                donorReady = true;
+            }
+            return donor;
+        };
+        if (poseDonors) {
+            nativeDonor();
+            if (donor.donors.empty()) {
+                logf("[modmesh] donor_pose rejected: no native weighted vertices");
+                return {};
+            }
+            for (auto &sample : donor.donors) {
+                retarget::Vec3 p, n;
+                if (!donorpose::transform(donorPose, sample.bi, sample.bw,
+                        {{sample.p[0],sample.p[1],sample.p[2]}}, {{sample.n[0],sample.n[1],sample.n[2]}},
+                        false, p, n, &donorPoseError)) {
+                    logf("[modmesh] donor_pose rejected: %s", donorPoseError.c_str());
+                    return {};
+                }
+                for (int c = 0; c < 3; ++c) { sample.p[c] = p[c]; sample.n[c] = n[c]; }
+            }
+            donor.cells.clear();
+            donor.build();
+            logf("[modmesh] donor_pose=arms_down: %u native samples; shoulder bones %d/%d; pitches %.2f/%.2f; inverse skinning to native bind",
+                 unsigned(donor.donors.size()), donorPose.upperarm[0], donorPose.upperarm[1],
+                 sc.cfg.donorLeftArmPitch, sc.cfg.donorRightArmPitch);
+        }
+        auto textureStem = [](std::string name) {
+            if (auto nul = name.find('\0'); nul != std::string::npos) name.resize(nul);
+            if (auto prefix = name.rfind("::"); prefix != std::string::npos) name.erase(0, prefix + 2);
+            if (auto slash = name.find_last_of("/\\"); slash != std::string::npos) name.erase(0, slash + 1);
+            for (auto &c : name) c = char(std::toupper(uint8_t(c)));
+            return name;
+        };
+        // Complete transfer across all materials before inverse posing. The
+        // auxiliary graph shares weights at exact source positions within one
+        // FBX model, so material/UV seams cannot split the surface treatment.
+        for (auto &part : parts) {
+            auto &bucket = part.bucket;
+            if (bucket.corners.size() % 3) return {};
+            // Use source normals before nearest-native skin transfer can
+            // replace an exactly coincident corner's normal.
+            orientCustomTriangles(bucket);
+            if (part.skinMode == 3) applyRigidBind(bucket, domBone);
+            else if (part.skinMode == 2) {
+                if (anySkinnedOrig && nativeDonor().donors.empty()) {
+                    logf("[modmesh] custom skin rejected: no usable native donor weights");
+                    return {};
+                }
+                transferCorners(bucket, nativeDonor());
+            }
+            if (part.skinMode == 1) patchWeightlessCorners(bucket, firstTemplate);
+            if (sc.cfg.skin == 4 && part.skinMode != 3) applyRigidParts(bucket);
+        }
+        // Apply constraints in target skeleton space, after weight transfer.
+        // Selectors name an entire source object or material; OBJ has no Blender
+        // vertex groups. Native gameplay skeletons/animations are never replaced.
+        for (const auto &pin : sc.cfg.toolkit.pins) {
+            size_t matched = 0, touched = 0;
+            for (auto &part : parts) {
+                std::string material;
+                const auto found = sc.materials.find(partKey(part));
+                if (found != sc.materials.end()) material = Scene::normName(found->second);
+                if (pin.target != Scene::normName(part.model->name) && pin.target != material) continue;
+                ++matched;
+                for (auto &corner : part.bucket.corners)
+                    touched += toolkit::pin(pin, origRef.bonePos, corner) ? 1u : 0u;
+            }
+            if (!matched) { logf("[modmesh] pin selector '%s' matched no object/material; replacement rejected", pin.target.c_str()); return {}; }
+            logf("[modmesh] toolkit pin %s (%s): %u corners", pin.target.c_str(), pin.mode.c_str(), unsigned(touched));
+        }
+        if (sc.cfg.toolkit.weldNormals) {
+            std::vector<std::pair<int64_t, TriBucket *>> buckets;
+            for (auto &part : parts) buckets.emplace_back(part.model->id, &part.bucket);
+            toolkit::weldNormals(buckets);
+            logf("[modmesh] toolkit normals welded across source-object material seams");
+        }
+        if (poseDonors) {
+            std::vector<donorsurface::Surface<Corner>> surfaces;
+            for (auto &part : parts) surfaces.push_back({part.model->id, &part.bucket.corners});
+            donorsurface::Stats stats;
+            if (!donorsurface::smooth(surfaces, donorPose.arm, nativeDonor(), &stats, &donorPoseError)) {
+                logf("[modmesh] donor surface rejected: %s", donorPoseError.c_str());
+                return {};
+            }
+            logf("[modmesh] donor surface: %u positions, %u original edges, %u iterations, %u recovered native families; max group error %.9g",
+                 unsigned(stats.positions), unsigned(stats.edges), stats.iterations,
+                 unsigned(stats.recoveredFamilies), stats.maximumGroupError);
+        }
+        size_t nextOutput = 0, inputTriangles = 0, outputTriangles = 0;
+        for (auto &part : parts) {
+            auto &bucket = part.bucket;
+            inputTriangles += bucket.corners.size() / 3;
+            if (poseDonors) for (auto &corner : bucket.corners) {
+                retarget::Vec3 p, n;
+                if (!donorpose::transform(donorPose, corner.bi, corner.bw,
+                        {{corner.px,corner.py,corner.pz}}, {{corner.nx,corner.ny,corner.nz}},
+                        true, p, n, &donorPoseError)) {
+                    logf("[modmesh] donor_pose rejected: %s", donorPoseError.c_str());
+                    return {};
+                }
+                corner.px=p[0]; corner.py=p[1]; corner.pz=p[2];
+                corner.nx=n[0]; corner.ny=n[1]; corner.nz=n[2];
+            }
+
+            BuiltSection prototype;
+            prototype.source = sc.srcName;
+            prototype.sourceMeshName = part.model->name;
+            prototype.sourceSection = part.materialSlot;
+            prototype.customMaterial = true;
+            prototype.autoStems = false;
+            if (part.materialSlot >= 0 && size_t(part.materialSlot) < part.model->materials.size()) {
+                const auto material = part.model->materials[size_t(part.materialSlot)];
+                if (auto found = sc.materials.find(material); found != sc.materials.end())
+                    prototype.sourceMaterialName = found->second;
+                // Binary object labels carry a NUL/type suffix; ASCII labels
+                // may carry Material::. Neither is part of an image name.
+                // Preserve numeric suffixes: Material.001 is a distinct slot.
+                if (auto nul = prototype.sourceMaterialName.find('\0'); nul != std::string::npos)
+                    prototype.sourceMaterialName.resize(nul);
+                if (auto prefix = prototype.sourceMaterialName.rfind("::"); prefix != std::string::npos)
+                    prototype.sourceMaterialName.erase(0, prefix + 2);
+                if (auto found = sc.materialDiffuse.find(material); found != sc.materialDiffuse.end())
+                    prototype.customDiffuse = found->second;
+                if (auto found = sc.matTexStem.find(material); found != sc.matTexStem.end())
+                    detail::pushUniqueTex(prototype.textureCandidates, found->second);
+            }
+            const auto materialStem = textureStem(prototype.sourceMaterialName);
+            if (!materialStem.empty()) {
+                const auto modelStem = textureStem(part.model->name);
+                detail::pushUniqueTex(prototype.textureCandidates, modelStem + "_" + materialStem + "_MAP_KD");
+                detail::pushUniqueTex(prototype.textureCandidates, materialStem + "_MAP_KD");
+                detail::pushUniqueTex(prototype.textureCandidates, materialStem);
+            }
+            detail::attachTexPayloads(prototype, sc);
+
+            // This also bounds unwelded vertices and GPU allocation sizes.
+            // A larger whole model is represented by more complete draws.
+            constexpr size_t maxBatchCorners = 60000;
+            constexpr size_t maxBatchBones = (90 - 11) / 3;
+            struct PaletteBatch {
+                std::vector<size_t> triangles;
+                std::vector<int> bones; // sorted; no more than maxBatchBones
+            };
+            std::vector<PaletteBatch> batches;
+            // Reuse a compatible palette instead of closing a draw whenever
+            // consecutive authored triangles visit a different body part.
+            // Best fit minimizes new bones; stable ties and source order
+            // inside each bin make the result deterministic. Only triangle
+            // order changes, never positions, influences, UVs or materials.
+            for (size_t triangle = 0; triangle < bucket.corners.size(); triangle += 3) {
+                std::set<int> triangleBones;
+                for (size_t corner = 0; corner < 3; ++corner) {
+                    const auto &value = bucket.corners[triangle + corner];
+                    const float channels[] = {value.px,value.py,value.pz,value.nx,value.ny,value.nz,value.u,value.v};
+                    for (float channel : channels) if (!std::isfinite(channel)) return {};
+                    for (int influence = 0; influence < 4; ++influence) {
+                        const float weight = value.bw[influence], index = value.bi[influence];
+                        if (!std::isfinite(weight) || !std::isfinite(index)) return {};
+                        if (weight <= 0.f) continue;
+                        if (index < 0.f || index >= 65536.f || index != std::floor(index)
+                            || !boneValid(int(index))) return {};
+                        triangleBones.insert(int(index));
+                    }
+                }
+                size_t best = batches.size(), fewestAdded = maxBatchBones + 1;
+                for (size_t i = 0; i < batches.size(); ++i) {
+                    const auto &candidate = batches[i];
+                    if (candidate.triangles.size() >= maxBatchCorners / 3) continue;
+                    size_t added = 0;
+                    for (int bone : triangleBones)
+                        added += !std::binary_search(candidate.bones.begin(), candidate.bones.end(), bone);
+                    if (candidate.bones.size() + added > maxBatchBones || added >= fewestAdded) continue;
+                    best = i; fewestAdded = added;
+                    if (!added) break;
+                }
+                if (best == batches.size()) {
+                    if (batches.size() + nextOutput >= 1024) return {};
+                    batches.emplace_back();
+                }
+                auto &chosen = batches[best];
+                chosen.triangles.push_back(triangle);
+                for (int bone : triangleBones) {
+                    const auto at = std::lower_bound(chosen.bones.begin(), chosen.bones.end(), bone);
+                    if (at == chosen.bones.end() || *at != bone) chosen.bones.insert(at, bone);
+                }
+            }
+            auto flush = [&](const PaletteBatch &packed) -> bool {
+                if (packed.triangles.empty()) return true;
+                while (nextOutput < origs.size() && !origs[nextOutput].replaceable()) ++nextOutput;
+                if (nextOutput >= 1024) return false;
+                if (nextOutput >= out.size()) out.resize(nextOutput + 1);
+                TriBucket batch;
+                batch.corners.reserve(packed.triangles.size() * 3);
+                for (size_t triangle : packed.triangles)
+                    batch.corners.insert(batch.corners.end(), bucket.corners.begin() + triangle,
+                                         bucket.corners.begin() + triangle + 3);
+                BuiltSection built = prototype;
+                built.templateSection = nextOutput < origs.size() ? nextOutput : firstTemplate;
+                buildBuffers(batch, sc.cfg.weld, built.vertices, built.indices, /*exactWeld=*/true);
+                built.palette = compactPalette(built.vertices); // <=26 by construction
+                built.keepOriginalPalette = false;
+                built.weightClass = classifyWeights(built.vertices);
+                outputTriangles += built.indices.size() / 3;
+                logf("[modmesh] %s sec%u <- custom %s material %d (%u vertices, %u triangles, %u bones)",
+                     meshName.c_str(), unsigned(nextOutput), part.model->name.c_str(), part.materialSlot,
+                     unsigned(built.vertices.size() / 16), unsigned(built.indices.size() / 3), unsigned(built.palette.size()));
+                out[nextOutput++] = std::move(built);
+                return true;
+            };
+            for (const auto &packed : batches) if (!flush(packed)) return {};
+        }
+        for (size_t i = nextOutput; i < origs.size(); ++i)
+            if (origs[i].replaceable()) {
+                out[i] = makeHidden("custom/no-material");
+                out[i]->templateSection = i;
+            }
+        if (inputTriangles != outputTriangles) return {};
+        logf("[modmesh] custom full scene: %u model/material parts, %u triangles retained in %u sections",
+             unsigned(parts.size()), unsigned(outputTriangles), unsigned(out.size()));
+        return out;
+    }
 
     // ================= Tier A: per-section objects ======================
     {
@@ -4791,163 +5487,100 @@ buildSectionsForMeshRaw(Scene &sc,
     }
 
     // ================= Tier B: merged object, split by material =========
-    if (const Model *m = sc.findModelByNorm(meshName)) {
+    // Selecting an FBX by its filename authorizes replacing this host with its
+    // source model even when the exported node retains the original name.
+    const Model *merged = sc.findModelByNorm(meshName);
+    if (!merged && sc.meshModelOrder.size() == 1)
+        merged = &sc.models.at(sc.meshModelOrder.front());
+    if (const Model *m = merged) {
         std::map<int, TriBucket> buckets;
-        int skinMode = expandModel(*m, buckets);
-        std::string src = Scene::normName(m->name);
-
+        const int skinMode = expandModel(*m, buckets);
+        const std::string src = Scene::normName(m->name);
+        const bool crossMesh = src != meshName;
         if (!buckets.empty()) {
-            {   // normalize: sidecar transform + auto-fit against the
-                // original mesh height (no-op within +/-25%) + dead-zone
-                // translation onto the original bounds. A merged export
-                // represents the whole mesh, so the reference is all
-                // sections; genuine round trips shift by ~0 and stay
-                // bit-exact.
-                std::vector<TriBucket *> parts;
-                parts.reserve(buckets.size());
-                for (auto &sb : buckets) parts.push_back(&sb.second);
-                fitCorners(parts, /*alignToDonor=*/true);
-            }
-            for (size_t si = 0; si < origs.size(); ++si) {
-                if (!origs[si].replaceable()) continue;     // keep original
-                TriBucket mine;
+            size_t templateIndex = 0;
+            while (templateIndex < origs.size() && !origs[templateIndex].replaceable())
+                ++templateIndex;
+            if (templateIndex == origs.size()) return {};
+            // Preserve each material as a separate draw. In particular, a
+            // white eye/spider slot must never share the body's texture.
+            const size_t count = std::max(origs.size(), size_t(buckets.rbegin()->first + 1));
+            out.resize(count);
+            std::vector<TriBucket *> parts;
+            for (auto &slot : buckets) parts.push_back(&slot.second);
+            const bool savedFit = sc.cfg.fit;
+            if (skinMode == 1 && haveBindRemap) sc.cfg.fit = false;
+            fitCorners(parts, skinMode != 1);
+            sc.cfg.fit = savedFit;
+            for (size_t si = 0; si < count; ++si) {
+                const size_t ti = si < origs.size() && origs[si].replaceable()
+                                ? si : templateIndex;
+                if (si < origs.size() && !origs[si].replaceable()) continue;
                 auto it = buckets.find(int(si));
-                if (it != buckets.end())
-                    mine.corners = std::move(it->second.corners);
-                if (si + 1 == origs.size())                // overflow -> last
-                    for (auto &sb : buckets)
-                        if (sb.first > int(si))
-                            mine.corners.insert(mine.corners.end(),
-                                                sb.second.corners.begin(),
-                                                sb.second.corners.end());
-                if (mine.corners.empty()) {
+                if (it == buckets.end() || it->second.corners.empty()) {
                     out[si] = makeHidden("merged/empty-slot");
+                    out[si]->templateSection = ti;
                     continue;
                 }
-
+                TriBucket &mine = it->second;
                 BuiltSection b;
+                b.templateSection = ti;
                 b.source = src;
-                for (int64_t matId : m->materials)
-                    if (auto ts = sc.matTexStem.find(matId); ts != sc.matTexStem.end())
-                        detail::pushUniqueTex(b.textureCandidates, ts->second);
-                b.autoStems = b.textureCandidates.empty();
-                // THIS slot's material carries no texture reference: the
-                // exporter's signature for morph-held reveal geometry.
-                // Remembered for the blank-geometry policy further down.
-                const bool untexturedPiece =
-                    si < m->materials.size()
-                        ? sc.matTexStem.find(m->materials[si])
-                              == sc.matTexStem.end()
-                        : b.textureCandidates.empty();
-                {   // family-name fallback for exports without texture refs:
-                    // "usm_blacksuit000" -> USM_BLACKSUIT, USM_BLACKSUIT000
-                    size_t e2 = src.size(), st2 = e2;
-                    while (st2 > 0 && std::isdigit((unsigned char) src[st2 - 1])) --st2;
-                    std::string famU = src.substr(0, st2), baseU = src;
-                    for (auto &ch : famU)  ch = char(std::toupper((unsigned char) ch));
-                    for (auto &ch : baseU) ch = char(std::toupper((unsigned char) ch));
-                    detail::pushUniqueTex(b.textureCandidates, famU);
-                    detail::pushUniqueTex(b.textureCandidates, baseU);
+                b.sourceMeshName = src;
+                b.sourceSection = int(si);
+                if (si < m->materials.size()) {
+                    auto tex = sc.matTexStem.find(m->materials[si]);
+                    if (tex != sc.matTexStem.end())
+                        detail::pushUniqueTex(b.textureCandidates, tex->second);
                 }
-                detail::sortColorTexFirst(b.textureCandidates);
+                b.autoStems = b.textureCandidates.empty();
                 detail::attachTexPayloads(b, sc);
+                bool skeletonSpace = skinMode == 1 || skinMode == 3 || crossMesh || si >= origs.size();
                 size_t nrmHits = 0;
-                if (skinMode == 2) {
-                    DonorGrid grid = donorForSection(si, false);
+                if (skinMode == 3) applyRigidBind(mine, domBone);
+                else if (skinMode == 2) {
+                    const DonorGrid grid = donorForSection(ti, skeletonSpace);
                     nrmHits = transferCorners(mine, grid);
                 }
-                if (skinMode == 1) patchWeightlessCorners(mine, si);
+                if (skinMode == 1) patchWeightlessCorners(mine, ti);
+                if (sc.cfg.skin == 4 && skinMode != 3) {
+                    applyRigidParts(mine);
+                    skeletonSpace = true;
+                }
                 orientTriangles(mine,
                     detail::normalsMostlyFlat(mine) && nrmHits * 2 < mine.corners.size());
                 buildBuffers(mine, sc.cfg.weld, b.vertices, b.indices);
-
-                // collapsed UV layer: take the vanilla UVs back (Tier A note)
-                if (detail::countDistinctUV(b.vertices) <= 1) {
-                    double uvDist = 0.0;
-                    const size_t np =
-                        detail::restoreUVsFromOriginal(b.vertices, origs[si],
-                                                       uvDist);
-                    if (np > 0)
-                        logf("[modmesh] %s sec%u <- \"%s\" slot %u: collapsed "
-                             "UV layer - %u vertices took the original UVs "
-                             "back (max search %.4f)",
-                             meshName.c_str(), unsigned(si), src.c_str(),
-                             unsigned(si), unsigned(np), uvDist);
-                }
-
-                // exact round trip of this slot? keep the vanilla buffers so
-                // retail morph playback stays live (see the Tier A note).
-                double rtDelta = 0.0;
-                if (sc.cfg.roundtripEps > 0.0
-                    && detail::sectionMatchesOriginal(b.vertices, origs[si],
-                                                      sc.cfg.roundtripEps,
-                                                      rtDelta)) {
-                    b.keepGeometry = true;
-                    b.vertices.clear();
-                    b.indices.clear();
-                    b.palette.clear();
-                    b.keepOriginalPalette = true;
-                    logf("[modmesh] %s sec%u <- \"%s\" slot %u: exact round "
-                         "trip of the original (max delta %.5f) - vanilla "
-                         "geometry kept, morphs stay live (sidecar "
-                         "roundtrip=0 forces the import)",
-                         meshName.c_str(), unsigned(si), src.c_str(),
-                         unsigned(si), rtDelta);
-                    out[si] = std::move(b);
-                    continue;
-                }
-
-                // Untextured slot that did NOT round-trip: morph-held reveal
-                // geometry (see the Tier A note). Keep the vanilla section so
-                // the retail morphs keep folding it away instead of freezing
-                // it open as a white shell; blank=import/hide overrides.
-                if (untexturedPiece && sc.cfg.blankGeo != 1
-                    && origs[si].replaceable()
-                    && !sc.cfg.texPin.count(int(si))) {
-                    if (sc.cfg.blankGeo == 2) {
-                        out[si] = makeHidden(src.c_str());
-                        logf("[modmesh] %s sec%u <- \"%s\" slot %u: untextured "
-                             "slot, not a round trip - HIDDEN (sidecar "
-                             "blank=hide)",
-                             meshName.c_str(), unsigned(si), src.c_str(),
-                             unsigned(si));
+                // Original UV/geometry recovery is valid only for the same
+                // native mesh and slot, never for a different character.
+                if (!crossMesh && si < origs.size()) {
+                    if (detail::countDistinctUV(b.vertices) <= 1) {
+                        double distance = 0;
+                        detail::restoreUVsFromOriginal(b.vertices, origs[ti], distance);
+                    }
+                    double delta = 0;
+                    if (sc.cfg.roundtripEps > 0.0
+                        && detail::sectionMatchesOriginal(b.vertices, origs[ti], sc.cfg.roundtripEps, delta)) {
+                        b.keepGeometry = true;
+                        b.vertices.clear();
+                        b.indices.clear();
+                        out[si] = std::move(b);
                         continue;
                     }
-                    b.keepGeometry = true;
-                    b.vertices.clear();
-                    b.indices.clear();
-                    b.palette.clear();
-                    b.keepOriginalPalette = true;
-                    b.blankOnly = true;     // repaint only a blank material
-                    logf("[modmesh] %s sec%u <- \"%s\" slot %u: untextured "
-                         "slot, not a round trip - vanilla geometry kept so "
-                         "the retail morphs keep folding it away (it would "
-                         "otherwise freeze open as a white shell). Sidecar "
-                         "blank=import forces the replacement, blank=hide "
-                         "hides it.",
-                         meshName.c_str(), unsigned(si), src.c_str(),
-                         unsigned(si));
-                    out[si] = std::move(b);
-                    continue;
                 }
-
-                if (skinMode == 1) {
+                if (skeletonSpace) {
                     b.palette = compactPalette(b.vertices);
                     b.keepOriginalPalette = false;
                 }
                 b.weightClass = classifyWeights(b.vertices);
-                if (oversize(si, src.c_str(), b)) { out[si] = makeHidden(src.c_str()); continue; }
-
-                logf("[modmesh] %s sec%u <- \"%s\" slot %u (%u verts, %u tris)",
+                if (oversize(ti, src.c_str(), b)) return {};
+                logf("[modmesh] %s sec%u <- %s material %u (%u vertices, %u triangles)",
                      meshName.c_str(), unsigned(si), src.c_str(), unsigned(si),
-                     unsigned(b.vertices.size() / 16),
-                     unsigned(b.indices.size() / 3));
+                     unsigned(b.vertices.size() / 16), unsigned(b.indices.size() / 3));
                 out[si] = std::move(b);
             }
             return out;
         }
     }
-
     // ================= Tier A': cross-family piece exports ===============
     // A renamed export ("VENOM.fbx" dropped in as ULTIMATE_SPIDERMAN.fbx)
     // still contains per-section pieces of its ORIGINAL mesh family
@@ -5348,6 +5981,14 @@ inline void sanitizeBuiltSection(BuiltSection &b, const OrigSectionView &ov,
              b.source.c_str(), unsigned(nanFixed), unsigned(slotFixed),
              unsigned(palFixed), unsigned(rebound));
 
+    // Custom geometry is fitted as a complete scene. Its valid protrusions
+    // need not fit the stock character sphere, so retain the authored shape
+    // after validating indices/weights instead of clamping it to native skin.
+    if (ref.customSource) {
+        b.weightClass = detail::classifyWeights(b.vertices);
+        return;
+    }
+
     // Position outliers. A FINITE vertex far outside the character's own
     // volume is an importer artefact (stray helper node, unmapped piece,
     // botched transform), never real geometry - and a single one is enough to
@@ -5508,12 +6149,757 @@ inline void clampRigidOutliers(BuiltSection &b, const OrigSectionView &ov)
              b.source.c_str(), unsigned(clamped), allow);
 }
 
+// Exported scenes can contain several unrelated characters. Prefer their
+// highest-detail (000) model; renaming the file changes the destination only.
+inline std::string primaryMeshName(const Scene &sc)
+{
+    std::map<std::string, size_t> corners;
+    for (int64_t id : sc.meshModelOrder) {
+        const auto found = sc.models.find(id);
+        if (found == sc.models.end()) continue;
+        std::string name = Scene::normName(found->second.name);
+        const size_t split = name.rfind('_');
+        if (split != std::string::npos && split >= 3
+            && std::isdigit(uint8_t(name[split - 1]))
+            && split + 1 < name.size()
+            && std::all_of(name.begin() + split + 1, name.end(),
+                           [](char c) { return std::isdigit(uint8_t(c)) != 0; }))
+            name.resize(split);
+        for (int64_t gid : found->second.geoms) {
+            const auto geom = sc.geoms.find(gid);
+            if (geom != sc.geoms.end()) corners[name] += geom->second.pvi.size();
+        }
+    }
+    std::string best;
+    size_t bestCount = 0;
+    bool bestLod0 = false;
+    for (const auto &entry : corners) {
+        const bool lod0 = entry.first.size() >= 3
+                       && entry.first.compare(entry.first.size() - 3, 3, "000") == 0;
+        if (best.empty() || (lod0 && !bestLod0)
+            || (lod0 == bestLod0 && entry.second > bestCount)) {
+            best = entry.first;
+            bestCount = entry.second;
+            bestLod0 = lod0;
+        }
+    }
+    return best;
+}
+
+inline std::string meshFamilyName(std::string name)
+{
+    name = Scene::normName(name);
+    while (!name.empty() && std::isdigit(uint8_t(name.back()))) name.pop_back();
+    return name;
+}
+
+// Retail bone identities recovered from the supplied FBX clusters and PCMESH
+// bind matrices. Full bind positions validate the layout before any index is
+// trusted; unknown game layouts fall back to the normal importer path.
+inline std::vector<std::string> nativeBoneNames(const std::string &meshName,
+    int nbones, const std::vector<float> &positions)
+{
+    struct Bone { const char *name; float x, y, z; };
+    const std::string family = meshFamilyName(meshName);
+    const Bone *layout = nullptr; size_t count = 0;
+    if (family == "arachno_man") {
+        static const Bone bones[] = {
+            { "pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "spine", 0.000000000f, 0.086232997f, -0.000121000f },
+            { "spine1", 0.000000000f, 0.237793997f, 0.013228000f },
+            { "spine2", 0.000000000f, 0.279109001f, 0.013098000f },
+            { "neck", 0.000000000f, 0.497864991f, -0.016608000f },
+            { "head", 0.000000000f, 0.586131990f, 0.044966999f },
+            { "head pivot", 0.000012000f, 0.499527007f, 0.293956995f },
+            { "l_clavicle", -0.058334999f, 0.470133990f, -0.011736000f },
+            { "l_upperarm", -0.184576005f, 0.443863988f, -0.014950000f },
+            { "l_forearm", -0.430974007f, 0.412636012f, -0.024501000f },
+            { "l_hand", -0.695674002f, 0.379090995f, -0.033849001f },
+            { "l_finger_0", -0.719726026f, 0.365803987f, -0.008446000f },
+            { "l_finger_01", -0.758751988f, 0.361126006f, 0.016809000f },
+            { "l_finger_02", -0.813189983f, 0.352322012f, 0.032942999f },
+            { "l_finger_1", -0.797179997f, 0.384691000f, -0.007599000f },
+            { "l_finger_11", -0.836345971f, 0.384768993f, -0.000123000f },
+            { "l_finger_12", -0.858160973f, 0.379350007f, 0.003430000f },
+            { "l_finger_2", -0.797272980f, 0.386667997f, -0.035202999f },
+            { "l_finger_21", -0.838666022f, 0.386426985f, -0.037039999f },
+            { "l_finger_22", -0.864987016f, 0.380822003f, -0.038201999f },
+            { "l_finger_3", -0.789314985f, 0.385890990f, -0.060231000f },
+            { "l_finger_31", -0.827651024f, 0.385172993f, -0.068182997f },
+            { "l_finger_32", -0.858071983f, 0.379449993f, -0.073779002f },
+            { "l_finger_4", -0.782060027f, 0.382324994f, -0.080205999f },
+            { "l_finger_41", -0.805114985f, 0.379846007f, -0.089791000f },
+            { "l_finger_42", -0.827719986f, 0.376350999f, -0.099022001f },
+            { "bip01_l_prop_hand", -0.781386018f, 0.364645004f, -0.030553000f },
+            { "bip01 l upperarm pivot", -0.194331005f, 0.673458993f, -0.022146000f },
+            { "l_fore_twist_0", -0.430974007f, 0.412636012f, -0.024501000f },
+            { "l_fore_twist_1", -0.563323975f, 0.395864010f, -0.029175000f },
+            { "bip01 l clavicle pivot", -0.256655991f, 0.443333000f, -0.168099001f },
+            { "r_clavicle", 0.058334999f, 0.470133990f, -0.011736000f },
+            { "r_upperarm", 0.184576005f, 0.443863988f, -0.014950000f },
+            { "r_forearm", 0.430974007f, 0.412636012f, -0.024501000f },
+            { "r_hand", 0.695674002f, 0.379090995f, -0.033849001f },
+            { "r_finger_0", 0.719726026f, 0.365803987f, -0.008446000f },
+            { "r_finger_01", 0.758750975f, 0.361126006f, 0.016809000f },
+            { "r_finger_02", 0.813189983f, 0.352322012f, 0.032942999f },
+            { "r_finger_1", 0.797179997f, 0.384691000f, -0.007599000f },
+            { "r_finger_11", 0.836345971f, 0.384768993f, -0.000122000f },
+            { "r_finger_12", 0.858160973f, 0.379350007f, 0.003430000f },
+            { "r_finger_2", 0.797272027f, 0.386667997f, -0.035202999f },
+            { "r_finger_21", 0.838666022f, 0.386426985f, -0.037039999f },
+            { "r_finger_22", 0.864987016f, 0.380822003f, -0.038201999f },
+            { "r_finger_3", 0.789314985f, 0.385890990f, -0.060231000f },
+            { "r_finger_31", 0.827651024f, 0.385172993f, -0.068182997f },
+            { "r_finger_32", 0.858071983f, 0.379449993f, -0.073779002f },
+            { "r_finger_4", 0.782060027f, 0.382324994f, -0.080205001f },
+            { "r_finger_41", 0.805114985f, 0.379846007f, -0.089791000f },
+            { "r_finger_42", 0.827719986f, 0.376350999f, -0.099022001f },
+            { "bip01_r_prop_hand", 0.777397990f, 0.361095011f, -0.035131998f },
+            { "bip01 r upperarm pivot", 0.197733000f, 0.710165977f, -0.021968000f },
+            { "r_fore_twist_0", 0.430974007f, 0.412636012f, -0.024501000f },
+            { "r_fore_twist_1", 0.563323975f, 0.395864010f, -0.029175000f },
+            { "bip01 r clavicle pivot", 0.268808991f, 0.441650987f, -0.167750001f },
+            { "spine2 pivot", 0.000013000f, 0.315297991f, 0.252382994f },
+            { "spine1 pivot", 0.000013000f, 0.224527001f, 0.223422006f },
+            { "spine pivot", 0.000013000f, 0.077816002f, 0.218608007f },
+            { "l_thigh", -0.077078000f, 0.000000000f, 0.000000000f },
+            { "l_calf", -0.134806007f, -0.499615014f, 0.011336000f },
+            { "l_foot", -0.195651993f, -1.030225992f, -0.016716000f },
+            { "l_toe", -0.212107003f, -1.127508044f, 0.109209999f },
+            { "r_thigh", 0.077078000f, 0.000000000f, 0.000000000f },
+            { "r_calf", 0.134806007f, -0.499615014f, 0.011336000f },
+            { "r_foot", 0.195651993f, -1.030225992f, -0.016716000f },
+            { "r_toe", 0.212107003f, -1.127508044f, 0.109209999f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (family == "carnage") {
+        static const Bone bones[] = {
+            { "pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "spine", 0.000000000f, 0.100409001f, 0.008551000f },
+            { "spine1", 0.000000000f, 0.277446985f, 0.015455000f },
+            { "spine2", 0.000000000f, 0.349776000f, 0.014438000f },
+            { "bone_4", 0.000000000f, 0.618634999f, -0.074867003f },
+            { "neck", 0.000000000f, 0.619105995f, -0.072291002f },
+            { "head", 0.000000000f, 0.629485011f, 0.052602001f },
+            { "l_clavicle", 0.000000000f, 0.597064018f, 0.055840001f },
+            { "l_upperarm", -0.067929000f, 0.566861987f, -0.058424000f },
+            { "l_forearm", -0.218128994f, 0.566861987f, -0.058424000f },
+            { "l_hand", -0.446236014f, 0.571784019f, -0.080208004f },
+            { "l_finger_0", -0.745311022f, 0.578275025f, -0.066316001f },
+            { "l_finger_01", -0.794530988f, 0.551442027f, -0.027791001f },
+            { "l_finger_02", -0.844689012f, 0.533317029f, 0.023252999f },
+            { "l_finger_1", -0.894061029f, 0.517588019f, 0.035698000f },
+            { "l_finger_11", -0.914952993f, 0.577950001f, -0.041244999f },
+            { "l_finger_12", -0.977768004f, 0.577827990f, -0.034844000f },
+            { "l_finger_2", -1.001660943f, 0.575686991f, -0.032554999f },
+            { "l_finger_21", -0.910588026f, 0.573840976f, -0.110298999f },
+            { "l_finger_22", -0.972702026f, 0.570846021f, -0.115174003f },
+            { "bip01_l_prop_hand", -0.994691014f, 0.568627000f, -0.116830997f },
+            { "l_fore_twist_0", -0.830169022f, 0.562210023f, -0.055955000f },
+            { "l_fore_twist_1", -0.446236014f, 0.571784019f, -0.080208004f },
+            { "r_clavicle", -0.595772982f, 0.575029016f, -0.073261999f },
+            { "r_upperarm", 0.067929000f, 0.566861987f, -0.058424000f },
+            { "r_forearm", 0.218130007f, 0.566861987f, -0.058424000f },
+            { "r_hand", 0.446236014f, 0.571784019f, -0.080206998f },
+            { "r_finger_0", 0.745311022f, 0.578275025f, -0.066316001f },
+            { "r_finger_01", 0.794530988f, 0.551442027f, -0.027791001f },
+            { "r_finger_02", 0.844689012f, 0.533316016f, 0.023252999f },
+            { "r_finger_1", 0.894061983f, 0.517588019f, 0.035696998f },
+            { "r_finger_11", 0.914952993f, 0.577950001f, -0.041244999f },
+            { "r_finger_12", 0.977768004f, 0.577827990f, -0.034844000f },
+            { "r_finger_2", 1.001660943f, 0.575686991f, -0.032554999f },
+            { "r_finger_21", 0.910588026f, 0.573840976f, -0.110298999f },
+            { "r_finger_22", 0.972702026f, 0.570846021f, -0.115174003f },
+            { "bip01_r_prop_hand", 0.994691014f, 0.568627000f, -0.116832003f },
+            { "r_fore_twist_0", 0.826493025f, 0.558691025f, -0.060811002f },
+            { "r_fore_twist_1", 0.446236014f, 0.571784019f, -0.080206998f },
+            { "bip01 ponytail1", 0.595772982f, 0.575029016f, -0.073261999f },
+            { "l_thigh", -0.093275003f, 0.000000000f, 0.000000000f },
+            { "l_calf", -0.199141994f, -0.495804012f, 0.010988000f },
+            { "l_foot", -0.302446991f, -0.984350026f, -0.039225001f },
+            { "l_toe", -0.319766015f, -1.130960941f, 0.088087000f },
+            { "r_thigh", 0.093275003f, 0.000000000f, 0.000000000f },
+            { "r_calf", 0.199141994f, -0.495804012f, 0.010988000f },
+            { "r_foot", 0.302446991f, -0.984350026f, -0.039225001f },
+            { "r_toe", 0.319766015f, -1.130960941f, 0.088087000f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (family == "mary_jane") {
+        static const Bone bones[] = {
+            { "pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "spine", 0.000000000f, 0.091909997f, 0.035436001f },
+            { "spine1", 0.000000000f, 0.209877998f, 0.056129999f },
+            { "spine2", 0.000000000f, 0.309462994f, 0.040656000f },
+            { "bone_4", 0.000000000f, 0.491373986f, 0.002122000f },
+            { "neck", 0.000000000f, 0.554629028f, 0.006301000f },
+            { "head", 0.000000000f, 0.637669027f, 0.046613999f },
+            { "box01", 0.000000000f, 0.883844972f, 0.071650997f },
+            { "l_clavicle", -0.053923000f, 0.506828010f, -0.041118000f },
+            { "l_upperarm", -0.169303000f, 0.499415010f, -0.015656000f },
+            { "l_forearm", -0.376868010f, 0.488068998f, -0.003613000f },
+            { "l_hand", -0.605773985f, 0.475629002f, 0.042822000f },
+            { "l_finger_0", -0.638413012f, 0.457727998f, 0.084191002f },
+            { "l_finger_01", -0.660453022f, 0.452060014f, 0.102558002f },
+            { "l_finger_02", -0.674057007f, 0.448446989f, 0.114523001f },
+            { "l_finger_1", -0.694637001f, 0.476974010f, 0.084434003f },
+            { "l_finger_11", -0.726527989f, 0.475304991f, 0.090412997f },
+            { "l_finger_12", -0.746927023f, 0.471076012f, 0.093837999f },
+            { "l_finger_2", -0.700420022f, 0.482834995f, 0.059716001f },
+            { "l_finger_21", -0.740490973f, 0.481750011f, 0.061795998f },
+            { "l_finger_22", -0.767808974f, 0.475082010f, 0.063506000f },
+            { "l_finger_3", -0.697458029f, 0.481635004f, 0.037586998f },
+            { "l_finger_31", -0.725216985f, 0.482378006f, 0.031332001f },
+            { "l_finger_32", -0.752762973f, 0.478298992f, 0.025683001f },
+            { "l_finger_4", -0.682115972f, 0.474088997f, 0.019120000f },
+            { "l_finger_41", -0.698000014f, 0.474032998f, 0.005763000f },
+            { "l_finger_42", -0.713194013f, 0.472748995f, -0.006842000f },
+            { "l_fore_twist_0", -0.376868010f, 0.488068998f, -0.003613000f },
+            { "l_fore_twist_1", -0.491320997f, 0.481849015f, 0.019603999f },
+            { "r_clavicle", 0.053923000f, 0.506828010f, -0.041118000f },
+            { "r_upperarm", 0.169303000f, 0.499415010f, -0.015656000f },
+            { "r_forearm", 0.376868010f, 0.488068998f, -0.003613000f },
+            { "r_hand", 0.605774999f, 0.475629002f, 0.042822000f },
+            { "r_finger_0", 0.638414025f, 0.457727998f, 0.084191002f },
+            { "r_finger_01", 0.656822026f, 0.451793998f, 0.106126003f },
+            { "r_finger_02", 0.668075025f, 0.448029995f, 0.120286003f },
+            { "r_finger_1", 0.694637001f, 0.476974010f, 0.084434003f },
+            { "r_finger_11", 0.726527989f, 0.475304991f, 0.090412997f },
+            { "r_finger_12", 0.746927023f, 0.471076012f, 0.093837999f },
+            { "r_finger_2", 0.700420022f, 0.482834995f, 0.059716001f },
+            { "r_finger_21", 0.740490973f, 0.481750011f, 0.061795998f },
+            { "r_finger_22", 0.767808974f, 0.475082010f, 0.063506000f },
+            { "r_finger_3", 0.697458029f, 0.481635004f, 0.037586998f },
+            { "r_finger_31", 0.725216985f, 0.482378006f, 0.031332001f },
+            { "r_finger_32", 0.752763987f, 0.478298992f, 0.025683001f },
+            { "r_finger_4", 0.682115972f, 0.474088997f, 0.019120000f },
+            { "r_finger_41", 0.698000014f, 0.474032998f, 0.005763000f },
+            { "r_finger_42", 0.713194013f, 0.472748995f, -0.006842000f },
+            { "r_fore_twist_0", 0.376868010f, 0.488068998f, -0.003613000f },
+            { "r_fore_twist_1", 0.491320997f, 0.481849015f, 0.019603999f },
+            { "l_thigh", -0.079907998f, 0.000000000f, 0.000000000f },
+            { "l_calf", -0.097066000f, -0.465074003f, -0.021971000f },
+            { "l_foot", -0.113270998f, -0.908288002f, -0.082723998f },
+            { "l_toe", -0.124903999f, -1.005555034f, 0.032478001f },
+            { "r_thigh", 0.079907998f, 0.000000000f, 0.000000000f },
+            { "r_calf", 0.097066000f, -0.465074003f, -0.021970000f },
+            { "r_foot", 0.113270998f, -0.908289015f, -0.082722999f },
+            { "r_toe", 0.124903999f, -1.005555034f, 0.032478999f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (family == "peter_parker") {
+        static const Bone bones[] = {
+            { "pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "spine", 0.000000000f, 0.086232997f, -0.000121000f },
+            { "spine1", 0.000000000f, 0.237793997f, 0.013228000f },
+            { "spine2", 0.000000000f, 0.279109001f, 0.013098000f },
+            { "bone_4", 0.000001000f, 0.480580002f, -0.002382000f },
+            { "neck", 0.000001000f, 0.484504014f, -0.000441000f },
+            { "head", 0.000001000f, 0.579943001f, 0.049299002f },
+            { "head pivot", 0.000002000f, 0.504100978f, 0.295740008f },
+            { "l_clavicle", -0.058334999f, 0.470133990f, -0.011736000f },
+            { "l_upperarm", -0.184576005f, 0.443863988f, -0.014950000f },
+            { "l_forearm", -0.430974007f, 0.412636012f, -0.024501000f },
+            { "l_hand", -0.695674002f, 0.379090995f, -0.033849001f },
+            { "l_finger_0", -0.723855972f, 0.365803987f, -0.008397000f },
+            { "l_finger_01", -0.753907979f, 0.361584008f, 0.027124001f },
+            { "l_finger_02", -0.796422005f, 0.354654014f, 0.065150999f },
+            { "l_finger_1", -0.812831998f, 0.387345999f, 0.005131000f },
+            { "l_finger_11", -0.852657020f, 0.388049006f, 0.006948000f },
+            { "l_finger_12", -0.874837995f, 0.382975996f, 0.007366000f },
+            { "l_finger_2", -0.823611975f, 0.390769005f, -0.032175001f },
+            { "l_finger_21", -0.865006030f, 0.390527993f, -0.034012001f },
+            { "l_finger_22", -0.891327024f, 0.384923011f, -0.035174001f },
+            { "l_finger_3", -0.805437982f, 0.388321012f, -0.058713999f },
+            { "l_finger_31", -0.842019975f, 0.388808012f, -0.072674997f },
+            { "l_finger_32", -0.871303022f, 0.384036988f, -0.083126001f },
+            { "l_finger_4", -0.791756988f, 0.387057006f, -0.081214003f },
+            { "l_finger_41", -0.807376027f, 0.384667009f, -0.100703999f },
+            { "l_finger_42", -0.822718024f, 0.381251991f, -0.119713999f },
+            { "bip01_l_prop_hand", -0.789501011f, 0.360493004f, -0.029095000f },
+            { "bip01 l upperarm pivot", -0.220487997f, 0.657673001f, -0.016782001f },
+            { "l_fore_twist_0", -0.430974007f, 0.412636012f, -0.024501000f },
+            { "l_fore_twist_1", -0.563323975f, 0.395862997f, -0.029175000f },
+            { "bip01 l clavicle pivot", -0.277350008f, 0.462877005f, -0.159808993f },
+            { "r_clavicle", 0.058334999f, 0.470133990f, -0.011736000f },
+            { "r_upperarm", 0.184576005f, 0.443863988f, -0.014950000f },
+            { "r_forearm", 0.430974007f, 0.412636012f, -0.024501000f },
+            { "r_hand", 0.695674002f, 0.379090995f, -0.033849001f },
+            { "r_finger_0", 0.723855972f, 0.365803987f, -0.008397000f },
+            { "r_finger_01", 0.753907979f, 0.361584008f, 0.027124999f },
+            { "r_finger_02", 0.796422005f, 0.354654014f, 0.065150999f },
+            { "r_finger_1", 0.812831998f, 0.387345999f, 0.005131000f },
+            { "r_finger_11", 0.852657020f, 0.388049006f, 0.006948000f },
+            { "r_finger_12", 0.874837995f, 0.382975996f, 0.007366000f },
+            { "r_finger_2", 0.823611975f, 0.390769005f, -0.032175001f },
+            { "r_finger_21", 0.865006030f, 0.390527993f, -0.034012001f },
+            { "r_finger_22", 0.891327024f, 0.384923011f, -0.035174001f },
+            { "r_finger_3", 0.805437982f, 0.388321012f, -0.058713999f },
+            { "r_finger_31", 0.842019975f, 0.388808012f, -0.072674997f },
+            { "r_finger_32", 0.871303022f, 0.384036988f, -0.083126001f },
+            { "r_finger_4", 0.791756988f, 0.387057006f, -0.081214003f },
+            { "r_finger_41", 0.807376027f, 0.384667009f, -0.100703999f },
+            { "r_finger_42", 0.822718024f, 0.381251991f, -0.119713999f },
+            { "bip01_r_prop_hand", 0.787818015f, 0.362426013f, -0.027511001f },
+            { "bip01 r upperarm pivot", 0.214415997f, 0.698369026f, -0.016829001f },
+            { "r_fore_twist_0", 0.430974007f, 0.412636012f, -0.024501000f },
+            { "r_fore_twist_1", 0.563323975f, 0.395862997f, -0.029175000f },
+            { "bip01 r clavicle pivot", 0.306286007f, 0.462877005f, -0.159704000f },
+            { "spine2 pivot", 0.000000000f, 0.328343004f, 0.258933991f },
+            { "spine1 pivot", 0.000000000f, 0.237571999f, 0.229973003f },
+            { "spine pivot", 0.000000000f, 0.077102996f, 0.225159004f },
+            { "l_thigh", -0.077078000f, 0.000000000f, 0.000000000f },
+            { "l_calf", -0.134532005f, -0.499725014f, -0.007076000f },
+            { "l_foot", -0.194371998f, -1.026522994f, -0.077362999f },
+            { "l_toe", -0.210826993f, -1.123805046f, 0.048563998f },
+            { "r_thigh", 0.077078000f, 0.000000000f, 0.000000000f },
+            { "r_calf", 0.134532005f, -0.499725014f, -0.007076000f },
+            { "r_foot", 0.194371998f, -1.026522994f, -0.077362999f },
+            { "r_toe", 0.210826993f, -1.123805046f, 0.048563998f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (family == "ultimate_spiderman") {
+        static const Bone bones[] = {
+            { "pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "spine", 0.000000000f, 0.086232997f, -0.000121000f },
+            { "spine1", 0.000000000f, 0.237793997f, 0.013228000f },
+            { "spine2", 0.000000000f, 0.279109001f, 0.013098000f },
+            { "neck", 0.000000000f, 0.497887999f, -0.016584000f },
+            { "head", 0.000000000f, 0.555930018f, 0.074046001f },
+            { "head pivot", 0.000012000f, 0.474296004f, 0.324710011f },
+            { "l_clavicle", -0.058334999f, 0.470133990f, -0.011736000f },
+            { "l_upperarm", -0.184576005f, 0.443863988f, -0.014950000f },
+            { "l_forearm", -0.430974007f, 0.412636012f, -0.024501000f },
+            { "l_hand", -0.695674002f, 0.379090995f, -0.033849001f },
+            { "l_finger_0", -0.719726026f, 0.365803987f, -0.008446000f },
+            { "l_finger_01", -0.758751988f, 0.361126006f, 0.016809000f },
+            { "l_finger_02", -0.813189983f, 0.352322012f, 0.032942999f },
+            { "l_finger_1", -0.797179997f, 0.384691000f, -0.007599000f },
+            { "l_finger_11", -0.836345971f, 0.384768993f, -0.000123000f },
+            { "l_finger_12", -0.858160973f, 0.379350007f, 0.003430000f },
+            { "l_finger_2", -0.797272980f, 0.386667997f, -0.035202999f },
+            { "l_finger_21", -0.838666022f, 0.386426985f, -0.037039999f },
+            { "l_finger_22", -0.864987016f, 0.380822003f, -0.038201999f },
+            { "l_finger_3", -0.789314985f, 0.385890990f, -0.060231000f },
+            { "l_finger_31", -0.827651024f, 0.385172993f, -0.068182997f },
+            { "l_finger_32", -0.858071983f, 0.379449993f, -0.073779002f },
+            { "l_finger_4", -0.782060027f, 0.382324994f, -0.080205999f },
+            { "l_finger_41", -0.805114985f, 0.379846007f, -0.089791000f },
+            { "l_finger_42", -0.827719986f, 0.376350999f, -0.099022001f },
+            { "bip01_l_prop_hand", -0.781386018f, 0.364645004f, -0.030553000f },
+            { "bip01 l upperarm pivot", -0.194331005f, 0.673458993f, -0.022146000f },
+            { "l_fore_twist_0", -0.430974007f, 0.412636012f, -0.024501000f },
+            { "l_fore_twist_1", -0.563323975f, 0.395864010f, -0.029175000f },
+            { "bip01 l clavicle pivot", -0.256655991f, 0.443333000f, -0.168099001f },
+            { "r_clavicle", 0.058334999f, 0.470133990f, -0.011736000f },
+            { "r_upperarm", 0.184576005f, 0.443863988f, -0.014950000f },
+            { "r_forearm", 0.430974007f, 0.412636012f, -0.024501000f },
+            { "r_hand", 0.695674002f, 0.379090995f, -0.033849001f },
+            { "r_finger_0", 0.719726026f, 0.365803987f, -0.008446000f },
+            { "r_finger_01", 0.758750975f, 0.361126006f, 0.016809000f },
+            { "r_finger_02", 0.813190997f, 0.352322012f, 0.032942999f },
+            { "r_finger_1", 0.797179997f, 0.384691000f, -0.007599000f },
+            { "r_finger_11", 0.836345971f, 0.384768993f, -0.000122000f },
+            { "r_finger_12", 0.858160973f, 0.379350007f, 0.003430000f },
+            { "r_finger_2", 0.797272027f, 0.386667997f, -0.035202999f },
+            { "r_finger_21", 0.838666022f, 0.386426985f, -0.037039999f },
+            { "r_finger_22", 0.864987016f, 0.380822003f, -0.038201999f },
+            { "r_finger_3", 0.789314985f, 0.385890990f, -0.060231000f },
+            { "r_finger_31", 0.827651024f, 0.385172993f, -0.068182997f },
+            { "r_finger_32", 0.858071983f, 0.379449993f, -0.073779002f },
+            { "r_finger_4", 0.782060027f, 0.382324994f, -0.080205001f },
+            { "r_finger_41", 0.805114985f, 0.379846007f, -0.089791000f },
+            { "r_finger_42", 0.827719986f, 0.376350999f, -0.099022001f },
+            { "bip01_r_prop_hand", 0.777397990f, 0.361095011f, -0.035131998f },
+            { "bip01 r upperarm pivot", 0.197733000f, 0.710165977f, -0.021968000f },
+            { "r_fore_twist_0", 0.430974007f, 0.412636012f, -0.024501000f },
+            { "r_fore_twist_1", 0.563323975f, 0.395864010f, -0.029175000f },
+            { "bip01 r clavicle pivot", 0.268808991f, 0.441650987f, -0.167750001f },
+            { "spine2 pivot", 0.000013000f, 0.315297991f, 0.252382994f },
+            { "spine1 pivot", 0.000013000f, 0.224527001f, 0.223422006f },
+            { "spine pivot", 0.000013000f, 0.077816002f, 0.218608007f },
+            { "l_thigh", -0.077078000f, 0.000000000f, 0.000000000f },
+            { "l_calf", -0.134806007f, -0.499615014f, 0.011336000f },
+            { "l_foot", -0.195651993f, -1.030225992f, -0.016716000f },
+            { "l_toe", -0.212107003f, -1.127508044f, 0.109209999f },
+            { "r_thigh", 0.077078000f, 0.000000000f, 0.000000000f },
+            { "r_calf", 0.134806007f, -0.499615014f, 0.011336000f },
+            { "r_foot", 0.195651993f, -1.030225992f, -0.016716000f },
+            { "r_toe", 0.212107003f, -1.127508044f, 0.109209999f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (family == "usm_blacksuit") {
+        static const Bone bones[] = {
+            { "pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "spine", 0.000000000f, 0.086232997f, -0.000121000f },
+            { "spine1", 0.000000000f, 0.237793997f, 0.013228000f },
+            { "spine2", 0.000000000f, 0.279109001f, 0.013098000f },
+            { "neck", 0.000000000f, 0.497864008f, -0.016609000f },
+            { "head", 0.000000000f, 0.586640000f, 0.044231001f },
+            { "head pivot", 0.000012000f, 0.506160975f, 0.295267999f },
+            { "l_clavicle", -0.058334999f, 0.470133990f, -0.011736000f },
+            { "l_upperarm", -0.184576005f, 0.443863988f, -0.014950000f },
+            { "l_forearm", -0.430974007f, 0.412636012f, -0.024501000f },
+            { "l_hand", -0.695674002f, 0.379090995f, -0.033849001f },
+            { "l_finger_0", -0.719726026f, 0.365803987f, -0.008446000f },
+            { "l_finger_01", -0.758751988f, 0.361126006f, 0.016809000f },
+            { "l_finger_02", -0.813189983f, 0.352322012f, 0.032942999f },
+            { "l_finger_1", -0.797179997f, 0.384691000f, -0.007599000f },
+            { "l_finger_11", -0.836345971f, 0.384768993f, -0.000123000f },
+            { "l_finger_12", -0.858160973f, 0.379350007f, 0.003430000f },
+            { "l_finger_2", -0.797272980f, 0.386667997f, -0.035202999f },
+            { "l_finger_21", -0.838666022f, 0.386426985f, -0.037039999f },
+            { "l_finger_22", -0.864987016f, 0.380822003f, -0.038201999f },
+            { "l_finger_3", -0.789314985f, 0.385890990f, -0.060231000f },
+            { "l_finger_31", -0.827651024f, 0.385172993f, -0.068182997f },
+            { "l_finger_32", -0.858071983f, 0.379449993f, -0.073779002f },
+            { "l_finger_4", -0.782060027f, 0.382324994f, -0.080205999f },
+            { "l_finger_41", -0.805114985f, 0.379846007f, -0.089791000f },
+            { "l_finger_42", -0.827719986f, 0.376350999f, -0.099022001f },
+            { "bip01_l_prop_hand", -0.781386018f, 0.364645004f, -0.030553000f },
+            { "bip01 l upperarm pivot", -0.194331005f, 0.673458993f, -0.022146000f },
+            { "l_fore_twist_0", -0.430974007f, 0.412636012f, -0.024501000f },
+            { "l_fore_twist_1", -0.563323975f, 0.395864010f, -0.029175000f },
+            { "bip01 l clavicle pivot", -0.256655991f, 0.443333000f, -0.168099001f },
+            { "r_clavicle", 0.058334999f, 0.470133990f, -0.011736000f },
+            { "r_upperarm", 0.184576005f, 0.443863988f, -0.014950000f },
+            { "r_forearm", 0.430974007f, 0.412636012f, -0.024501000f },
+            { "r_hand", 0.695674002f, 0.379090995f, -0.033849001f },
+            { "r_finger_0", 0.719726026f, 0.365803987f, -0.008446000f },
+            { "r_finger_01", 0.758750975f, 0.361126006f, 0.016809000f },
+            { "r_finger_02", 0.813190997f, 0.352322012f, 0.032942999f },
+            { "r_finger_1", 0.797179997f, 0.384691000f, -0.007599000f },
+            { "r_finger_11", 0.836345971f, 0.384768993f, -0.000122000f },
+            { "r_finger_12", 0.858160973f, 0.379350007f, 0.003430000f },
+            { "r_finger_2", 0.797272027f, 0.386667997f, -0.035202999f },
+            { "r_finger_21", 0.838666022f, 0.386426985f, -0.037039999f },
+            { "r_finger_22", 0.864987016f, 0.380822003f, -0.038201999f },
+            { "r_finger_3", 0.789314985f, 0.385890990f, -0.060231000f },
+            { "r_finger_31", 0.827651024f, 0.385172993f, -0.068182997f },
+            { "r_finger_32", 0.858071983f, 0.379449993f, -0.073779002f },
+            { "r_finger_4", 0.782060027f, 0.382324994f, -0.080205001f },
+            { "r_finger_41", 0.805114985f, 0.379846007f, -0.089791000f },
+            { "r_finger_42", 0.827719986f, 0.376350999f, -0.099022001f },
+            { "bip01_r_prop_hand", 0.777397990f, 0.361095011f, -0.035131998f },
+            { "bip01 r upperarm pivot", 0.197733000f, 0.710165977f, -0.021968000f },
+            { "r_fore_twist_0", 0.430974007f, 0.412636012f, -0.024501000f },
+            { "r_fore_twist_1", 0.563323975f, 0.395864010f, -0.029175000f },
+            { "bip01 r clavicle pivot", 0.268808991f, 0.441650987f, -0.167750001f },
+            { "spine2 pivot", 0.000013000f, 0.315297991f, 0.252382994f },
+            { "spine1 pivot", 0.000013000f, 0.224527001f, 0.223422006f },
+            { "spine pivot", 0.000013000f, 0.077816002f, 0.218608007f },
+            { "l_thigh", -0.077078000f, 0.000000000f, 0.000000000f },
+            { "l_calf", -0.134806007f, -0.499615014f, 0.011336000f },
+            { "l_foot", -0.195651993f, -1.030225992f, -0.016716000f },
+            { "l_toe", -0.212107003f, -1.127508044f, 0.109209999f },
+            { "r_thigh", 0.077078000f, 0.000000000f, 0.000000000f },
+            { "r_calf", 0.134806007f, -0.499615014f, 0.011336000f },
+            { "r_foot", 0.195651993f, -1.030225992f, -0.016716000f },
+            { "r_toe", 0.212107003f, -1.127508044f, 0.109209999f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (family == "venom") {
+        static const Bone bones[] = {
+            { "pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "spine", 0.000000000f, 0.228883997f, -0.000243000f },
+            { "spine1", 0.000000000f, 0.534056008f, -0.000130000f },
+            { "spine2", 0.000000000f, 0.696864009f, -0.000254000f },
+            { "bone_4", 0.004826000f, 1.210494041f, 0.006263000f },
+            { "neck", 0.004826000f, 1.217092991f, 0.006165000f },
+            { "head", 0.004826000f, 1.346817017f, 0.081197999f },
+            { "bip01 jaw", 0.004851000f, 1.382701039f, 0.127757996f },
+            { "l_clavicle", -0.270628989f, 0.963074028f, -0.095816001f },
+            { "l_upperarm", -0.541603029f, 0.963074028f, -0.095816001f },
+            { "l_forearm", -1.078219056f, 0.918256998f, -0.125384003f },
+            { "l_hand", -1.633823037f, 0.871876001f, -0.145218000f },
+            { "l_finger_0", -1.728278041f, 0.807030976f, -0.050228000f },
+            { "l_finger_01", -1.818302035f, 0.792101979f, 0.023833999f },
+            { "l_finger_02", -1.885386944f, 0.776877999f, 0.062641002f },
+            { "l_finger_1", -1.970093966f, 0.879930019f, -0.028922999f },
+            { "l_finger_11", -2.042397022f, 0.864308000f, -0.014880000f },
+            { "l_finger_12", -2.160576105f, 0.813624024f, 0.005441000f },
+            { "l_finger_2", -1.979316950f, 0.892293990f, -0.111878999f },
+            { "l_finger_21", -2.115803003f, 0.855594993f, -0.120212004f },
+            { "l_finger_22", -2.185703039f, 0.827975988f, -0.124508001f },
+            { "l_finger_3", -1.965823054f, 0.885365009f, -0.188906997f },
+            { "l_finger_31", -2.074568987f, 0.854534984f, -0.223349005f },
+            { "l_finger_32", -2.144016981f, 0.827932000f, -0.244752005f },
+            { "l_finger_4", -1.926959991f, 0.864255011f, -0.269252002f },
+            { "l_finger_41", -1.986006021f, 0.843897998f, -0.299771011f },
+            { "l_finger_42", -2.042257071f, 0.813790977f, -0.329057992f },
+            { "bip01 l prophand", -1.810804009f, 0.824680984f, -0.156443998f },
+            { "l_fore_twist_0", -1.078219056f, 0.918256998f, -0.125384003f },
+            { "l_fore_twist_1", -1.356021047f, 0.895066977f, -0.135300994f },
+            { "r_clavicle", 0.270628989f, 0.963074028f, -0.095816001f },
+            { "r_upperarm", 0.541603029f, 0.963074028f, -0.095816001f },
+            { "r_forearm", 1.078219056f, 0.918256998f, -0.125384003f },
+            { "r_hand", 1.633823991f, 0.871876001f, -0.145210996f },
+            { "r_finger_0", 1.728276968f, 0.807030976f, -0.050220001f },
+            { "r_finger_01", 1.818300962f, 0.792101979f, 0.023844000f },
+            { "r_finger_02", 1.885385036f, 0.776879013f, 0.062651001f },
+            { "r_finger_1", 1.970093012f, 0.879930973f, -0.028912000f },
+            { "r_finger_11", 2.042396069f, 0.864308000f, -0.014868000f },
+            { "r_finger_12", 2.160574913f, 0.813624024f, 0.005454000f },
+            { "r_finger_2", 1.979316950f, 0.892293990f, -0.111868002f },
+            { "r_finger_21", 2.115803003f, 0.855594993f, -0.120199002f },
+            { "r_finger_22", 2.185703039f, 0.827975988f, -0.124494001f },
+            { "r_finger_3", 1.965824008f, 0.885365009f, -0.188896000f },
+            { "r_finger_31", 2.074569941f, 0.854534984f, -0.223336995f },
+            { "r_finger_32", 2.144017935f, 0.827932000f, -0.244737998f },
+            { "r_finger_4", 1.926962018f, 0.864255011f, -0.269241005f },
+            { "r_finger_41", 1.986008048f, 0.843897998f, -0.299760014f },
+            { "r_finger_42", 2.042259932f, 0.813790977f, -0.329046011f },
+            { "bip01 r prophand", 1.816354036f, 0.824684978f, -0.156451002f },
+            { "r_fore_twist_0", 1.078219056f, 0.918256998f, -0.125384003f },
+            { "r_fore_twist_1", 1.356021047f, 0.895066977f, -0.135297999f },
+            { "l_thigh", -0.165088996f, 0.000000000f, 0.000000000f },
+            { "l_calf", -0.263478994f, -0.742242992f, -0.042528000f },
+            { "l_foot", -0.367246002f, -1.528067946f, -0.117618002f },
+            { "l_toe", -0.390953004f, -1.796278000f, 0.153353006f },
+            { "r_thigh", 0.165088996f, 0.000000000f, 0.000000000f },
+            { "r_calf", 0.263478994f, -0.742242992f, -0.042528000f },
+            { "r_foot", 0.367246002f, -1.528067946f, -0.117618002f },
+            { "r_toe", 0.390953004f, -1.796278000f, 0.153353006f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (family == "venom_eddie") {
+        static const Bone bones[] = {
+            { "bip01 pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "dummy01", 0.000000000f, 0.228883997f, -0.000243000f },
+            { "bip01 spine", 0.000000000f, 0.534056008f, -0.000130000f },
+            { "bip01 spine1", 0.000000000f, 0.696864009f, -0.000254000f },
+            { "bip01 spine2", 0.004826000f, 0.878713012f, 0.138545007f },
+            { "bip01 neck", 0.004826000f, 0.992832005f, 0.208881006f },
+            { "bip01 neck1", 0.004826000f, 1.049986959f, 0.284664989f },
+            { "bip01 head", 0.004838000f, 0.898259997f, 0.741457999f },
+            { "head pivot", -0.270628989f, 0.963074028f, -0.095816001f },
+            { "bip01 l clavicle", -0.541603029f, 0.963074028f, -0.095816001f },
+            { "bip01 l upperarm", -1.078219056f, 0.918256998f, -0.125384003f },
+            { "bip01 l forearm", -1.633823037f, 0.871876001f, -0.145218000f },
+            { "bip01 l hand", -1.728278041f, 0.807030976f, -0.050228000f },
+            { "bip01 l finger0", -1.818302035f, 0.792101979f, 0.023833999f },
+            { "bip01 l finger01", -1.885386944f, 0.776877999f, 0.062641002f },
+            { "bip01 l finger02", -1.970093966f, 0.879930019f, -0.028922999f },
+            { "bip01 l finger1", -2.042397022f, 0.864308000f, -0.014880000f },
+            { "bip01 l finger11", -2.160576105f, 0.813624024f, 0.005441000f },
+            { "bip01 l finger12", -1.979316950f, 0.892293990f, -0.111878999f },
+            { "bip01 l finger2", -2.115803003f, 0.855594993f, -0.120212004f },
+            { "bip01 l finger21", -2.185703039f, 0.827975988f, -0.124508001f },
+            { "bip01 l finger22", -1.965823054f, 0.885365009f, -0.188906997f },
+            { "bip01 l finger3", -2.074568987f, 0.854534984f, -0.223349005f },
+            { "bip01 l finger31", -2.144016981f, 0.827932000f, -0.244752005f },
+            { "bip01 l finger32", -1.926959991f, 0.864255011f, -0.269252002f },
+            { "bip01 l finger4", -1.986006021f, 0.843897998f, -0.299771011f },
+            { "bip01 l finger41", -2.042257071f, 0.813790977f, -0.329057992f },
+            { "bip01 l finger42", -1.810804009f, 0.824680984f, -0.156443998f },
+            { "bip01 l prophand", -1.078219056f, 0.918256998f, -0.125384003f },
+            { "bip01 l foretwist", -1.356021047f, 0.895066977f, -0.135300994f },
+            { "bip01 l foretwist1", 0.270628989f, 0.963074028f, -0.095816001f },
+            { "bip01 r clavicle", 0.541603029f, 0.963074028f, -0.095816001f },
+            { "bip01 r upperarm", 1.078219056f, 0.918256998f, -0.125384003f },
+            { "bip01 r forearm", 1.633823991f, 0.871876001f, -0.145210996f },
+            { "bip01 r hand", 1.728276968f, 0.807030976f, -0.050220001f },
+            { "bip01 r finger0", 1.818300962f, 0.792101979f, 0.023844000f },
+            { "bip01 r finger01", 1.885385036f, 0.776879013f, 0.062651001f },
+            { "bip01 r finger02", 1.970093012f, 0.879930973f, -0.028912000f },
+            { "bip01 r finger1", 2.042396069f, 0.864308000f, -0.014868000f },
+            { "bip01 r finger11", 2.160574913f, 0.813624024f, 0.005454000f },
+            { "bip01 r finger12", 1.979316950f, 0.892293990f, -0.111868002f },
+            { "bip01 r finger2", 2.115803003f, 0.855594993f, -0.120199002f },
+            { "bip01 r finger21", 2.185703039f, 0.827975988f, -0.124494001f },
+            { "bip01 r finger22", 1.965824008f, 0.885365009f, -0.188896000f },
+            { "bip01 r finger3", 2.074569941f, 0.854534984f, -0.223336995f },
+            { "bip01 r finger31", 2.144017935f, 0.827932000f, -0.244737998f },
+            { "bip01 r finger32", 1.926962018f, 0.864255011f, -0.269241005f },
+            { "bip01 r finger4", 1.986008048f, 0.843897998f, -0.299760014f },
+            { "bip01 r finger41", 2.042259932f, 0.813790977f, -0.329046011f },
+            { "bip01 r finger42", 1.816354036f, 0.824684978f, -0.156451002f },
+            { "bip01 r prophand", 1.078219056f, 0.918256998f, -0.125384003f },
+            { "bip01 r foretwist", 1.356021047f, 0.895066977f, -0.135297999f },
+            { "bip01 r foretwist1", 0.000013000f, 0.714277983f, 0.392592013f },
+            { "spine2 pivot", 0.004851000f, 1.014917970f, 0.203894004f },
+            { "bip01 jaw", 0.002914000f, 1.205330014f, 0.227378994f },
+            { "bip01 upperjaw", 0.000013000f, 0.512503982f, 0.360947996f },
+            { "spine1 pivot", 0.000013000f, 0.252795994f, 0.369271010f },
+            { "spine pivot", -0.165088996f, 0.000000000f, 0.000000000f },
+            { "bip01 l thigh", -0.263478994f, -0.742242992f, -0.042528000f },
+            { "bip01 l calf", -0.367246002f, -1.528067946f, -0.117618002f },
+            { "bip01 l foot", -0.390953004f, -1.796278000f, 0.153353006f },
+            { "bip01 l toe0", 0.165088996f, 0.000000000f, 0.000000000f },
+            { "bip01 r thigh", 0.263478994f, -0.742242992f, -0.042528000f },
+            { "bip01 r calf", 0.367246002f, -1.528067946f, -0.117618002f },
+            { "bip01 r foot", 0.390953004f, -1.796278000f, 0.153353006f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (family == "venom_spider") {
+        static const Bone bones[] = {
+            { "pelvis", 0.000000000f, 0.000000000f, 0.000000000f },
+            { "spine", 0.000000000f, 0.228883997f, -0.000243000f },
+            { "spine1", 0.000000000f, 0.534056008f, -0.000130000f },
+            { "spine2", 0.000000000f, 0.696864009f, -0.000254000f },
+            { "bone_4", 0.004826000f, 1.210494041f, 0.006263000f },
+            { "neck", 0.004826000f, 1.217092991f, 0.006165000f },
+            { "head", 0.004826000f, 1.346817017f, 0.081197999f },
+            { "bip01 jaw", 0.004851000f, 1.382701039f, 0.127757996f },
+            { "l_clavicle", -0.270628989f, 0.963074028f, -0.095816001f },
+            { "l_upperarm", -0.541603029f, 0.963074028f, -0.095816001f },
+            { "l_forearm", -1.078219056f, 0.918256998f, -0.125384003f },
+            { "l_hand", -1.633823037f, 0.871876001f, -0.145218000f },
+            { "l_finger_0", -1.728278041f, 0.807030976f, -0.050228000f },
+            { "l_finger_01", -1.818302035f, 0.792101979f, 0.023833999f },
+            { "l_finger_02", -1.885386944f, 0.776877999f, 0.062641002f },
+            { "l_finger_1", -1.970093966f, 0.879930019f, -0.028922999f },
+            { "l_finger_11", -2.042397022f, 0.864308000f, -0.014880000f },
+            { "l_finger_12", -2.160576105f, 0.813624024f, 0.005441000f },
+            { "l_finger_2", -1.979316950f, 0.892293990f, -0.111878999f },
+            { "l_finger_21", -2.115803003f, 0.855594993f, -0.120212004f },
+            { "l_finger_22", -2.185703039f, 0.827975988f, -0.124508001f },
+            { "l_finger_3", -1.965823054f, 0.885365009f, -0.188906997f },
+            { "l_finger_31", -2.074568987f, 0.854534984f, -0.223349005f },
+            { "l_finger_32", -2.144016981f, 0.827932000f, -0.244752005f },
+            { "l_finger_4", -1.926959991f, 0.864255011f, -0.269252002f },
+            { "l_finger_41", -1.986006021f, 0.843897998f, -0.299771011f },
+            { "l_finger_42", -2.042257071f, 0.813790977f, -0.329057992f },
+            { "bip01 l prophand", -1.810804009f, 0.824680984f, -0.156443998f },
+            { "l_fore_twist_0", -1.078219056f, 0.918256998f, -0.125384003f },
+            { "l_fore_twist_1", -1.356021047f, 0.895066977f, -0.135300994f },
+            { "r_clavicle", 0.270628989f, 0.963074028f, -0.095816001f },
+            { "r_upperarm", 0.541603029f, 0.963074028f, -0.095816001f },
+            { "r_forearm", 1.078219056f, 0.918256998f, -0.125384003f },
+            { "r_hand", 1.633823991f, 0.871876001f, -0.145210996f },
+            { "r_finger_0", 1.728276968f, 0.807030976f, -0.050220001f },
+            { "r_finger_01", 1.818300962f, 0.792101979f, 0.023844000f },
+            { "r_finger_02", 1.885385036f, 0.776879013f, 0.062651001f },
+            { "r_finger_1", 1.970093012f, 0.879930973f, -0.028912000f },
+            { "r_finger_11", 2.042396069f, 0.864308000f, -0.014868000f },
+            { "r_finger_12", 2.160574913f, 0.813624024f, 0.005454000f },
+            { "r_finger_2", 1.979316950f, 0.892293990f, -0.111868002f },
+            { "r_finger_21", 2.115803003f, 0.855594993f, -0.120199002f },
+            { "r_finger_22", 2.185703039f, 0.827975988f, -0.124494001f },
+            { "r_finger_3", 1.965824008f, 0.885365009f, -0.188896000f },
+            { "r_finger_31", 2.074569941f, 0.854534984f, -0.223336995f },
+            { "r_finger_32", 2.144017935f, 0.827932000f, -0.244737998f },
+            { "r_finger_4", 1.926962018f, 0.864255011f, -0.269241005f },
+            { "r_finger_41", 1.986008048f, 0.843897998f, -0.299760014f },
+            { "r_finger_42", 2.042259932f, 0.813790977f, -0.329046011f },
+            { "bip01 r prophand", 1.816354036f, 0.824684978f, -0.156451002f },
+            { "r_fore_twist_0", 1.078219056f, 0.918256998f, -0.125384003f },
+            { "r_fore_twist_1", 1.356021047f, 0.895066977f, -0.135297999f },
+            { "l_thigh", -0.165088996f, 0.000000000f, 0.000000000f },
+            { "l_calf", -0.263478994f, -0.742242992f, -0.042528000f },
+            { "l_foot", -0.367246002f, -1.528067946f, -0.117618002f },
+            { "l_toe", -0.390953004f, -1.796278000f, 0.153353006f },
+            { "r_thigh", 0.165088996f, 0.000000000f, 0.000000000f },
+            { "r_calf", 0.263478994f, -0.742242992f, -0.042528000f },
+            { "r_foot", 0.367246002f, -1.528067946f, -0.117618002f },
+            { "r_toe", 0.390953004f, -1.796278000f, 0.153353006f },
+        };
+        layout = bones; count = sizeof(bones) / sizeof(bones[0]);
+    }
+    if (!layout || nbones <= 0 || count != size_t(nbones) || positions.size() != count * 3) return {};
+    std::vector<std::string> names; names.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const float expected[3] = { layout[i].x, layout[i].y, layout[i].z };
+        for (size_t axis = 0; axis < 3; ++axis)
+            if (!std::isfinite(positions[i * 3 + axis]) || std::fabs(positions[i * 3 + axis] - expected[axis]) > 0.001f) return {};
+        names.emplace_back(layout[i].name);
+    }
+    return names;
+}
+
+inline bool fileTargetsMesh(const Scene &sc, const std::string &meshName)
+{
+    std::string filename = sc.srcName;
+    const size_t slash = filename.find_last_of("/\\");
+    if (slash != std::string::npos) filename.erase(0, slash + 1);
+    const size_t dot = filename.rfind('.');
+    if (dot != std::string::npos) filename.resize(dot);
+    filename = Scene::normName(filename);
+    const std::string target = Scene::normName(meshName);
+    return filename == target || filename == meshFamilyName(target);
+}
+
+inline bool hasNamedStaticTargets(const Scene &scene, const OrigMeshRef &ref)
+{
+    if (ref.nbones != 0 || ref.targetFileMeshNames.empty()) return false;
+    for (int64_t id : scene.meshModelOrder) {
+        const auto model = scene.models.find(id);
+        if (model == scene.models.end()) continue;
+        const auto name = Scene::normName(model->second.name);
+        for (const auto &target : ref.targetFileMeshNames)
+            if (name == Scene::normName(target)) return true;
+    }
+    return false;
+}
+
+inline bool targetMeshAllowed(const Scene &scene, const std::string &meshNameIn,
+                              const OrigMeshRef &origRef)
+{
+    if (origRef.exactObjectTarget) {
+        const auto key = Scene::normName(meshNameIn);
+        return std::any_of(origRef.targetMeshNames.begin(), origRef.targetMeshNames.end(),
+            [&](const std::string &name) { return Scene::normName(name) == key; });
+    }
+    if (hasNamedStaticTargets(scene, origRef)) {
+        const auto key = Scene::normName(meshNameIn);
+        const bool inFile = std::any_of(origRef.targetFileMeshNames.begin(), origRef.targetFileMeshNames.end(),
+            [&](const std::string &name) { return Scene::normName(name) == key; });
+        if (!inFile) return false;
+        return std::any_of(scene.meshModelOrder.begin(), scene.meshModelOrder.end(), [&](int64_t id) {
+            const auto model = scene.models.find(id);
+            return model != scene.models.end() && Scene::normName(model->second.name) == key;
+        });
+    }
+    if (!origRef.targetMeshNames.empty()) {
+        const auto key = Scene::normName(meshNameIn);
+        return std::any_of(origRef.targetMeshNames.begin(), origRef.targetMeshNames.end(),
+                           [&](const std::string &name) { return Scene::normName(name) == key; });
+    }
+    if (origRef.targetFileName.empty()) {
+        return fileTargetsMesh(scene, meshNameIn);
+    } else {
+        std::string scope = origRef.targetFileName;
+        const size_t slash = scope.find_last_of("/\\");
+        if (slash != std::string::npos) scope.erase(0, slash + 1);
+        scope = Scene::normName(scope);
+        const auto mesh = Scene::normName(meshNameIn);
+        return scope == mesh || scope == meshFamilyName(mesh)
+            || (mesh.size() == scope.size() + 3 && mesh.compare(0, scope.size(), scope) == 0
+                && std::all_of(mesh.end() - 3, mesh.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }));
+    }
+}
+
 inline std::vector<std::optional<BuiltSection>>
-buildSectionsForMesh(Scene &sc,
+buildSectionsForMesh(Scene &scene,
                      const std::string &meshNameIn,
                      const std::vector<OrigSectionView> &origsIn,
                      const OrigMeshRef &origRef = {})
 {
+    if (origRef.rejectImportedSkin || !scene.cfg.toolkit.error.empty()) return {};
+    if (!targetMeshAllowed(scene, meshNameIn, origRef)) return {};
+    // Work on a selected scene so cached sibling assets and their skeletons
+    // cannot leak into this character or into native attack/FX meshes.
+    Scene sc = scene;
+    const std::string sourcePrimary = primaryMeshName(sc);
+    if (hasNamedStaticTargets(sc, origRef)) {
+        const auto key = Scene::normName(meshNameIn);
+        sc.meshModelOrder.erase(std::remove_if(sc.meshModelOrder.begin(), sc.meshModelOrder.end(),
+            [&](int64_t id) { return Scene::normName(sc.models.at(id).name) != key; }), sc.meshModelOrder.end());
+    } else if (!origRef.customSource && !sourcePrimary.empty()) {
+        sc.meshModelOrder.erase(std::remove_if(sc.meshModelOrder.begin(), sc.meshModelOrder.end(),
+            [&](int64_t id) {
+                const std::string name = Scene::normName(sc.models.at(id).name);
+                return name != sourcePrimary
+                    && name.compare(0, sourcePrimary.size() + 1, sourcePrimary + "_") != 0;
+            }), sc.meshModelOrder.end());
+    }
     // sidecar layout= override, applied to the STATIC sections only, before
     // anything reads a vertex through them
     std::vector<OrigSectionView> origs = origsIn;
@@ -5539,6 +6925,17 @@ buildSectionsForMesh(Scene &sc,
     }
 
     auto out = buildSectionsForMeshRaw(sc, meshNameIn, origs, origRef);
+    // Explicit anim=on users share the cached channel bindings with the
+    // engine-side animation reader after this mesh has resolved its rig.
+    if (sc.cfg.anim) scene.anims = sc.anims;
+    for (size_t si = 0; si < out.size(); ++si) {
+        if (!out[si]) continue;
+        if (si < origs.size()) out[si]->templateSection = si;
+        if (!out[si]->hide && out[si]->sourceMeshName.empty()) {
+            out[si]->sourceMeshName = sourcePrimary;
+            out[si]->sourceSection = int(si);
+        }
+    }
 
     // Retail USM_BLACKSUIT has intentionally untextured white geometry (eye
     // lenses + chest spider) next to a textured dark-purple body. The engine
@@ -5553,9 +6950,9 @@ buildSectionsForMesh(Scene &sc,
     // Detect the black-suit asset independently of white=auto: its purple-blue
     // body colour is now a built-in mesh rule and must be applied even when a
     // mod has no geometry mapping or disables the automatic white-name policy.
-    const bool blackSuitAsset =
-        containsCI(meshNameIn, "USM_BLACKSUIT")
-        || containsCI(sc.srcName, "USM_BLACKSUIT");
+    const bool blackSuitAsset = !origRef.customSource
+        && (containsCI(meshNameIn, "USM_BLACKSUIT")
+            || containsCI(sourcePrimary, "USM_BLACKSUIT"));
     const bool blackSuitWhiteAuto = sc.cfg.whiteAuto && blackSuitAsset;
 
     // VENOM_EDDIE is a morph-driven reveal asset: section 11 is Eddie's human
@@ -5565,9 +6962,8 @@ buildSectionsForMesh(Scene &sc,
     // Keep a dedicated flag here so the post-map safety below can preserve the
     // original head geometry while still letting the imported texture family
     // recolour it.
-    const bool venomEddieAsset =
-        containsCI(meshNameIn, "VENOM_EDDIE")
-        || containsCI(sc.srcName, "VENOM_EDDIE");
+    const bool venomEddieAsset = containsCI(meshNameIn, "VENOM_EDDIE")
+                             && Scene::normName(meshNameIn) == sourcePrimary;
 
     // The raw mapper returns an EMPTY vector whenever it cannot map geometry:
     // a scene with no usable mesh, a foreign scene that produced no buckets, a
@@ -5714,17 +7110,19 @@ buildSectionsForMesh(Scene &sc,
         }
     }
 
-    for (size_t si = 0; si < out.size() && si < origs.size(); ++si)
+    for (size_t si = 0; si < out.size(); ++si)
         if (out[si]) {
+            const size_t ti = out[si]->templateSection;
+            if (ti >= origs.size()) return {};
             out[si]->texMode = sc.cfg.tex;
             if (out[si]->keepGeometry) continue;
-            if (origs[si].rigidRow()) {
+            if (origs[ti].rigidRow()) {
                 // static target: no palette, no blend lanes, no morph window -
                 // but the vertex format and the baked colours must travel
-                clampRigidOutliers(*out[si], origs[si]);
-                finishRigidSection(*out[si], origs[si]);
+                if (!origRef.customSource) clampRigidOutliers(*out[si], origs[ti]);
+                finishRigidSection(*out[si], origs[ti]);
             } else {
-                sanitizeBuiltSection(*out[si], origs[si], origRef);
+                sanitizeBuiltSection(*out[si], origs[ti], origRef);
             }
         }
 
@@ -5752,7 +7150,7 @@ buildSectionsForMesh(Scene &sc,
     // its priority.
     if (!autoStems.empty())
         for (size_t si = 0; si < out.size(); ++si)
-            if (out[si] && !out[si]->hide
+            if (out[si] && !out[si]->hide && !out[si]->customMaterial
                 && (out[si]->autoStems || out[si]->textureCandidates.empty())) {
                 const size_t before = out[si]->textureCandidates.size();
                 for (const std::string &s : autoStems)
@@ -5881,107 +7279,6 @@ buildSectionsForMesh(Scene &sc,
              carriers,
              sc.cfg.whiteBlank ? "" : ". Names: ",
              sc.cfg.whiteBlank ? "" : kw.c_str());
-    }
-
-    // -----------------------------------------------------------------------
-    //  USM_BLACKSUIT permanent purple-blue body tint
-    // -----------------------------------------------------------------------
-    // Match the uploaded retail/reference look with a stable blue-violet
-    // material multiplier.  This is deliberately mesh-name driven: no sidecar
-    // setting and no replacement texture are required.  Every section receives
-    // a colour-only carrier so the rule also works when the FBX maps no geometry.
-    //
-    // The reference hue is approximately R:G:B = 0.75:0.52:1.00; the multiplier
-    // below keeps enough brightness for the glossy/toon highlights while staying
-    // visibly purple-blue instead of black/magenta.
-    if (blackSuitAsset) {
-        constexpr float kTintR = 0.66f;
-        constexpr float kTintG = 0.46f;
-        constexpr float kTintB = 0.88f;
-        unsigned tinted = 0;
-        for (size_t si = 0; si < out.size(); ++si) {
-            if (!out[si]) {
-                BuiltSection t;
-                t.keepGeometry = true;                 // colour-only carrier
-                t.texMode = sc.cfg.tex;                // preserve texture= policy
-                t.source = "USM_BLACKSUIT permanent purple-blue tint";
-                out[si] = std::move(t);
-            }
-
-            BuiltSection &b = *out[si];
-            if (b.hide || b.forceWhite)
-                continue;
-
-            b.permanentTint = true;
-            b.permanentTintBlackSuit = true;
-            b.permanentTintKeepBlankWhite = true;
-            b.tintRGBA[0] = kTintR;
-            b.tintRGBA[1] = kTintG;
-            b.tintRGBA[2] = kTintB;
-            b.tintRGBA[3] = 1.0f;
-            ++tinted;
-        }
-
-        logf("[modmesh] %s: permanent USM_BLACKSUIT PURPLE-BLUE tint enabled "
-             "on %u section(s): RGB %.2f %.2f %.2f; retail no-diffuse eye/spider "
-             "sections remain WHITE",
-             meshNameIn.c_str(), tinted, kTintR, kTintG, kTintB);
-    }
-
-    // -----------------------------------------------------------------------
-    //  VENOM_EDDIE permanent purple-blue body tint
-    // -----------------------------------------------------------------------
-    // The reference build uses a dark purple-blue symbiote body.  Make that
-    // colour deterministic at the mesh level instead of depending on whichever
-    // FBX texture/fallback happened to win.  This is a MATERIAL multiplier, not
-    // a replacement texture, so UV detail, ink/toon shading and highlights stay.
-    //
-    // RGB was chosen to reproduce the uploaded reference under the game's normal
-    // character lighting: (0.58, 0.36, 0.72).  The engine side clones the
-    // material before changing field_28, preventing shared mouth/head materials
-    // from being recoloured accidentally.  Section 11 is Eddie's human head and
-    // is always excluded.  Explicit forceWhite sections also stay white.
-    if (venomEddieAsset) {
-        constexpr float kTintR = 0.58f;
-        constexpr float kTintG = 0.36f;
-        constexpr float kTintB = 0.72f;
-        unsigned tinted = 0;
-        for (size_t si = 0; si < out.size(); ++si) {
-            if (si == 11)                              // Eddie human head
-                continue;
-            if (!out[si]) {
-                BuiltSection t;
-                t.keepGeometry = true;                 // colour-only carrier
-                t.texMode = sc.cfg.tex;                // preserve texture= policy
-                t.source = "VENOM_EDDIE permanent purple-blue tint";
-                out[si] = std::move(t);
-            }
-            BuiltSection &b = *out[si];
-            if (b.hide || b.forceWhite)
-                continue;
-            b.permanentTint = true;
-            b.tintRGBA[0] = kTintR;
-            b.tintRGBA[1] = kTintG;
-            b.tintRGBA[2] = kTintB;
-            b.tintRGBA[3] = 1.0f;
-
-            // The screenshot's white shoulder/cocoon piece is a BLANK material,
-            // not a separate white texture. Mark every non-head VENOM_EDDIE
-            // section as eligible; ngl.cpp applies this only when field_1C is
-            // actually null, so textured purple body pieces are unaffected.
-            // A red+blue-heavy multiplier produces the requested pink/blue
-            // violet while preserving the character shader's toon lighting.
-            b.venomEddieBlankTint = true;
-            b.blankTintRGBA[0] = 0.78f;
-            b.blankTintRGBA[1] = 0.24f;
-            b.blankTintRGBA[2] = 0.98f;
-            b.blankTintRGBA[3] = 1.0f;
-            ++tinted;
-        }
-        logf("[modmesh] %s: permanent VENOM_EDDIE body tint enabled on %u "
-             "section(s): RGB %.2f %.2f %.2f; blank white/reveal pieces use "
-             "PINK-BLUE RGB 0.78 0.24 0.98 (section 11/head excluded)",
-             meshNameIn.c_str(), tinted, kTintR, kTintG, kTintB);
     }
 
     // -----------------------------------------------------------------------

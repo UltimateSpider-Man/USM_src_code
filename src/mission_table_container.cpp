@@ -94,11 +94,23 @@ bool mission_condition::get_key_po(int instance, po *p) const
 
 bool mission_condition::applies_to_current_hero() const
 {
-    assert(g_world_ptr->get_hero_ptr( 0 ) != nullptr);
+    if (g_world_ptr == nullptr)
+    {
+        return false;
+    }
 
-    assert(bit_cast<actor*>(g_world_ptr->get_hero_ptr( 0 ))->get_player_controller() != nullptr);
+    auto *hero = bit_cast<actor *>(g_world_ptr->get_hero_ptr(0));
+    if (hero == nullptr)
+    {
+        return false;
+    }
 
-    auto *v8 = bit_cast<actor*>(g_world_ptr->get_hero_ptr( 0 ))->get_player_controller();
+    auto *v8 = hero->get_player_controller();
+    if (v8 == nullptr)
+    {
+        return false;
+    }
+
     auto v15 = v8->m_hero_type;
     if ( v15 == 1 )
     {

@@ -49,17 +49,11 @@ void mem_dealloc(void *a1, size_t Size) {
 
 //0x0058EC30
 void *arch_memalign_internal(size_t Alignment, size_t Size) {
-    if constexpr (1) {
-        void *result = _aligned_malloc(Size, Alignment);
-        void *v3 = result;
-        if (result != nullptr) {
-            result = v3;
-            dword_965EC0() += _msize(*(void **) (((unsigned int) result & 0xFFFFFFFC) - 4));
-        }
-        return result;
-    } else {
-        return bit_cast<void *>(CDECL_CALL(0x0058EC30, Alignment, Size));
-    }
+    // Keep aligned allocations on the retail executable's MSVCR71 heap.
+    // This function is also installed at retail call sites, so using the
+    // injected DLL's CRT here would make the retail teardown free the block
+    // through a different heap.
+    return bit_cast<void *>(CDECL_CALL(0x0058EC30, Alignment, Size));
 }
 
 void mem_on_first_allocation() {
@@ -92,10 +86,10 @@ void *arch_memalign(size_t Alignment, size_t Size) {
 }
 
 void mem_freealign(void *Memory) {
-    if (Memory != nullptr) {
-        dword_965EC0() -= _msize(*(void **) (((unsigned int) Memory & 0xFFFFFFFC) - 4));
-        _aligned_free(Memory);
-    }
+    // arch_memalign() delegates to the retail allocator, so its matching
+    // retail free must be used as well. Crossing from MSVCR71 to the injected
+    // DLL's msvcrt heap corrupts mission reload and shutdown.
+    CDECL_CALL(0x0058EC80, Memory);
 }
 
 void mem_print_stats(const char *a1) {
