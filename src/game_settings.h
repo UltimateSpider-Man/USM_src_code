@@ -120,3 +120,6 @@ struct game_settings {
 };
 
 extern void game_settings_patch();
+extern void game_settings_continue_hero_patch();
+extern void game_settings_request_continue_hero_override();
+extern void game_settings_cancel_continue_hero_override();

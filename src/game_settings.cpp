@@ -18,9 +18,68 @@
 #include "variables.h"
 #include "wds.h"
 
+#ifdef OPENUSM_XBPACK_V10
+#include "region.h"
+#include "terrain.h"
+#endif
+
 #include <cassert>
 
 VALIDATE_SIZE(game_settings, 0x4CCu);
+
+namespace
+{
+bool continue_hero_override_pending = false;
+#ifdef OPENUSM_XBPACK_V10
+game_settings *pending_district_restore = nullptr;
+
+bool restore_v10_saved_district(game_settings *settings)
+{
+    // Xbox load_game finishes loading the city before option export. The PC
+    // loader exports earlier, while its hero slot is still empty.
+    if (g_game_ptr == nullptr || !g_game_ptr->flag.level_is_loaded ||
+        g_world_ptr == nullptr || g_world_ptr->the_terrain == nullptr ||
+        g_world_ptr->get_hero_ptr(0) == nullptr) {
+        return false;
+    }
+
+    auto *ter = g_world_ptr->the_terrain;
+    // The native lookup returns an unsigned short in AX (not all EAX).
+    const auto index = static_cast<uint16_t>(THISCALL(
+        0x0054F670, ter, &settings->field_340.m_district_name));
+    if (index != 0xFFFF && index < ter->get_num_regions())
+    {
+        auto *reg = ter->get_region(index);
+        if (reg != nullptr)
+        {
+            if (reg->is_locked()) {
+                ter->unlock_district(reg->get_district_id());
+            }
+            // PC +0xA4 corresponds to Xbox region +0xB4.
+            const vector3d position = reg->field_A4;
+            g_world_ptr->sub_530460(position, 0, false);
+            sp_log("[xbpack] restored saved district %.32s at %.3f %.3f %.3f",
+                   settings->field_340.m_district_name.to_string(),
+                   position.x, position.y, position.z);
+        }
+    }
+    return true;
+}
+#endif
+}
+
+void game_settings_request_continue_hero_override()
+{
+    continue_hero_override_pending = true;
+}
+
+void game_settings_cancel_continue_hero_override()
+{
+    continue_hero_override_pending = false;
+#ifdef OPENUSM_XBPACK_V10
+    pending_district_restore = nullptr;
+#endif
+}
 
 #if USE_CXX_CONSTRUCTOR
 
@@ -133,6 +192,12 @@ void game_settings::frame_advance(Float a2)
         if (this->field_4C2 && ++this->field_4C8 > 2) {
             this->load_game(this->m_slot_num);
         }
+#ifdef OPENUSM_XBPACK_V10
+        if (pending_district_restore == this && !this->field_4C2 &&
+            restore_v10_saved_district(this)) {
+            pending_district_restore = nullptr;
+        }
+#endif
 
     }
     else
@@ -158,6 +223,14 @@ void game_settings::export_game_options()
         v2->disable_vibration();
     }
 
+#ifdef OPENUSM_XBPACK_V10
+    // Xbox 0x0011E23C..0x0011E2B2 restores the saved district's spawn
+    // position. V10 has no gv_hero_spawn_point; gv_hero_restart_pos is a
+    // different script value and must not substitute for that PC-only name.
+    if (!restore_v10_saved_district(this) && continue_hero_override_pending) {
+        pending_district_restore = this;
+    }
+#else
     if (g_world_ptr->get_hero_ptr(0) != nullptr)
     {
         mString a1{"gv_hero_spawn_point"};
@@ -166,6 +239,7 @@ void game_settings::export_game_options()
 
         g_world_ptr->sub_530460(*v3, 0, 0);
     }
+#endif
 }
 
 void game_settings::export_game_settings()
@@ -242,17 +316,42 @@ int game_settings::load()
 
 void game_settings::load_game(int slot_num)
 {
+#ifdef OPENUSM_XBPACK_V10
+    if (!this->field_4C2) {
+        pending_district_restore = nullptr;
+    }
+#endif
+    THISCALL(0x0057F410, this, slot_num);
 
-        THISCALL(0x0057F410, this, slot_num);
-    
+    // Main-menu Continue marks a one-shot override after its first-stage load
+    // starts.  The retail routine then copies game_data_meat (including its
+    // saved hero name) on this second call, so apply HERO_NAME only after that
+    // copy completes.  Direct slot/debug loads keep their saved hero.
+    if (!this->field_4C2 && continue_hero_override_pending)
+    {
+        continue_hero_override_pending = false;
+
+        auto *configured_hero = os_developer_options::instance->get_hero_name();
+        if (configured_hero != nullptr && configured_hero->c_str()[0] != '\0')
+        {
+            this->field_340.m_hero_name = fixedstring<8>{configured_hero->c_str()};
+        }
+    }
 }
 
 
 
 void game_settings::load_most_recent_game() 
 {
-
-   THISCALL(0x0057F580, this);
+    // Match retail 0x0057F580, but route the selected slot through this
+    // translation unit's two-stage wrapper.  That guarantees a main-menu
+    // Continue request is still visible when the saved game_data_meat is
+    // copied on the completion call.
+    const int slot_num = THISCALL(0x00573640, this);
+    if (slot_num >= 0)
+    {
+        this->load_game(slot_num);
+    }
 }
 
 int *GetSystemDate(int *out) {
@@ -484,12 +583,39 @@ bool game_settings::get_num(const resource_key &att, float &a3, bool a4) const
     }
 }
 
-void game_settings_patch()
+void game_settings_continue_hero_patch()
 {
     {
         FUNC_ADDRESS(address, &game_settings::frame_advance);
         REDIRECT(0x0055D770, address);
     }
+#ifdef OPENUSM_XBPACK_V10
+    // load_game and the other native option-export callers must all use the
+    // V10 district policy. Refuse an unknown executable prologue.
+    constexpr uintptr_t export_options = 0x00579A60;
+    constexpr uint8_t expected[] = {0x64, 0xA1, 0x00, 0x00, 0x00, 0x00};
+    static bool installed = false;
+    if (!installed)
+    {
+        if (std::memcmp(reinterpret_cast<const void *>(export_options),
+                        expected, sizeof(expected)) == 0)
+        {
+            FUNC_ADDRESS(address, &game_settings::export_game_options);
+            SET_JUMP(export_options, address);
+            installed = true;
+            sp_log("[xbpack] V10 saved-district option export installed");
+        }
+        else
+        {
+            sp_log("[xbpack] V10 option export rejected: unexpected native prologue");
+        }
+    }
+#endif
+}
+
+void game_settings_patch()
+{
+    game_settings_continue_hero_patch();
 
     {
         FUNC_ADDRESS(address, &game_settings::set_num);
