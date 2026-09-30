@@ -19,7 +19,11 @@ void nglDxSetTexture(uint32_t a1, nglTexture *Tex, uint8_t a3, int a4)
 {
     TRACE("nglDxSetTexture");
 
+#ifdef OPENUSM_XBPACK_V10
+    if constexpr (1)
+#else
     if constexpr (0)
+#endif
     {
         assert(Tex != nullptr && "NULL texture pointer.");
 
@@ -65,7 +69,7 @@ void nglDxSetTexture(uint32_t a1, nglTexture *Tex, uint8_t a3, int a4)
                 NGLTEX_GET_FORMAT(v5->m_format) == 7)
             {
                 for (auto v11 = 0u; v11 < v5->m_num_palettes; ++v11) {
-                    v5->Frames[v11]->field_34 |= 8u;
+                    v5->PaletteFrames[v11].field_34 |= 8u;
                 }
 
                 v5->DXTexture->lpVtbl->LockRect(v5->DXTexture, 0, &v5->field_24, 0, 0);
@@ -198,4 +202,10 @@ HRESULT nglDxUnlockTexture(nglTexture *Tex)
 
 void ngl_dx_texture_patch()
 {
+#ifdef OPENUSM_XBPACK_V10
+    // The prerelease executable's stock binder uploads the raw Xbox palette
+    // bytes and loses the repaired alpha channel. Keep other executable modes
+    // on their native binder; v10 uses the local D3D9 expansion above.
+    SET_JUMP(0x007754B0, nglDxSetTexture);
+#endif
 }

@@ -2,11 +2,16 @@
 
 #include <common.h>
 #include <func_wrapper.h>
+#include <game.h>
 #include <log.h>
 #include <matrix4x3.h>
 #include <mstring.h>
 #include <ngl.h>
 #include <ngl_mesh.h>
+#include <ngl_dx_palette.h>
+#include <ngl_dx_texture.h>
+
+void ngl_dx_texture_patch();
 #include <trace.h>
 #include <variables.h>
 #include <vtbl.h>
@@ -20,6 +25,12 @@
 #include <list.hpp>
 
 #include <d3dx9shader.h>
+
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+// Defined beside the importer registry in ngl.cpp. Its temporary mesh/pose
+// views call the untouched retail shader upload and leave gameplay bones alone.
+extern bool modSetupRetargetedVShaderBones(int registerBase, nglMeshNode *, nglMeshSection *);
+#endif
 
 Var<IDirect3DVertexDeclaration9 *[1]> dword_9738E0 { 0x009738E0 };
 
@@ -203,19 +214,33 @@ std::vector<DWORD> CompilePShader(const char *file_name)
 
     const char *profile = "ps_1_1";
 
-    if (D3DXCompileShaderFromFile(file_name,
+    const HRESULT compile_result = D3DXCompileShaderFromFile(file_name,
                                   nullptr,
                                   nullptr,
                                   "main",
                                   profile,
-                                  D3DXSHADER_USE_LEGACY_D3DX9_31_DLL,
+                                  0,
                                   &pShader,
                                   &error_messages,
-                                  nullptr) != D3D_OK) {
-        sp_log("%s",
-               static_cast<const char *>(error_messages->lpVtbl->GetBufferPointer(error_messages)));
-
-        error_messages->lpVtbl->Release(error_messages);
+                                  nullptr);
+    if (compile_result != D3D_OK) {
+        const char *compiler_message = error_messages != nullptr
+            ? static_cast<const char *>(
+                error_messages->lpVtbl->GetBufferPointer(error_messages))
+            : "(no compiler message)";
+        if (FILE *diagnostic = fopen("openusm_shader_error.log", "a")) {
+            fprintf(diagnostic, "CompilePShader failed: hr=0x%08lX file=%s\n%s\n",
+                    static_cast<unsigned long>(compile_result), file_name,
+                    compiler_message);
+            fclose(diagnostic);
+        }
+        if (error_messages != nullptr) {
+            sp_log("%s", compiler_message);
+            error_messages->lpVtbl->Release(error_messages);
+        } else {
+            sp_log("D3DXCompileShaderFromFile failed without an error message: %s",
+                   file_name);
+        }
 
         assert(0);
     }
@@ -325,6 +350,9 @@ void nglSetupVShaderBonesDX(int a5, nglMeshNode *MeshNode, nglMeshSection *Secti
     }
     else
     {
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+        if (!modSetupRetargetedVShaderBones(a5, MeshNode, Section))
+#endif
         CDECL_CALL(0x00772810, a5, MeshNode, Section);
     }
 
@@ -365,20 +393,34 @@ std::vector<DWORD> CompileVShader(const char *file_name, const D3DXMACRO *define
 
     const char *profile = "vs_1_1";
 
-    if (D3DXCompileShaderFromFile(file_name,
+    const HRESULT compile_result = D3DXCompileShaderFromFile(file_name,
                                   defines,
                                   nullptr,
                                   "main",
                                   profile,
-                                  D3DXSHADER_USE_LEGACY_D3DX9_31_DLL,
+                                  0,
                                   &pShader,
                                   &error_messages,
-                                  nullptr) != D3D_OK)
+                                  nullptr);
+    if (compile_result != D3D_OK)
     {
-        sp_log("%s",
-               static_cast<const char *>(error_messages->lpVtbl->GetBufferPointer(error_messages)));
-
-        error_messages->lpVtbl->Release(error_messages);
+        const char *compiler_message = error_messages != nullptr
+            ? static_cast<const char *>(
+                error_messages->lpVtbl->GetBufferPointer(error_messages))
+            : "(no compiler message)";
+        if (FILE *diagnostic = fopen("openusm_shader_error.log", "a")) {
+            fprintf(diagnostic, "CompileVShader failed: hr=0x%08lX file=%s\n%s\n",
+                    static_cast<unsigned long>(compile_result), file_name,
+                    compiler_message);
+            fclose(diagnostic);
+        }
+        if (error_messages != nullptr) {
+            sp_log("%s", compiler_message);
+            error_messages->lpVtbl->Release(error_messages);
+        } else {
+            sp_log("D3DXCompileShaderFromFile failed without an error message: %s",
+                   file_name);
+        }
         assert(0);
     }
 
@@ -1266,6 +1308,19 @@ int __fastcall CAssembler_Assemble(
 
 void ngl_dx_shader_patch()
 {
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+    // The two retail calls cover usperson and uspersonsolid. Redirect calls,
+    // not the upload entry, so the wrapper can safely delegate to retail.
+    REDIRECT(0x0041C5CE, nglSetupVShaderBonesDX);
+    REDIRECT(0x0041E5BE, nglSetupVShaderBonesDX);
+#endif
+#ifdef OPENUSM_XBPACK_V10
+    // Native Xbox-v10 multipalette construction must pass through the PC
+    // palette normalizer, and its frame binder must use the repaired entries.
+    SET_JUMP(0x00782950, nglCreatePalette);
+    ngl_dx_texture_patch();
+#endif
+
     REDIRECT(0x007E2BBF, d3dxtok_parse);
 
     REDIRECT(0x007E7BFE, d3dxasm_parse);
@@ -1290,4 +1345,4 @@ void ngl_dx_shader_patch()
     {
         REDIRECT(0x007E6FC6, CAssembler_DecodeRegister);
     }
-} 
+}

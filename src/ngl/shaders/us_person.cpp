@@ -7,6 +7,7 @@
 #include "comic_panels.h"
 #include "common.h"
 #include "func_wrapper.h"
+#include "game.h"
 #include "light_source.h"
 #include "log.h"
 #include "matrix4x3.h"
@@ -65,7 +66,7 @@ void CreateVertexDeclAndShaders(const D3DVERTEXELEMENT9 *elements)
         [[maybe_unused]] auto **v1 = g_pFunctions();
         auto *array_shaders = g_vertexShaders();
 
-        if constexpr (0)
+        if constexpr (1)
         {
 #include "../../shaders/us_person/0_VS.h"
 
@@ -81,13 +82,16 @@ void CreateVertexDeclAndShaders(const D3DVERTEXELEMENT9 *elements)
             nglCreateVertexDeclarationAndShader(&array_shaders[0], elements, shader.data());
         }
 
-        if constexpr (0)
+        if constexpr (1)
         {
 #include "../../shaders/us_person/1_VS.h"
 
             nglCreateVShader(elements, &array_shaders[1], 0, text);
 
-            //assert(compare_codes(v1[1], g_codes, size_codes(v1[1])));
+            // Lit single-texture person materials still need their diffuse UVs.
+            // Keep this byte-for-byte check enabled so the daylight path cannot
+            // silently regress to sampling texture coordinate (0, 0) again.
+            assert(compare_codes(v1[1], g_codes, size_codes(v1[1])));
         }
         else
         {
@@ -1782,6 +1786,11 @@ void us_person_patch()
     }
 
     REDIRECT(0x0041C5CE, nglSetupVShaderBonesDX);
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+    // The retail loader calls this patch directly; its broader DX patch may
+    // be disabled. Solid source materials need the same retargeted palette.
+    REDIRECT(0x0041E5BE, nglSetupVShaderBonesDX);
+#endif
 
     REDIRECT(0x0041171C, USPersonShaderSpace::CreatePixelShaders);
 
