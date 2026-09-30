@@ -8,7 +8,7 @@
 #                                  byte-identical to the retail USM.exe).
 #     • build/binkw32.dll        — the OpenUSM mod-loader (release)
 #     • build/binkw32_prelib.dll — the OpenUSM mod-loader (prerelease;
-#                                  built from main_beta.cpp). Shipped under
+#                                  built from Ultimate_prerelease.cpp). Shipped under
 #                                  the name USM_prelib.dll.
 #     • build/USM.dll            — stripped, shippable copy of binkw32.dll
 #     • build/USM.exe            — USM_original.exe with a stripped
@@ -18,8 +18,8 @@
 #                                  compiled from USMITA.c (optional).
 #     • build/Ultimate_prerelease_original.exe — PRERELEASE variant,
 #                                  compiled from Ultimate_prerelease.c's
-#                                  rawData[5984512] byte array
-#                                  (5,984,512 bytes = 5.71 MiB — note this
+#                                  rawData[5947392] byte array
+#                                  (5,947,392 bytes = 5.67 MiB — note this
 #                                  differs from the 5,926,912-byte retail
 #                                  exes). Built only if the source is present.
 #     • build/USM_prelib.dll     — binkw32_prelib.dll under its shipping name.
@@ -32,19 +32,20 @@
 #   The only DLLs stripped by this build are binkw32.dll (for USM.exe) and
 #   binkw32_prelib.dll (for Ultimate_prerelease.exe).
 #
-#   Auto-deploys every output to ../Ultimate Spider-Man/ if that directory
-#   exists next to the source tree. Stock DLLs (binkw32, d3dx9_24, dsound,
-#   MSVCP71, msvcr71, xerces-c_2_3_0) in that folder are left untouched.
+#   Optional auto-deployment is controlled by USM_AUTO_DEPLOY and defaults to
+#   OFF. When enabled, eligible outputs are copied to ../Ultimate Spider-Man/
+#   if that directory exists next to the source tree. Stock DLLs (binkw32,
+#   d3dx9_24, dsound, MSVCP71, msvcr71, xerces-c_2_3_0) are left untouched.
 #
 #   Required layout:
 #
 #       OpenUSM/
 #       ├── CMakeLists.txt                 ← this file
-#       ├── main_final.cpp                 ← binkw32 entry point
-#       ├── main_beta.cpp                  ← binkw32_prelib entry point
+#       ├── Ultimate_final.cpp                 ← binkw32 entry point
+#       ├── Ultimate_prerelease.cpp                  ← binkw32_prelib entry point
 #       ├── USM.c                          ← rawData[5926912] blob (REQUIRED)
 #       ├── USMITA.c                       ← rawData[5926912] blob — ITA variant (OPTIONAL)
-#       ├── Ultimate_prerelease.c          ← rawData[5984512] blob — PRERELEASE variant (OPTIONAL)
+#       ├── Ultimate_prerelease.c          ← rawData[5947392] blob — PRERELEASE variant (OPTIONAL)
 #       ├── emit_usm_exe.c                 ← host-tool writer       (REQUIRED)
 #       ├── src/                           ← parent-project libraries
 #       ├── cmake/
@@ -52,9 +53,9 @@
 #       │   └── report_size.cmake          ← size reporter for UPX step
 #       ├── tools/
 #       │   └── dll2exe.exe                ← DLL→EXE injector
-#       ├── third_party/{glm,googletest}/  ← (optional)
+#       ├── third_party/{glm,googletest}/  ← googletest retained for reference
 #       ├── assimp/                        ← Assimp source tree
-#       └── test/                          ← (optional, ENABLE_TESTS)
+#       └── test/                          ← retained legacy test sources
 #
 #   Build:
 #
@@ -67,7 +68,9 @@
 #     -DUSE_FSTREAM=ON               -DUSE_FSTREAM in binkw32/binkw32_prelib
 #     -DCHECK_STRUCT_SIZES=OFF       disable CHECK_STRUCT_SIZES define
 #     -DTARGET_XBOX=ON               build the Xbox variant of mash
-#     -DENABLE_TESTS=OFF             skip googletest/CTest
+#     -DENABLE_TESTS=ON              register ctest runtime tests (tools/runtime)
+#                                    against -DUSM_TEST_GAME_DIR=<install>;
+#                                    legacy unit tests are not wired to this build
 #     -DUSM_C_SOURCE=<path>          override USM.c location
 #     -DUSM_C_WRITER_SOURCE=<path>   override emit_usm_exe.c location
 #     -DUSMITA_C_SOURCE=<path>       override USMITA.c location (ITA variant)
@@ -168,12 +171,86 @@ list(APPEND flags
 project(USM-dev)
 
 
+
+# The rawData[] writers are build-time tools and must run on the host.  In a
+# WSL cross build CMAKE_C_COMPILER is i686-w64-mingw32-gcc, which produces a
+# Windows .exe that cannot be treated as a native Linux build tool.  Allow an
+# explicit override, otherwise use the target compiler only on Windows hosts
+# and locate a native C compiler everywhere else.
+set(OPENUSM_HOST_C_COMPILER "" CACHE FILEPATH
+    "Host C compiler used for rawData[] emitter tools")
+if(OPENUSM_HOST_C_COMPILER)
+    set(_OPENUSM_HOST_C_COMPILER "${OPENUSM_HOST_C_COMPILER}")
+elseif(CMAKE_HOST_WIN32)
+    set(_OPENUSM_HOST_C_COMPILER "${CMAKE_C_COMPILER}")
+else()
+    find_program(_OPENUSM_HOST_C_COMPILER
+        NAMES cc gcc clang
+        NO_CMAKE_FIND_ROOT_PATH)
+    if(NOT _OPENUSM_HOST_C_COMPILER)
+        message(FATAL_ERROR
+            "A native host C compiler is required for the rawData[] emitter "
+            "tools. Set -DOPENUSM_HOST_C_COMPILER=<path>.")
+    endif()
+endif()
+
+if(CMAKE_HOST_WIN32)
+    set(_OPENUSM_HOST_EXECUTABLE_SUFFIX ".exe")
+else()
+    set(_OPENUSM_HOST_EXECUTABLE_SUFFIX "")
+endif()
+
+function(openusm_add_host_emitter target_name output_path raw_source writer_source)
+    get_filename_component(_emitter_dir "${output_path}" DIRECTORY)
+    add_custom_command(
+        OUTPUT "${output_path}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_emitter_dir}"
+        COMMAND "${_OPENUSM_HOST_C_COMPILER}" -O0 ${ARGN}
+                "${raw_source}" "${writer_source}" -o "${output_path}"
+        DEPENDS "${raw_source}" "${writer_source}"
+        COMMENT "Building host-native emitter ${target_name}"
+        VERBATIM
+        COMMAND_EXPAND_LISTS)
+    add_custom_target(${target_name} DEPENDS "${output_path}")
+endfunction()
+
+option(ULTIMATE_RELEASE_XBPACK_MODE
+    "Build ultimate_release for Xbox XBPACK data instead of retail PC PCPACK data"
+    OFF)
+
+
 if(MINGW)
     # Drop the "lib" prefix on MinGW so shared libs come out as
     # binkw32.dll / binkw32_prelib.dll — not libbinkw32.dll etc.
     set(CMAKE_SHARED_LIBRARY_PREFIX "")
     set(CMAKE_STATIC_LIBRARY_PREFIX "")
     set(CMAKE_SHARED_MODULE_PREFIX  "")
+endif()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#   ultimate_release_original.exe — standalone release variant
+# ═══════════════════════════════════════════════════════════════════════
+set(ultimate_release_C_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/Ultimate_release.c"
+    CACHE FILEPATH "Path to Ultimate_release.c rawData[] blob")
+set(_OUT_ultimate_release
+    "${CMAKE_BINARY_DIR}/ultimate_release_original.exe")
+set(_ULTIMATE_RELEASE_WRITER "${CMAKE_CURRENT_SOURCE_DIR}/emit_usm_exe.c")
+if(EXISTS "${ultimate_release_C_SOURCE}" AND EXISTS "${_ULTIMATE_RELEASE_WRITER}")
+    set(_ULTIMATE_RELEASE_EMITTER
+        "${CMAKE_BINARY_DIR}/emit_ultimate_release_exe_build/emit_ultimate_release_exe${_OPENUSM_HOST_EXECUTABLE_SUFFIX}")
+    openusm_add_host_emitter(emit_ultimate_release_exe_host
+        "${_ULTIMATE_RELEASE_EMITTER}"
+        "${ultimate_release_C_SOURCE}"
+        "${_ULTIMATE_RELEASE_WRITER}")
+    add_custom_command(OUTPUT "${_OUT_ultimate_release}"
+        COMMAND "${_ULTIMATE_RELEASE_EMITTER}" "${_OUT_ultimate_release}"
+        DEPENDS emit_ultimate_release_exe_host
+                "${ultimate_release_C_SOURCE}" "${_ULTIMATE_RELEASE_WRITER}"
+        COMMENT "Compiling ultimate_release_original.exe from Ultimate_release.c"
+        VERBATIM)
+    add_custom_target(ultimate_release_image ALL DEPENDS "${_OUT_ultimate_release}")
 endif()
 
 
@@ -185,7 +262,74 @@ option(USE_GLM            ""                                             OFF)
 option(USE_FSTREAM        ""                                             OFF)
 option(CHECK_STRUCT_SIZES ""                                             ON)
 option(TARGET_XBOX        ""                                             OFF)
-option(ENABLE_TESTS       ""                                             ON)
+option(ENABLE_TESTS "Enable the retained legacy unit tests (currently unavailable)" OFF)
+option(OPENUSM_BUILD_MESH_PROBES "Build standalone FBX and PCMESH validation tools" OFF)
+
+if(OPENUSM_BUILD_MESH_PROBES)
+    foreach(probe mod_mesh_import_probe mod_mesh_import_build_probe mod_mesh_swap_probe mod_pcmesh_archive_probe mod_pcmesh_source_probe mod_mesh_aliases_probe mod_mesh_retarget_probe mod_pcskel_source_probe mod_polytube_attachment_probe mod_mesh_attachment_geometry_probe mod_nal_config_probe mod_pcanim_source_probe mod_mesh_custom_probe mod_mesh_texture_source_probe mod_mesh_donor_pose_probe
+        mod_mesh_donor_surface_probe mod_mesh_axes_probe mod_mesh_axes_import_probe
+        mod_mesh_static_probe mod_mesh_static_import_probe mod_mesh_foreign_rig_probe mod_mesh_foreign_import_probe mod_miles_skin_probe)
+        add_executable(${probe} test/${probe}.cpp)
+        target_link_options(${probe} PRIVATE -static-libgcc -static-libstdc++)
+    endforeach()
+    add_executable(build_miles_skin tools/build_miles_skin.cpp)
+    add_executable(export_miles_donor_weights tools/export_miles_donor_weights.cpp)
+    target_link_options(build_miles_skin PRIVATE -static-libgcc -static-libstdc++)
+    target_link_options(export_miles_donor_weights PRIVATE -static-libgcc -static-libstdc++)
+    enable_testing()
+    add_test(NAME mesh_aliases_validation COMMAND mod_mesh_aliases_probe)
+    add_test(NAME mesh_retarget_validation COMMAND mod_mesh_retarget_probe)
+    add_test(NAME pcskel_source_validation COMMAND mod_pcskel_source_probe)
+    add_test(NAME pcmesh_scope_validation COMMAND mod_pcmesh_source_probe)
+    add_test(NAME polytube_attachment_validation COMMAND mod_polytube_attachment_probe)
+    add_test(NAME mesh_attachment_geometry_validation COMMAND mod_mesh_attachment_geometry_probe)
+    add_test(NAME nal_config_validation COMMAND mod_nal_config_probe)
+    add_test(NAME pcanim_source_validation COMMAND mod_pcanim_source_probe)
+    add_test(NAME custom_fbx_geometry_validation COMMAND mod_mesh_custom_probe)
+    add_test(NAME custom_fbx_texture_validation COMMAND mod_mesh_texture_source_probe)
+    add_test(NAME custom_fbx_donor_pose_validation COMMAND mod_mesh_donor_pose_probe)
+    add_test(NAME custom_fbx_donor_surface_validation COMMAND mod_mesh_donor_surface_probe)
+    add_test(NAME fbx_axes_validation COMMAND mod_mesh_axes_probe)
+    add_test(NAME fbx_axes_import_validation COMMAND mod_mesh_axes_import_probe)
+    add_test(NAME static_mesh_layout_validation COMMAND mod_mesh_static_probe)
+    add_test(NAME static_mesh_import_validation COMMAND mod_mesh_static_import_probe)
+    add_test(NAME foreign_rig_validation COMMAND mod_mesh_foreign_rig_probe)
+    add_test(NAME foreign_fbx_import_validation COMMAND mod_mesh_foreign_import_probe)
+    add_test(NAME miles_skin_validation COMMAND mod_miles_skin_probe)
+    if(CMAKE_HOST_WIN32)
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if(Python3_Interpreter_FOUND)
+            enable_testing()
+            add_test(NAME pcmesh_archive_validation
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/test/verify_pcmesh_archive.py"
+                    "$<TARGET_FILE:mod_pcmesh_archive_probe>")
+        endif()
+    endif()
+endif()
+
+# ENABLE_TESTS registers bounded runtime tests (tools/runtime/runtime_test.ps1)
+# that deploy a built image into a real game install, run it windowed and
+# restore the install afterwards. The retained legacy unit-test sources still
+# link the removed monolithic 'usm' target and are not part of this build.
+set(USM_TEST_GAME_DIR "C:/Users/devusm1000/Desktop/Ultimate Spider-Man (20 june 2005) PC"
+    CACHE PATH "XBPACK v10 prerelease install used by the ENABLE_TESTS runtime tests (Windows path)")
+set(USM_TEST_RELEASE_GAME_DIR ""
+    CACHE PATH "Optional retail install for an ultimate_release.exe runtime test (empty = skip)")
+set(USM_TEST_SECONDS "90" CACHE STRING "Duration of each runtime test, in seconds")
+if(ENABLE_TESTS)
+    find_program(USM_POWERSHELL
+        NAMES powershell.exe powershell
+        PATHS "/mnt/c/Windows/System32/WindowsPowerShell/v1.0"
+              "C:/Windows/System32/WindowsPowerShell/v1.0"
+        NO_CMAKE_FIND_ROOT_PATH)
+    if(NOT USM_POWERSHELL)
+        message(FATAL_ERROR "ENABLE_TESTS needs Windows PowerShell (powershell.exe) to drive the game")
+    endif()
+    enable_testing()
+    message(STATUS "Runtime tests enabled against ${USM_TEST_GAME_DIR} (${USM_TEST_SECONDS}s each)")
+endif()
+
 
 if(CHECK_STRUCT_SIZES)
     add_compile_definitions(CHECK_STRUCT_SIZES)
@@ -207,6 +351,11 @@ endif()
 #   Core libraries
 # ─────────────────────────────────────────────────────────────────────────
 
+
+if (TARGET_XBOX)
+    message(FATAL_ERROR "TARGET_XBOX and the PC XBPACK loader variants are mutually exclusive")
+endif()
+
 add_library(utility src/utility/trace.cpp)
 target_include_directories(utility PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/utility>)
@@ -216,35 +365,136 @@ target_include_directories(variables PUBLIC "src/variables")
 target_link_libraries(variables PUBLIC utility)
 
 
-if(TARGET_XBOX)
-    add_library(mash src/mash/xbox/src/mash_info_struct.cpp)
-    target_include_directories(mash PUBLIC "src/mash/xbox/include/")
-else()
-    add_library(mash src/mash/pc/src/mash_info_struct.cpp)
-    target_include_directories(mash PUBLIC "src/mash/pc/include")
-endif()
+# The retail PC loader must use the game's native one-buffer mash ABI.  Do not
+# share this target with either XBPACK loader: the Xbox mash_info_struct is a
+# different size and interprets the original PC object's fields differently.
+add_library(mash src/mash/pc/src/mash_info_struct.cpp)
+target_include_directories(mash PUBLIC "src/mash/pc/include/")
 target_include_directories(mash PUBLIC "src" "include")
 target_compile_options   (mash PRIVATE ${flags})
 target_link_libraries    (mash PUBLIC utility variables)
+
+# The later Xbox build uses the v14 two-buffer mash layout.
+add_library(mash_xbpack src/mash/xbox/src/mash_info_struct.cpp)
+target_include_directories(mash_xbpack PUBLIC "src/mash/xbox/include/")
+target_include_directories(mash_xbpack PUBLIC "src" "include")
+target_compile_options   (mash_xbpack PRIVATE ${flags})
+target_compile_definitions(mash_xbpack PRIVATE OPENUSM_XBPACK_MODE)
+target_link_libraries    (mash_xbpack PUBLIC utility variables)
+
+# The June 2005 prerelease uses the older XBPACK v10 mash header layout.  Keep
+# that ABI isolated from both the retail PC and later Xbox build loaders.
+add_library(mash_prelib src/mash/xbox/src/mash_info_struct.cpp)
+target_include_directories(mash_prelib PUBLIC "src/mash/xbox/include/")
+target_include_directories(mash_prelib PUBLIC "src" "include")
+target_compile_options   (mash_prelib PRIVATE ${flags})
+target_compile_definitions(mash_prelib PRIVATE
+    OPENUSM_XBPACK_MODE
+    OPENUSM_XBPACK_V10)
+target_link_libraries    (mash_prelib PUBLIC utility variables)
 
 
 # ─────────────────────────────────────────────────────────────────────────
 #   binkw32.dll (release) + binkw32_prelib.dll (prerelease) — OpenUSM loaders
 #
 #   Both share the same ${SRC} glob (the in-process mod-loader code). They
-#   differ only in entry point: main_final.cpp vs. main_beta.cpp.
+#   differ only in entry point: Ultimate_final.cpp vs. Ultimate_prerelease.cpp.
 # ─────────────────────────────────────────────────────────────────────────
 
-file(GLOB SRC "./src/*.cpp" "./src/*.h")
+# The original openusm fork contributed a number of incomplete translation
+# units that are useful as reference source, but were never part of the merged
+# xbpack-mode build.  Keep them in the unified tree without letting broad
+# source globs silently add them to production targets.
+set(OPENUSM_RETAINED_LEGACY_CPP
+    "src/actor_interface.cpp"
+    "src/ai_state_car.cpp"
+    "src/ai_std_avoidance.cpp"
+    "src/ai_voice_box_inode.cpp"
+    "src/als_adv_mocomps.cpp"
+    "src/anim_event.cpp"
+    "src/camera_setup_entry.cpp"
+    "src/charanimtype/arbitrarypocharcomp.cpp"
+    "src/charanimtype/armikentcompdecomp.cpp"
+    "src/charanimtype/armikposedesc.cpp"
+    "src/charanimtype/armstdposedesc.cpp"
+    "src/charanimtype/character_anim_inst.cpp"
+    "src/charanimtype/charcompressor.cpp"
+    "src/charanimtype/fakerootentcompdecomp.cpp"
+    "src/charanimtype/fing52knuckcurlentcompdecomp.cpp"
+    "src/charanimtype/fing52knuckcurlposedesc.cpp"
+    "src/charanimtype/fing5curlentcompdecomp.cpp"
+    "src/charanimtype/fing5curlposedesc.cpp"
+    "src/charanimtype/fing5redentcompdecomp.cpp"
+    "src/charanimtype/fing5reducedposedesc.cpp"
+    "src/charanimtype/finger5stdposedesc.cpp"
+    "src/charanimtype/flexiblecharcomp.cpp"
+    "src/charanimtype/floatsentcompdecomp.cpp"
+    "src/charanimtype/genericcharcomp.cpp"
+    "src/charanimtype/legsikposedesc.cpp"
+    "src/charanimtype/legsstdposedesc.cpp"
+    "src/charanimtype/quatsentcompdecomp.cpp"
+    "src/charanimtype/tentaclesposedesc.cpp"
+    "src/charanimtype/torsoheadentcompdecomp.cpp"
+    "src/charanimtype/torsoheadstdposedesc.cpp"
+    "src/chuck/vm/script_var_container.cpp"
+    "src/component.cpp"
+    "src/conglomerate_interface.cpp"
+    "src/entity_base_interface.cpp"
+    "src/entity_class_entry.cpp"
+    "src/entity_interface.cpp"
+    "src/entity_viseme_entry.cpp"
+    "src/guidance_sys.cpp"
+    "src/mVectorBasic.cpp"
+    "src/nalcomp/component_id.cpp"
+    "src/nsl/src/nsl/nslinit.cpp"
+    "src/nsl/src/nsl/nslsource.cpp"
+    "src/nugget.cpp"
+    "src/parking_marker.cpp"
+    "src/script_lib_beam.cpp"
+    "src/terrain_decal.cpp"
+    "src/tracking_panel.cpp"
+    "src/traffic_light_interface.cpp"
+)
 
-add_library(binkw32 SHARED main_final.cpp ${SRC})
-target_compile_options(binkw32 PRIVATE ${flags})
+function(openusm_filter_retained_legacy list_name)
+    set(filtered_sources)
+    foreach(source_path IN LISTS ${list_name})
+        file(RELATIVE_PATH relative_source "${CMAKE_CURRENT_SOURCE_DIR}" "${source_path}")
+        string(REPLACE "\\" "/" relative_source "${relative_source}")
+        list(FIND OPENUSM_RETAINED_LEGACY_CPP "${relative_source}" legacy_index)
+        if(legacy_index EQUAL -1)
+            list(APPEND filtered_sources "${source_path}")
+        endif()
+    endforeach()
+    set(${list_name} "${filtered_sources}" PARENT_SCOPE)
+endfunction()
 
-add_library(binkw32_prelib SHARED main_beta.cpp ${SRC})
-target_compile_options(binkw32_prelib PRIVATE ${flags})
+file(GLOB SRC CONFIGURE_DEPENDS "./src/*.cpp" "./src/*.h")
+openusm_filter_retained_legacy(SRC)
 
-add_library(binkw32_build SHARED main_build.cpp ${SRC})
-target_compile_options(binkw32_build PRIVATE ${flags})
+add_library(USM SHARED Ultimate_final.cpp ${SRC})
+target_compile_options(USM PRIVATE ${flags})
+
+
+add_library(ultimate_prerelease SHARED Ultimate_prerelease.cpp ${SRC})
+target_compile_options(ultimate_prerelease PRIVATE ${flags})
+target_compile_definitions(ultimate_prerelease PRIVATE
+    OPENUSM_XBPACK_MODE
+    OPENUSM_XBPACK_V10)
+
+add_library(ultimate_build SHARED Ultimate_build.cpp ${SRC})
+target_compile_options(ultimate_build PRIVATE ${flags})
+target_compile_definitions(ultimate_build PRIVATE OPENUSM_XBPACK_MODE)
+
+# Standalone release variant.  This is intentionally a real target (rather
+# than an ALIAS) so it can use its own entry point and produce its own DLL.
+add_library(ultimate_release SHARED Ultimate_release.cpp ${SRC})
+target_compile_options(ultimate_release PRIVATE ${flags})
+target_compile_definitions(ultimate_release PRIVATE OPENUSM_ULTIMATE_RELEASE)
+if(ULTIMATE_RELEASE_XBPACK_MODE)
+    target_compile_definitions(ultimate_release PRIVATE OPENUSM_XBPACK_MODE)
+endif()
+
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -253,12 +503,12 @@ target_compile_options(binkw32_build PRIVATE ${flags})
 
 add_library(memory "./src/memory.cpp" "./src/memory.h")
 target_compile_options    (memory PRIVATE ${flags})
-target_include_directories(memory PUBLIC  "./include/")
+target_include_directories(memory PUBLIC  "./include/" "./src/")
 target_link_libraries     (memory PUBLIC  utility)
 
 add_library(slab_allocator "./src/slab_allocator.cpp" "./src/slab_allocator.h")
 target_compile_options    (slab_allocator PRIVATE ${flags})
-target_include_directories(slab_allocator PUBLIC  "./include/")
+target_include_directories(slab_allocator PUBLIC  "./include/" "./src/")
 target_link_libraries     (slab_allocator PUBLIC  memory)
 
 
@@ -267,23 +517,27 @@ target_link_libraries     (slab_allocator PUBLIC  memory)
 # ─────────────────────────────────────────────────────────────────────────
 
 file(GLOB_RECURSE NALCOMP_SRC "./src/nalcomp/*.cpp")
+openusm_filter_retained_legacy(NALCOMP_SRC)
 add_library(nalcomp ${NALCOMP_SRC})
 target_compile_options    (nalcomp PRIVATE ${flags})
 target_include_directories(nalcomp PUBLIC  "./src/nalcomp/" "./src/")
 
 file(GLOB_RECURSE NALPANEL_SRC "./src/panels/nalpanel/*.cpp")
+openusm_filter_retained_legacy(NALPANEL_SRC)
 add_library(nalpanel ${NALPANEL_SRC})
 target_compile_options    (nalpanel PRIVATE ${flags})
 target_include_directories(nalpanel PUBLIC  "./src/panels/nalpanel/")
 target_link_libraries     (nalpanel PUBLIC  nalcomp)
 
 file(GLOB_RECURSE NSL_SRC "./src/nsl/src/nsl/*.cpp")
+openusm_filter_retained_legacy(NSL_SRC)
 add_library(nsl ${NSL_SRC})
 target_compile_options    (nsl PRIVATE ${flags})
 target_include_directories(nsl PUBLIC  "./include/" "./src/" "./src/nsl/src/nsl/")
 target_link_libraries     (nsl PUBLIC  nfl utility)
 
 file(GLOB_RECURSE NAL_SRC "./src/nal_system.cpp" "./src/nal/source/common/*.cpp")
+openusm_filter_retained_legacy(NAL_SRC)
 add_library(nal ${NAL_SRC})
 target_compile_options    (nal PRIVATE ${flags})
 target_include_directories(nal PUBLIC  "./include/" "./src/" "./src/nal/include/common/")
@@ -302,10 +556,21 @@ target_link_libraries(nalcomp PUBLIC nal)
 # ─────────────────────────────────────────────────────────────────────────
 
 file(GLOB_RECURSE SRC_CHUCK "./src/chuck/vm/*.cpp")
+openusm_filter_retained_legacy(SRC_CHUCK)
 add_library(chuck ${SRC_CHUCK})
 target_compile_options    (chuck PRIVATE ${flags})
 target_include_directories(chuck INTERFACE "./src/chuck/vm/")
 target_link_libraries     (chuck PUBLIC   slab_allocator variables)
+
+# Chuck's mashed executable records also changed in XBPACK v10.  Compile a
+# prerelease-only copy so the other loader targets keep their native layout.
+add_library(chuck_prelib ${SRC_CHUCK})
+target_compile_options    (chuck_prelib PRIVATE ${flags})
+target_compile_definitions(chuck_prelib PRIVATE
+    OPENUSM_XBPACK_MODE
+    OPENUSM_XBPACK_V10)
+target_include_directories(chuck_prelib INTERFACE "./src/chuck/vm/")
+target_link_libraries     (chuck_prelib PUBLIC slab_allocator variables)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -313,6 +578,7 @@ target_link_libraries     (chuck PUBLIC   slab_allocator variables)
 # ─────────────────────────────────────────────────────────────────────────
 
 file(GLOB_RECURSE SRC_TX "./src/tx/src/*.cpp" "./src/tx/src/*.h")
+openusm_filter_retained_legacy(SRC_TX)
 add_library(tx ${SRC_TX})
 target_compile_options    (tx PRIVATE ${flags})
 target_include_directories(tx INTERFACE "./src/tx/src/")
@@ -324,11 +590,14 @@ target_include_directories(test_tx INTERFACE "./src/tx/src/")
 target_link_libraries     (test_tx PUBLIC    utility)
 
 file(GLOB_RECURSE SRC_NFL "./src/nfl/src/*.cpp" "./src/nfl/src/*.h")
+openusm_filter_retained_legacy(SRC_NFL)
 add_library(nfl ${SRC_NFL})
 target_compile_options    (nfl PRIVATE ${flags})
 target_include_directories(nfl INTERFACE "./src/nfl/src/")
 target_link_libraries     (nfl PUBLIC    tx)
 target_link_libraries     (mash PUBLIC   nfl)
+target_link_libraries     (mash_xbpack PUBLIC nfl)
+target_link_libraries     (mash_prelib PUBLIC nfl)
 
 add_library(test_nfl ${SRC_NFL})
 target_compile_options    (test_nfl PRIVATE ${flags})
@@ -336,30 +605,35 @@ target_include_directories(test_nfl INTERFACE "./src/nfl/src/")
 target_link_libraries     (test_nfl PUBLIC    test_tx)
 
 file(GLOB_RECURSE SRC_NGL_DX "./src/ngl/src/dx/*.cpp")
+openusm_filter_retained_legacy(SRC_NGL_DX)
 add_library(ngl_dx ${SRC_NGL_DX})
 target_compile_options    (ngl_dx PRIVATE ${flags})
 target_include_directories(ngl_dx PUBLIC  "./src/ngl/include/dx" "./src/ngl/include/")
 target_link_libraries     (ngl_dx PUBLIC  psapi utility variables)
 
 file(GLOB_RECURSE SRC_NGL_SHADERS "./src/ngl/shaders/*.cpp")
+openusm_filter_retained_legacy(SRC_NGL_SHADERS)
 add_library(ngl_shaders ${SRC_NGL_SHADERS})
 target_compile_options    (ngl_shaders PRIVATE ${flags})
 target_include_directories(ngl_shaders PUBLIC  "./src/ngl/shaders")
 target_link_libraries     (ngl_shaders PUBLIC  ngl_dx)
 
 file(GLOB SRC_NGL "./src/ngl/src/*.cpp")
+openusm_filter_retained_legacy(SRC_NGL)
 add_library(ngl ${SRC_NGL})
 target_compile_options    (ngl PRIVATE ${flags})
 target_include_directories(ngl PUBLIC  "./src/ngl/include/")
 target_link_libraries     (ngl PUBLIC  ngl_dx ngl_shaders)
 
 file(GLOB SRC_CHARANIMTYPE "./src/charanimtype/*.cpp")
+openusm_filter_retained_legacy(SRC_CHARANIMTYPE)
 add_library(charanimtype ${SRC_CHARANIMTYPE})
 target_compile_options    (charanimtype PRIVATE ${flags})
 target_include_directories(charanimtype PUBLIC  "./src/charanimtype/")
 target_link_libraries     (charanimtype PUBLIC  nal ngl_dx ngl_shaders)
 
 file(GLOB_RECURSE PHYSICS_SRC "./src/physics/source/*.cpp")
+openusm_filter_retained_legacy(PHYSICS_SRC)
 add_library(physics ${PHYSICS_SRC})
 target_compile_options    (physics PRIVATE ${flags})
 target_include_directories(physics PUBLIC  "./src/physics/include/")
@@ -371,19 +645,22 @@ target_link_libraries     (physics PUBLIC  utility ngl)
 # ─────────────────────────────────────────────────────────────────────────
 
 if(USE_FSTREAM)
-    target_compile_definitions(binkw32         PUBLIC USE_FSTREAM)
-    target_compile_definitions(binkw32_prelib  PUBLIC USE_FSTREAM)
-	    target_compile_definitions(binkw32_build  PUBLIC USE_FSTREAM)
+    target_compile_definitions(USM               PUBLIC USE_FSTREAM)
+    target_compile_definitions(ultimate_release    PUBLIC USE_FSTREAM)
+    target_compile_definitions(ultimate_prerelease PUBLIC USE_FSTREAM)
+    target_compile_definitions(ultimate_build      PUBLIC USE_FSTREAM)
 endif()
 
-target_include_directories(binkw32        PUBLIC "include" "./src/nfl/src/")
-target_include_directories(binkw32_prelib PUBLIC "include" "./src/nfl/src/")
-target_include_directories(binkw32_build PUBLIC "include" "./src/nfl/src/")
+target_include_directories(USM               PUBLIC "include" "./src/nfl/src/")
+target_include_directories(ultimate_release    PUBLIC "include" "./src/nfl/src/")
+target_include_directories(ultimate_prerelease PUBLIC "include" "./src/nfl/src/")
+target_include_directories(ultimate_build      PUBLIC "include" "./src/nfl/src/")
 
-target_include_directories(chuck   PUBLIC "include" "src")
-target_include_directories(tx      PUBLIC "include" "src")
-target_include_directories(ngl_dx  PUBLIC "include" "src")
-target_include_directories(test_tx PUBLIC "include" "src")
+target_include_directories(chuck        PUBLIC "include" "src")
+target_include_directories(chuck_prelib PUBLIC "include" "src")
+target_include_directories(tx           PUBLIC "include" "src")
+target_include_directories(ngl_dx       PUBLIC "include" "src")
+target_include_directories(test_tx      PUBLIC "include" "src")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -393,6 +670,9 @@ target_include_directories(test_tx PUBLIC "include" "src")
 ExternalProject_Add(AssimpProject
     SOURCE_DIR ${CMAKE_SOURCE_DIR}/assimp
     BINARY_DIR ${CMAKE_BINARY_DIR}/assimp-build
+    BUILD_BYPRODUCTS
+        ${CMAKE_BINARY_DIR}/assimp-build/lib/libassimp.a
+        ${CMAKE_BINARY_DIR}/assimp-build/contrib/zlib/libzlibstatic.a
     CMAKE_ARGS
         -DCMAKE_TOOLCHAIN_FILE=${CMAKE_SOURCE_DIR}/cmake/i686-pc-mingw32.cmake
         -DCMAKE_BUILD_TYPE=Release
@@ -412,17 +692,20 @@ ExternalProject_Add(AssimpProject
     INSTALL_COMMAND ""
 )
 
-target_include_directories(binkw32 PUBLIC "./assimp/include/")
-target_link_directories   (binkw32 PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
-add_dependencies          (binkw32 AssimpProject)
+target_include_directories(USM PUBLIC "./assimp/include/")
+target_link_directories   (USM PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
+add_dependencies          (USM AssimpProject)
+target_include_directories(ultimate_release PUBLIC "./assimp/include/")
+target_link_directories   (ultimate_release PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
+add_dependencies          (ultimate_release AssimpProject)
 
-target_include_directories(binkw32_prelib PUBLIC "./assimp/include/")
-target_link_directories   (binkw32_prelib PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
-add_dependencies          (binkw32_prelib AssimpProject)
+target_include_directories(ultimate_prerelease PUBLIC "./assimp/include/")
+target_link_directories   (ultimate_prerelease PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
+add_dependencies          (ultimate_prerelease AssimpProject)
 
-target_include_directories(binkw32_build PUBLIC "./assimp/include/")
-target_link_directories   (binkw32_build PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
-add_dependencies          (binkw32_build AssimpProject)
+target_include_directories(ultimate_build PUBLIC "./assimp/include/")
+target_link_directories   (ultimate_build PUBLIC ${CMAKE_BINARY_DIR}/assimp-build/lib)
+add_dependencies          (ultimate_build AssimpProject)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -432,53 +715,80 @@ add_dependencies          (binkw32_build AssimpProject)
 #    regardless of whether USM.c / the exe blobs are present.)
 # ─────────────────────────────────────────────────────────────────────────
 
-target_link_libraries(ngl_dx PUBLIC d3dx9)
+# Ultimate Spider-Man ships the June 2005 D3DX runtime.  MinGW's unversioned
+# import library currently resolves to d3dx9_43.dll, which is not present in
+# the game directory and prevents an injected executable from starting.
+target_link_libraries(ngl_dx PUBLIC d3dx9_24)
 
 # --- binkw32 (release loader) ---
-target_link_directories(binkw32 PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
-target_link_directories(binkw32 PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
-target_link_libraries  (binkw32 PUBLIC physics
+target_link_directories(USM PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
+target_link_directories(USM PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
+target_link_libraries  (USM PUBLIC physics
                                        charanimtype mash chuck nfl ngl nal nsl utility
-                                       winmm psapi d3d9 dinput8 dxguid dsound assimp z)
+                                       winmm psapi d3d9 dinput8 dxguid dsound assimp
+                                       "${CMAKE_BINARY_DIR}/assimp-build/contrib/zlib/libzlibstatic.a")
+target_link_directories(ultimate_release PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
+target_link_directories(ultimate_release PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
+if(ULTIMATE_RELEASE_XBPACK_MODE)
+    target_link_libraries(ultimate_release PUBLIC physics
+        charanimtype mash_xbpack chuck nfl ngl nal nsl utility
+        winmm psapi d3d9 dinput8 dxguid dsound assimp
+        "${CMAKE_BINARY_DIR}/assimp-build/contrib/zlib/libzlibstatic.a")
+else()
+    target_link_libraries(ultimate_release PUBLIC physics
+        charanimtype mash chuck nfl ngl nal nsl utility
+        winmm psapi d3d9 dinput8 dxguid dsound assimp
+        "${CMAKE_BINARY_DIR}/assimp-build/contrib/zlib/libzlibstatic.a")
+endif()
+# Private-LAN multiplayer transport (retail PC entrypoints only).
+target_link_libraries(USM PUBLIC ws2_32 bcrypt iphlpapi)
+target_link_libraries(ultimate_release PUBLIC ws2_32 bcrypt iphlpapi)
 if(USE_GLM)
-    target_link_libraries(binkw32 PUBLIC glm::glm)
+    target_link_libraries(USM PUBLIC glm::glm)
+    target_link_libraries(ultimate_release PUBLIC glm::glm)
 endif()
 
-# --- binkw32_prelib (prerelease loader) — identical link set to binkw32 ---
-target_link_directories(binkw32_prelib PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
-target_link_directories(binkw32_prelib PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
-target_link_libraries  (binkw32_prelib PUBLIC physics
-                                       charanimtype mash chuck nfl ngl nal nsl utility
-                                       winmm psapi d3d9 dinput8 dxguid dsound assimp z)
-									   
-									   
-target_link_directories(binkw32_build PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
-target_link_directories(binkw32_build PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
-target_link_libraries  (binkw32_build PUBLIC physics
-                                       charanimtype mash chuck nfl ngl nal nsl utility
-                                       winmm psapi d3d9 dinput8 dxguid dsound assimp z)
+# --- binkw32_prelib (June 2005 XBPACK v10 prerelease loader) ---
+target_link_directories(ultimate_prerelease PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
+target_link_directories(ultimate_prerelease PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
+target_link_libraries  (ultimate_prerelease PUBLIC physics
+                                       charanimtype mash_prelib chuck_prelib nfl ngl nal nsl utility
+                                       winmm psapi d3d9 dinput8 dxguid dsound assimp
+                                       "${CMAKE_BINARY_DIR}/assimp-build/contrib/zlib/libzlibstatic.a")
+
+target_link_directories(ultimate_build PUBLIC ${CMAKE_FIND_ROOT_PATH}/include)
+target_link_directories(ultimate_build PUBLIC ${CMAKE_FIND_ROOT_PATH}/lib)
+target_link_libraries  (ultimate_build PUBLIC physics
+                                       charanimtype mash_xbpack chuck nfl ngl nal nsl utility
+                                       winmm psapi d3d9 dinput8 dxguid dsound assimp
+                                       "${CMAKE_BINARY_DIR}/assimp-build/contrib/zlib/libzlibstatic.a")
 if(USE_GLM)
-    target_link_libraries(binkw32_prelib PUBLIC glm::glm)
-	target_link_libraries(binkw32_build PUBLIC glm::glm)
+    target_link_libraries(ultimate_prerelease PUBLIC glm::glm)
+    target_link_libraries(ultimate_build PUBLIC glm::glm)
 endif()
 
 # Pin both loaders' output directory so the inject/deploy steps below know
 # exactly where to find them.
-set_target_properties(binkw32 PROPERTIES
+set_target_properties(USM PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set_target_properties(ultimate_release PROPERTIES
+    PREFIX ""
+    SUFFIX ".dll"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
-foreach(_USM_LOADER_TARGET binkw32 binkw32_prelib binkw32_build)
+foreach(_USM_LOADER_TARGET USM ultimate_release ultimate_prerelease ultimate_build)
     target_compile_options(${_USM_LOADER_TARGET} PRIVATE
         -Os -ffunction-sections -fdata-sections)
     set_property(TARGET ${_USM_LOADER_TARGET} APPEND_STRING PROPERTY
         LINK_FLAGS " -Wl,--gc-sections -Wl,--strip-all")
 endforeach()
 unset(_USM_LOADER_TARGET)
-set_target_properties(binkw32_prelib PROPERTIES
+set_target_properties(ultimate_prerelease PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-set_target_properties(binkw32_build PROPERTIES
+set_target_properties(ultimate_build PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
@@ -510,34 +820,22 @@ else()
     # ── Host-native compile of USM.c + emit_usm_exe.c ────────────────
     # NOTE: emit_usm_exe.c should size its write with sizeof(rawData),
     # so the same writer works for every blob regardless of length.
-    ExternalProject_Add(emit_usm_exe_host
-        SOURCE_DIR        "${CMAKE_BINARY_DIR}/emit_usm_exe_src"
-        BINARY_DIR        "${CMAKE_BINARY_DIR}/emit_usm_exe_build"
-        DOWNLOAD_COMMAND  ""
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND
-            ${CMAKE_COMMAND} -E make_directory
-                "${CMAKE_BINARY_DIR}/emit_usm_exe_build"
-            COMMAND
-            cc -O0
-               "${USM_C_SOURCE}"
-               "${USM_C_WRITER_SOURCE}"
-               -o "${CMAKE_BINARY_DIR}/emit_usm_exe_build/emit_usm_exe"
-        INSTALL_COMMAND   ""
-        BUILD_BYPRODUCTS  "${CMAKE_BINARY_DIR}/emit_usm_exe_build/emit_usm_exe"
-        BUILD_ALWAYS      FALSE
-    )
+    set(_USM_EMITTER
+        "${CMAKE_BINARY_DIR}/emit_usm_exe_build/emit_usm_exe${_OPENUSM_HOST_EXECUTABLE_SUFFIX}")
+    openusm_add_host_emitter(emit_usm_exe_host
+        "${_USM_EMITTER}"
+        "${USM_C_SOURCE}"
+        "${USM_C_WRITER_SOURCE}")
 
     add_custom_command(
         OUTPUT  "${_OUT_USM}"
-        COMMAND "${CMAKE_BINARY_DIR}/emit_usm_exe_build/emit_usm_exe"
-                "${_OUT_USM}"
+        COMMAND "${_USM_EMITTER}" "${_OUT_USM}"
         DEPENDS emit_usm_exe_host "${USM_C_SOURCE}" "${USM_C_WRITER_SOURCE}"
         COMMENT "Compiling USM_original.exe from USM.c rawData[] (5,926,912 bytes / 5.65 MiB)"
         VERBATIM
     )
 
-    add_custom_target(USM ALL DEPENDS "${_OUT_USM}")
+    add_custom_target(USM_original ALL DEPENDS "${_OUT_USM}")
 
     file(SIZE   "${USM_C_SOURCE}" _USM_C_SIZE)
     file(SHA256 "${USM_C_SOURCE}" _USM_C_SHA)
@@ -571,28 +869,16 @@ if(NOT EXISTS "${USMITA_C_SOURCE}")
 elseif(NOT EXISTS "${USM_C_WRITER_SOURCE}")
     # Missing-writer warning already emitted by the USM block. Silent here.
 else()
-    ExternalProject_Add(emit_usmita_exe_host
-        SOURCE_DIR        "${CMAKE_BINARY_DIR}/emit_usmita_exe_src"
-        BINARY_DIR        "${CMAKE_BINARY_DIR}/emit_usmita_exe_build"
-        DOWNLOAD_COMMAND  ""
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND
-            ${CMAKE_COMMAND} -E make_directory
-                "${CMAKE_BINARY_DIR}/emit_usmita_exe_build"
-            COMMAND
-            cc -O0
-               "${USMITA_C_SOURCE}"
-               "${USM_C_WRITER_SOURCE}"
-               -o "${CMAKE_BINARY_DIR}/emit_usmita_exe_build/emit_usmita_exe"
-        INSTALL_COMMAND   ""
-        BUILD_BYPRODUCTS  "${CMAKE_BINARY_DIR}/emit_usmita_exe_build/emit_usmita_exe"
-        BUILD_ALWAYS      FALSE
-    )
+    set(_USMITA_EMITTER
+        "${CMAKE_BINARY_DIR}/emit_usmita_exe_build/emit_usmita_exe${_OPENUSM_HOST_EXECUTABLE_SUFFIX}")
+    openusm_add_host_emitter(emit_usmita_exe_host
+        "${_USMITA_EMITTER}"
+        "${USMITA_C_SOURCE}"
+        "${USM_C_WRITER_SOURCE}")
 
     add_custom_command(
         OUTPUT  "${_OUT_USMITA}"
-        COMMAND "${CMAKE_BINARY_DIR}/emit_usmita_exe_build/emit_usmita_exe"
-                "${_OUT_USMITA}"
+        COMMAND "${_USMITA_EMITTER}" "${_OUT_USMITA}"
         DEPENDS emit_usmita_exe_host "${USMITA_C_SOURCE}" "${USM_C_WRITER_SOURCE}"
         COMMENT "Compiling USMITA_original.exe from USMITA.c rawData[] (5,926,912 bytes / 5.65 MiB)"
         VERBATIM
@@ -613,61 +899,50 @@ endif()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#   Ultimate_Build_original.exe — Italian retail variant, compiled from ultimate_build.c
+#   Ultimate_Build_original.exe — build variant, compiled from Ultimate_build.c
 #
 #   Same rawData[5926912] symbol as USM.c, so it's built as a parallel
-#   host writer (emit_ultimate_build_exe). Skipped silently if ultimate_build.c absent.
+#   host writer (emit_ultimate_build_exe). Skipped silently if Ultimate_build.c is absent.
 # ═══════════════════════════════════════════════════════════════════════
 
 set(ultimate_build_C_SOURCE
-    "${CMAKE_CURRENT_SOURCE_DIR}/ultimate_build.c"
-    CACHE FILEPATH "Path to ultimate_build.c with rawData[5926912] byte array (Italian variant)")
+    "${CMAKE_CURRENT_SOURCE_DIR}/Ultimate_build.c"
+    CACHE FILEPATH "Path to Ultimate_build.c with rawData[5926912] byte array (build variant)")
 
 set(_OUT_ultimate_build "${CMAKE_BINARY_DIR}/Ultimate_Build_original.exe")
 
 if(NOT EXISTS "${ultimate_build_C_SOURCE}")
     message(STATUS
-        "ultimate_build.c not found at ${ultimate_build_C_SOURCE} — ultimate_build target "
+        "Ultimate_build.c not found at ${ultimate_build_C_SOURCE} — ultimate_build target "
         "skipped. (Optional Italian variant; set -Dultimate_build_C_SOURCE=<path> "
         "to enable.)")
 elseif(NOT EXISTS "${USM_C_WRITER_SOURCE}")
     # Missing-writer warning already emitted by the USM block. Silent here.
 else()
-    ExternalProject_Add(emit_ultimate_build_exe_host
-        SOURCE_DIR        "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_src"
-        BINARY_DIR        "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build"
-        DOWNLOAD_COMMAND  ""
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND
-            ${CMAKE_COMMAND} -E make_directory
-                "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build"
-            COMMAND
-            cc -O0
-               "${ultimate_build_C_SOURCE}"
-               "${USM_C_WRITER_SOURCE}"
-               -o "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build/emit_ultimate_build_exe"
-        INSTALL_COMMAND   ""
-        BUILD_BYPRODUCTS  "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build/emit_ultimate_build_exe"
-        BUILD_ALWAYS      FALSE
-    )
+    set(_ULTIMATE_BUILD_EMITTER
+        "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build/emit_ultimate_build_exe${_OPENUSM_HOST_EXECUTABLE_SUFFIX}")
+    openusm_add_host_emitter(emit_ultimate_build_exe_host
+        "${_ULTIMATE_BUILD_EMITTER}"
+        "${ultimate_build_C_SOURCE}"
+        "${USM_C_WRITER_SOURCE}")
 
     add_custom_command(
         OUTPUT  "${_OUT_ultimate_build}"
-        COMMAND "${CMAKE_BINARY_DIR}/emit_ultimate_build_exe_build/emit_ultimate_build_exe"
-                "${_OUT_ultimate_build}"
-        DEPENDS emit_ultimate_build_exe_host "${ultimate_build_C_SOURCE}" "${USM_C_WRITER_SOURCE}"
-        COMMENT "Compiling Ultimate_Build_original.exe from ultimate_build.c rawData[] (5,926,912 bytes / 5.65 MiB)"
+        COMMAND "${_ULTIMATE_BUILD_EMITTER}" "${_OUT_ultimate_build}"
+        DEPENDS emit_ultimate_build_exe_host
+                "${ultimate_build_C_SOURCE}" "${USM_C_WRITER_SOURCE}"
+        COMMENT "Compiling Ultimate_Build_original.exe from Ultimate_build.c rawData[] (5,926,912 bytes / 5.65 MiB)"
         VERBATIM
     )
 
-    add_custom_target(ultimate_build ALL DEPENDS "${_OUT_ultimate_build}")
+    add_custom_target(ultimate_build_original ALL DEPENDS "${_OUT_ultimate_build}")
 
     file(SIZE   "${ultimate_build_C_SOURCE}" _ultimate_build_C_SIZE)
     file(SHA256 "${ultimate_build_C_SOURCE}" _ultimate_build_C_SHA)
-    message(STATUS "Ultimate_Build_original.exe: compiling from ultimate_build.c rawData[]")
-    message(STATUS "  ultimate_build.c       : ${ultimate_build_C_SOURCE}")
-    message(STATUS "  ultimate_build.c size  : ${_ultimate_build_C_SIZE} bytes")
-    message(STATUS "  ultimate_build.c sha256: ${_ultimate_build_C_SHA}")
+    message(STATUS "Ultimate_Build_original.exe: compiling from Ultimate_build.c rawData[]")
+    message(STATUS "  Ultimate_build.c       : ${ultimate_build_C_SOURCE}")
+    message(STATUS "  Ultimate_build.c size  : ${_ultimate_build_C_SIZE} bytes")
+    message(STATUS "  Ultimate_build.c sha256: ${_ultimate_build_C_SHA}")
     message(STATUS "  writer         : ${USM_C_WRITER_SOURCE}")
     message(STATUS "  output         : ${_OUT_ultimate_build} (expected: 5926912 bytes / 5.65 MiB)")
 endif()
@@ -677,10 +952,10 @@ endif()
 #   Ultimate_prerelease_original.exe — PRERELEASE variant
 #
 #   Ultimate_prerelease.c is the same kind of ASCII-hex blob as USM.c, but
-#   declares  unsigned char rawData[5984512]  — the bytes of the Ultimate
-#   Spider-Man PRERELEASE build (5,984,512 bytes / 5.71 MiB).
+#   declares  unsigned char rawData[5947392]  — the bytes of the Ultimate
+#   Spider-Man PRERELEASE build (5,947,392 bytes / 5.67 MiB).
 #
-#   ⚠ SIZE DIFFERS from retail: 5,984,512 (prerelease) vs 5,926,912
+#   ⚠ SIZE DIFFERS from retail: 5,947,392 (prerelease) vs 5,926,912
 #     (USM/USMITA). emit_usm_exe.c MUST write sizeof(rawData) bytes (not a
 #     hard-coded 5926912) or this exe will be truncated. If your writer
 #     hard-codes the retail length, parameterise it before building this.
@@ -692,7 +967,7 @@ endif()
 
 set(Ultimate_prerelease_C_SOURCE
     "${CMAKE_CURRENT_SOURCE_DIR}/Ultimate_prerelease.c"
-    CACHE FILEPATH "Path to Ultimate_prerelease.c with rawData[5984512] byte array (prerelease variant)")
+    CACHE FILEPATH "Path to Ultimate_prerelease.c with rawData[5947392] byte array (prerelease variant)")
 
 set(_OUT_Ultimate_prerelease "${CMAKE_BINARY_DIR}/Ultimate_prerelease_original.exe")
 
@@ -705,38 +980,27 @@ elseif(NOT EXISTS "${USM_C_WRITER_SOURCE}")
     # Missing-writer warning already emitted by the USM block. Silent here.
 else()
     # ── Host-native compile of Ultimate_prerelease.c + emit_usm_exe.c ──
-    # Mirrors the USM_original.exe ExternalProject. The host program is
+    # Mirrors the USM_original.exe emitter. The host program is
     # named emit_Ultimate_prerelease_exe so it cannot collide with the
     # English / Italian writers on disk or at link time.
-    ExternalProject_Add(emit_Ultimate_prerelease_exe_host
-        SOURCE_DIR        "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_src"
-        BINARY_DIR        "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build"
-        DOWNLOAD_COMMAND  ""
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND
-            ${CMAKE_COMMAND} -E make_directory
-                "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build"
-            COMMAND
-            cc -O0
-               "${Ultimate_prerelease_C_SOURCE}"
-               "${USM_C_WRITER_SOURCE}"
-               -o "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build/emit_Ultimate_prerelease_exe"
-        INSTALL_COMMAND   ""
-        BUILD_BYPRODUCTS  "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build/emit_Ultimate_prerelease_exe"
-        BUILD_ALWAYS      FALSE
-    )
+    set(_ULTIMATE_PRERELEASE_EMITTER
+        "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build/emit_Ultimate_prerelease_exe${_OPENUSM_HOST_EXECUTABLE_SUFFIX}")
+    openusm_add_host_emitter(emit_Ultimate_prerelease_exe_host
+        "${_ULTIMATE_PRERELEASE_EMITTER}"
+        "${Ultimate_prerelease_C_SOURCE}"
+        "${USM_C_WRITER_SOURCE}"
+        -DRAWDATA_SIZE=5947392u)
 
     add_custom_command(
         OUTPUT  "${_OUT_Ultimate_prerelease}"
-        COMMAND "${CMAKE_BINARY_DIR}/emit_Ultimate_prerelease_exe_build/emit_Ultimate_prerelease_exe"
-                "${_OUT_Ultimate_prerelease}"
+        COMMAND "${_ULTIMATE_PRERELEASE_EMITTER}" "${_OUT_Ultimate_prerelease}"
         DEPENDS emit_Ultimate_prerelease_exe_host
                 "${Ultimate_prerelease_C_SOURCE}" "${USM_C_WRITER_SOURCE}"
-        COMMENT "Compiling Ultimate_prerelease_original.exe from Ultimate_prerelease.c rawData[] (5,984,512 bytes / 5.71 MiB)"
+        COMMENT "Compiling Ultimate_prerelease_original.exe from Ultimate_prerelease.c rawData[] (5,947,392 bytes / 5.67 MiB)"
         VERBATIM
     )
 
-    add_custom_target(Ultimate_prerelease ALL DEPENDS "${_OUT_Ultimate_prerelease}")
+    add_custom_target(ultimate_prerelease_image ALL DEPENDS "${_OUT_Ultimate_prerelease}")
 
     file(SIZE   "${Ultimate_prerelease_C_SOURCE}" _PRE_C_SIZE)
     file(SHA256 "${Ultimate_prerelease_C_SOURCE}" _PRE_C_SHA)
@@ -745,7 +1009,7 @@ else()
     message(STATUS "  Ultimate_prerelease.c size  : ${_PRE_C_SIZE} bytes")
     message(STATUS "  Ultimate_prerelease.c sha256: ${_PRE_C_SHA}")
     message(STATUS "  writer         : ${USM_C_WRITER_SOURCE}")
-    message(STATUS "  output         : ${_OUT_Ultimate_prerelease} (expected: 5984512 bytes / 5.71 MiB)")
+    message(STATUS "  output         : ${_OUT_Ultimate_prerelease} (expected: 5947392 bytes / 5.67 MiB)")
 endif()
 
 
@@ -1045,11 +1309,15 @@ endfunction()
 # ─────────────────────────────────────────────────────────────────────────
 
 if(TARGET USM)
-    if(TARGET binkw32)
-        add_dependencies(USM binkw32)
+    if(TARGET USM_original)
+        add_dependencies(USM USM_original)
+    endif()
+
+    if(TARGET USM)
+        # USM is the release loader target itself.
         add_custom_command(TARGET USM POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy
-                "$<TARGET_FILE:binkw32>"
+                "$<TARGET_FILE:USM>"
                 "${CMAKE_BINARY_DIR}/USM.dll"
             COMMENT "Deploying built mod loader → USM.dll"
             VERBATIM)
@@ -1062,7 +1330,7 @@ if(TARGET USM)
     _to_dll2exe_path("${CMAKE_BINARY_DIR}/USMITA.exe"       _USMITA_EXE_ARG)
 
     if(EXISTS "${DLL2EXE}")
-        if(TARGET binkw32)
+        if(TARGET USM)
             add_custom_command(TARGET USM POST_BUILD
                 COMMAND ${CMAKE_COMMAND}
                         "-DSRC=${CMAKE_BINARY_DIR}/USM.dll"
@@ -1105,6 +1373,73 @@ endif()
 
 
 # ─────────────────────────────────────────────────────────────────────────
+#   ultimate_release.exe — inject ultimate_release.dll into the release image
+# ─────────────────────────────────────────────────────────────────────────
+if(TARGET ultimate_release_image AND TARGET ultimate_release)
+    add_dependencies(ultimate_release_image ultimate_release)
+
+    if(EXISTS "${DLL2EXE}")
+        _to_dll2exe_path("${_OUT_ultimate_release}"                    _OUT_RELEASE_ARG)
+        _to_dll2exe_path("${CMAKE_BINARY_DIR}/ultimate_release.dll"    _RELEASE_DLL_ARG)
+        _to_dll2exe_path("${CMAKE_BINARY_DIR}/ultimate_release.exe"    _RELEASE_EXE_ARG)
+
+        add_custom_command(TARGET ultimate_release_image POST_BUILD
+            COMMAND ${_DLL2EXE_RUN} -efix -injimp
+                    "${_OUT_RELEASE_ARG}"
+                    "${_RELEASE_DLL_ARG}"
+                    "${_RELEASE_EXE_ARG}"
+            COMMENT "Injecting ultimate_release.dll into ultimate_release_original.exe → ultimate_release.exe"
+            VERBATIM)
+
+        # Keep an unambiguous copy of each ABI-specific release. PC and Xbox
+        # mash/resource-directory layouts cannot safely coexist in one DLL.
+        # The original game also requires its executable basename to remain
+        # ultimate_release.exe, so package variants in separate directories
+        # instead of renaming the injected image.
+        if(ULTIMATE_RELEASE_XBPACK_MODE)
+            set(_ULTIMATE_RELEASE_VARIANT_DIR "xbox")
+        else()
+            set(_ULTIMATE_RELEASE_VARIANT_DIR "pc")
+        endif()
+        add_custom_command(TARGET ultimate_release_image POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "${CMAKE_BINARY_DIR}/ultimate_release_${_ULTIMATE_RELEASE_VARIANT_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_BINARY_DIR}/ultimate_release.dll"
+                    "${CMAKE_BINARY_DIR}/ultimate_release_${_ULTIMATE_RELEASE_VARIANT_DIR}/ultimate_release.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_BINARY_DIR}/ultimate_release.exe"
+                    "${CMAKE_BINARY_DIR}/ultimate_release_${_ULTIMATE_RELEASE_VARIANT_DIR}/ultimate_release.exe"
+            COMMENT "Packaging ultimate_release_${_ULTIMATE_RELEASE_VARIANT_DIR}/ultimate_release.exe"
+            VERBATIM)
+        usm_pack_exe(ultimate_release_image
+            "${CMAKE_BINARY_DIR}/ultimate_release.exe")
+        # The image target runs again even when the linker DLL is unchanged.
+        # Keep that injection input and the ABI-specific copy uncompressed;
+        # modifying the target DLL here makes the next injection embed UPX
+        # sections instead of the loader's native code/data sections.
+        if(USM_PACK_DLLS)
+            add_custom_command(TARGET ultimate_release_image POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "$<TARGET_FILE:ultimate_release>"
+                        "${CMAKE_BINARY_DIR}/ultimate_release_packed.dll"
+                COMMENT "Copying retail loader for optional DLL compression"
+                VERBATIM)
+            usm_pack_dll(ultimate_release_image
+                "${CMAKE_BINARY_DIR}/ultimate_release_packed.dll")
+        endif()
+        message(STATUS "ultimate_release.exe: dll2exe injector : ${DLL2EXE}")
+        if(_IS_WSL)
+            message(STATUS "ultimate_release.exe: WSL argv paths translated via ${WSLPATH}")
+        endif()
+    else()
+        message(WARNING
+            "dll2exe.exe not found at ${DLL2EXE} — ultimate_release.exe will not be produced.")
+    endif()
+endif()
+
+
+# ─────────────────────────────────────────────────────────────────────────
 #   Ultimate_prerelease.exe — inject the PRERELEASE loader (binkw32_prelib)
 #
 #   Mirrors the USM.exe pipeline, but for the prerelease and using its own
@@ -1120,18 +1455,18 @@ endif()
 #            Ultimate_prerelease.exe
 # ─────────────────────────────────────────────────────────────────────────
 
-if(TARGET Ultimate_prerelease AND TARGET binkw32_prelib)
-    add_dependencies(Ultimate_prerelease binkw32_prelib)
+if(TARGET ultimate_prerelease_image AND TARGET ultimate_prerelease)
+    add_dependencies(ultimate_prerelease_image ultimate_prerelease)
 
     # (1) deployable loader: binkw32_prelib.dll → USM_prelib.dll
-    add_custom_command(TARGET binkw32_prelib POST_BUILD
+    add_custom_command(TARGET ultimate_prerelease POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
-            "$<TARGET_FILE:binkw32_prelib>"
+            "$<TARGET_FILE:ultimate_prerelease>"
             "${CMAKE_BINARY_DIR}/USM_prelib.dll"
         COMMENT "Renaming prerelease loader → USM_prelib.dll"
         VERBATIM)
 
-    usm_pack_dll(binkw32_prelib "${CMAKE_BINARY_DIR}/USM_prelib.dll")
+    usm_pack_dll(ultimate_prerelease "${CMAKE_BINARY_DIR}/USM_prelib.dll")
 
     if(EXISTS "${DLL2EXE}")
         _to_dll2exe_path("${_OUT_Ultimate_prerelease}"                 _OUT_PRE_ARG)
@@ -1139,9 +1474,9 @@ if(TARGET Ultimate_prerelease AND TARGET binkw32_prelib)
         _to_dll2exe_path("${CMAKE_BINARY_DIR}/Ultimate_prerelease.exe" _PRE_EXE_ARG)
 
         # (2)+(3) strip a copy of binkw32_prelib.dll, then inject it.
-        add_custom_command(TARGET Ultimate_prerelease POST_BUILD
+        add_custom_command(TARGET ultimate_prerelease_image POST_BUILD
             COMMAND ${CMAKE_COMMAND}
-                    "-DSRC=$<TARGET_FILE:binkw32_prelib>"
+                    "-DSRC=$<TARGET_FILE:ultimate_prerelease>"
                     "-DOUT=${CMAKE_BINARY_DIR}/USM_prelib_stripped.dll"
                     "-DSTRIP=${CMAKE_STRIP}"
                     "-DDOSTRIP=${USM_STRIP_INJECTED_DLL}"
@@ -1152,9 +1487,9 @@ if(TARGET Ultimate_prerelease AND TARGET binkw32_prelib)
                     "${_PRE_EXE_ARG}"
             COMMENT "Preparing prerelease loader (strip=${USM_STRIP_INJECTED_DLL}) and injecting into Ultimate_prerelease_original.exe → Ultimate_prerelease.exe"
             VERBATIM)
-        usm_pack_exe(Ultimate_prerelease "${CMAKE_BINARY_DIR}/Ultimate_prerelease.exe")
-        usm_pack_dll(Ultimate_prerelease "${CMAKE_BINARY_DIR}/USM_prelib_stripped.dll")
-        usm_pack_dll(Ultimate_prerelease "$<TARGET_FILE:binkw32_prelib>")
+        usm_pack_exe(ultimate_prerelease_image "${CMAKE_BINARY_DIR}/Ultimate_prerelease.exe")
+        usm_pack_dll(ultimate_prerelease_image "${CMAKE_BINARY_DIR}/USM_prelib_stripped.dll")
+        usm_pack_dll(ultimate_prerelease_image "$<TARGET_FILE:ultimate_prerelease>")
         message(STATUS "Ultimate_prerelease.exe: dll2exe injector : ${DLL2EXE}")
         message(STATUS "Ultimate_prerelease.exe: inject strip     : ${USM_STRIP_INJECTED_DLL} (${CMAKE_STRIP})")
         if(_IS_WSL)
@@ -1183,18 +1518,20 @@ endif()
 #            Ultimate_Build.exe
 # ─────────────────────────────────────────────────────────────────────────
 
-if(TARGET ultimate_build AND TARGET binkw32_build)
-    add_dependencies(ultimate_build binkw32_build)
+if(TARGET ultimate_build)
+    if(TARGET ultimate_build_original)
+        add_dependencies(ultimate_build ultimate_build_original)
+    endif()
 
     # (1) deployable loader: binkw32_build.dll → USM_build.dll
-    add_custom_command(TARGET binkw32_build POST_BUILD
+    add_custom_command(TARGET ultimate_build POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
-            "$<TARGET_FILE:binkw32_build>"
+            "$<TARGET_FILE:ultimate_build>"
             "${CMAKE_BINARY_DIR}/USM_build.dll"
         COMMENT "Renaming build loader → USM_build.dll"
         VERBATIM)
 
-    usm_pack_dll(binkw32_build "${CMAKE_BINARY_DIR}/USM_build.dll")
+    usm_pack_dll(ultimate_build "${CMAKE_BINARY_DIR}/USM_build.dll")
 
     if(EXISTS "${DLL2EXE}")
         _to_dll2exe_path("${_OUT_ultimate_build}"                     _OUT_BUILD_ARG)
@@ -1204,7 +1541,7 @@ if(TARGET ultimate_build AND TARGET binkw32_build)
         # (2)+(3) strip a copy of binkw32_build.dll, then inject it.
         add_custom_command(TARGET ultimate_build POST_BUILD
             COMMAND ${CMAKE_COMMAND}
-                    "-DSRC=$<TARGET_FILE:binkw32_build>"
+                    "-DSRC=$<TARGET_FILE:ultimate_build>"
                     "-DOUT=${CMAKE_BINARY_DIR}/USM_build_stripped.dll"
                     "-DSTRIP=${CMAKE_STRIP}"
                     "-DDOSTRIP=${USM_STRIP_INJECTED_DLL}"
@@ -1217,7 +1554,7 @@ if(TARGET ultimate_build AND TARGET binkw32_build)
             VERBATIM)
         usm_pack_exe(ultimate_build "${CMAKE_BINARY_DIR}/Ultimate_Build.exe")
         usm_pack_dll(ultimate_build "${CMAKE_BINARY_DIR}/USM_build_stripped.dll")
-        usm_pack_dll(ultimate_build "$<TARGET_FILE:binkw32_build>")
+        usm_pack_dll(ultimate_build "$<TARGET_FILE:ultimate_build>")
         message(STATUS "Ultimate_Build.exe: dll2exe injector : ${DLL2EXE}")
         message(STATUS "Ultimate_Build.exe: inject strip    : ${USM_STRIP_INJECTED_DLL} (${CMAKE_STRIP})")
         if(_IS_WSL)
@@ -1232,11 +1569,49 @@ endif()
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#   Auto-deploy built artifacts into ../Ultimate Spider-Man/ if present.
-#   Stock DLLs already in that folder are left untouched.
+#   Runtime tests (ENABLE_TESTS=ON). Run with:  ctest --test-dir build -L runtime -V
+#   Each test backs up the install's executable once, deploys the built image,
+#   runs it windowed for USM_TEST_SECONDS, terminates only its own PID,
+#   restores the executable and fails on a crash or on changed saves/game.ini.
+#   Logs and screenshots go to build/runtime-tests/<label>/.
+# ─────────────────────────────────────────────────────────────────────────
+if(ENABLE_TESTS)
+    _to_dll2exe_path("${CMAKE_CURRENT_SOURCE_DIR}/tools/runtime/runtime_test.ps1" _RT_SCRIPT)
+    _to_dll2exe_path("${CMAKE_BINARY_DIR}/Ultimate_prerelease.exe" _RT_PRERELEASE_EXE)
+    _to_dll2exe_path("${CMAKE_BINARY_DIR}/ultimate_release.exe" _RT_RELEASE_EXE)
+    _to_dll2exe_path("${CMAKE_BINARY_DIR}/runtime-tests" _RT_OUT)
+    math(EXPR _RT_TIMEOUT "${USM_TEST_SECONDS} + 120")
+
+    # XBPACK v10: boot the June 2005 install into city_arena (Press Start,
+    # Continue) and keep it running for USM_TEST_SECONDS.
+    add_test(NAME runtime_prerelease_city
+        COMMAND "${USM_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass -File "${_RT_SCRIPT}"
+                -GameDir "${USM_TEST_GAME_DIR}" -Exe "${_RT_PRERELEASE_EXE}"
+                -Label prerelease_city -OutDir "${_RT_OUT}/prerelease_city"
+                -Seconds "${USM_TEST_SECONDS}" -ScreenshotEvery 15
+                -Keys "25:ENTER,33:ENTER")
+    set_tests_properties(runtime_prerelease_city PROPERTIES
+        LABELS "runtime;v10" TIMEOUT ${_RT_TIMEOUT} RUN_SERIAL TRUE)
+
+    if(USM_TEST_RELEASE_GAME_DIR)
+        add_test(NAME runtime_release_city
+            COMMAND "${USM_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass -File "${_RT_SCRIPT}"
+                    -GameDir "${USM_TEST_RELEASE_GAME_DIR}" -Exe "${_RT_RELEASE_EXE}"
+                    -Label release_city -OutDir "${_RT_OUT}/release_city"
+                    -Seconds "${USM_TEST_SECONDS}" -ScreenshotEvery 15
+                    -Keys "25:ENTER,33:ENTER")
+        set_tests_properties(runtime_release_city PROPERTIES
+            LABELS "runtime;release" TIMEOUT ${_RT_TIMEOUT} RUN_SERIAL TRUE)
+    endif()
+endif()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#   Optional deployment into ../Ultimate Spider-Man/. Disabled by default so
+#   normal builds cannot overwrite a game installation unexpectedly.
 # ─────────────────────────────────────────────────────────────────────────
 
-option(USM_AUTO_DEPLOY "Copy built artifacts into ../Ultimate Spider-Man when that folder exists" ON)
+option(USM_AUTO_DEPLOY "Copy built artifacts into ../Ultimate Spider-Man when that folder exists" OFF)
 
 set(_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Ultimate Spider-Man")
 if(USM_AUTO_DEPLOY AND EXISTS "${_GAME_DIR}/")
@@ -1248,7 +1623,7 @@ if(USM_AUTO_DEPLOY AND EXISTS "${_GAME_DIR}/")
                 "${_OUT_USM}" "${_GAME_DIR}/USM_original.exe"
             COMMENT "Deploying USM_original.exe to ${_GAME_DIR}"
             VERBATIM)
-        if(EXISTS "${DLL2EXE}" AND TARGET binkw32)
+        if(EXISTS "${DLL2EXE}" AND TARGET USM)
             add_custom_command(TARGET USM POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy
                     "${CMAKE_BINARY_DIR}/USM.exe" "${_GAME_DIR}/USM.exe"
@@ -1258,17 +1633,17 @@ if(USM_AUTO_DEPLOY AND EXISTS "${_GAME_DIR}/")
     endif()
 
     # --- release loader binkw32.dll ---
-    if(TARGET binkw32)
-        add_custom_command(TARGET binkw32 POST_BUILD
+    if(TARGET USM)
+        add_custom_command(TARGET USM POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy
-                "$<TARGET_FILE:binkw32>" "${_GAME_DIR}/binkw32.dll"
+            "$<TARGET_FILE:USM>" "${_GAME_DIR}/binkw32.dll"
             COMMENT "Deploying binkw32.dll to ${_GAME_DIR}"
             VERBATIM)
     endif()
 
     # --- prerelease loader, deployed under the renamed USM_prelib.dll ---
-    if(TARGET binkw32_prelib)
-        add_custom_command(TARGET binkw32_prelib POST_BUILD
+    if(TARGET ultimate_prerelease)
+        add_custom_command(TARGET ultimate_prerelease POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy
                 "$<TARGET_FILE:binkw32_prelib>" "${_GAME_DIR}/USM_prelib.dll"
             COMMENT "Deploying USM_prelib.dll to ${_GAME_DIR}"
@@ -1282,7 +1657,7 @@ if(USM_AUTO_DEPLOY AND EXISTS "${_GAME_DIR}/")
                 "${_OUT_USMITA}" "${_GAME_DIR}/USMITA_original.exe"
             COMMENT "Deploying USMITA_original.exe to ${_GAME_DIR}"
             VERBATIM)
-        if(EXISTS "${DLL2EXE}" AND TARGET binkw32)
+        if(EXISTS "${DLL2EXE}" AND TARGET USM)
             add_custom_command(TARGET USMITA POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy
                     "${CMAKE_BINARY_DIR}/USMITA.exe" "${_GAME_DIR}/USMITA.exe"
@@ -1292,14 +1667,14 @@ if(USM_AUTO_DEPLOY AND EXISTS "${_GAME_DIR}/")
     endif()
 
     # --- Ultimate_prerelease ---
-    if(TARGET Ultimate_prerelease)
-        add_custom_command(TARGET Ultimate_prerelease POST_BUILD
+    if(TARGET ultimate_prerelease_image)
+        add_custom_command(TARGET ultimate_prerelease_image POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy
                 "${_OUT_Ultimate_prerelease}" "${_GAME_DIR}/Ultimate_prerelease_original.exe"
             COMMENT "Deploying Ultimate_prerelease_original.exe to ${_GAME_DIR}"
             VERBATIM)
-        if(EXISTS "${DLL2EXE}" AND TARGET binkw32_prelib)
-            add_custom_command(TARGET Ultimate_prerelease POST_BUILD
+        if(EXISTS "${DLL2EXE}" AND TARGET ultimate_prerelease)
+            add_custom_command(TARGET ultimate_prerelease_image POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy
                     "${CMAKE_BINARY_DIR}/Ultimate_prerelease.exe" "${_GAME_DIR}/Ultimate_prerelease.exe"
                 COMMENT "Deploying Ultimate_prerelease.exe to ${_GAME_DIR}"
@@ -1314,7 +1689,7 @@ if(USM_AUTO_DEPLOY AND EXISTS "${_GAME_DIR}/")
                 "${_OUT_ultimate_build}" "${_GAME_DIR}/Ultimate_Build_original.exe"
             COMMENT "Deploying Ultimate_Build_original.exe to ${_GAME_DIR}"
             VERBATIM)
-        if(EXISTS "${DLL2EXE}" AND TARGET binkw32_build)
+        if(EXISTS "${DLL2EXE}" AND TARGET ultimate_build)
             add_custom_command(TARGET ultimate_build POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy
                     "${CMAKE_BINARY_DIR}/Ultimate_Build.exe" "${_GAME_DIR}/Ultimate_Build.exe"
@@ -1324,8 +1699,8 @@ if(USM_AUTO_DEPLOY AND EXISTS "${_GAME_DIR}/")
     endif()
 
     # --- build loader, deployed under the renamed USM_build.dll ---
-    if(TARGET binkw32_build)
-        add_custom_command(TARGET binkw32_build POST_BUILD
+    if(TARGET ultimate_build)
+        add_custom_command(TARGET ultimate_build POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy
                 "$<TARGET_FILE:binkw32_build>" "${_GAME_DIR}/USM_build.dll"
             COMMENT "Deploying USM_build.dll to ${_GAME_DIR}"
@@ -1359,7 +1734,7 @@ endif()
 #   cmake_minimum_required(3.12); `-f` makes the step idempotent on re-runs.
 # ═══════════════════════════════════════════════════════════════════════
 
-if(EXISTS "${DLL2EXE}" AND TARGET USM AND TARGET binkw32)
+if(EXISTS "${DLL2EXE}" AND TARGET USM)
     if(TARGET USMITA)
         set(_USM_CLEANUP_TARGET USMITA)
     else()
