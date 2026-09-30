@@ -39,6 +39,7 @@ static const char text[] =
                 "dp4 oPos.y, r7, c1\n"
                 "dp4 oPos.z, r7, c2\n"
                 "dp4 oPos.w, r7, c3\n"
+                "mov oT0, v2\n"
                 "dp3 r8.w, r5, c6\n"
                 "max r8.w, r8.w, c91.x\n"
                 "min r8.w, r8.w, c91.z\n"
