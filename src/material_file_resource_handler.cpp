@@ -11,6 +11,30 @@
 
 VALIDATE_SIZE(material_file_resource_handler, 0x14);
 
+#ifdef OPENUSM_XBPACK_V10
+namespace {
+bool __fastcall handle_xbox_material_file(
+    material_file_resource_handler *handler, void *,
+    worldly_resource_handler::eBehavior behavior, tlresource_location *location)
+{
+    auto *file = behavior == worldly_resource_handler::UNLOAD
+        ? reinterpret_cast<nglMeshFile *>(location->field_8) : nullptr;
+    using native_handler = bool (__fastcall *)(material_file_resource_handler *,
+        void *, worldly_resource_handler::eBehavior, tlresource_location *);
+    const bool pending = bit_cast<native_handler>(0x0056C190)(
+        handler, nullptr, behavior, location);
+    if (!pending && file != nullptr) {
+        // Native packed-material unload waits for the renderer, then advances
+        // the handler without releasing file memory. Xbox conversion also
+        // owns hash names, texture references and a registry entry. Remove
+        // them while this pack is valid, before the pool reuses its address.
+        modReleaseXboxMeshFileResources(&file->FileBuf, true);
+    }
+    return pending;
+}
+}
+#endif
+
 material_file_resource_handler::material_file_resource_handler(worldly_pack_slot *a2)
 {
     this->m_vtbl = 0x00888A94;
@@ -81,4 +105,11 @@ void material_file_resource_handler_patch()
 
     FUNC_ADDRESS(address, &material_file_resource_handler::_handle_resource);
     set_vfunc(0x00888AA0, address);
+}
+
+void material_file_resource_handler_xbpack_patch()
+{
+#ifdef OPENUSM_XBPACK_V10
+    set_vfunc(0x00888AA0, &handle_xbox_material_file);
+#endif
 }

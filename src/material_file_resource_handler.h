@@ -14,3 +14,4 @@ struct material_file_resource_handler : base_tl_resource_handler {
 };
 
 extern void material_file_resource_handler_patch();
+extern void material_file_resource_handler_xbpack_patch();

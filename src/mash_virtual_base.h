@@ -61,3 +61,7 @@ struct mash_virtual_base {
 
 
 extern void mash_virtual_base_patch();
+
+#if defined(OPENUSM_XBPACK_MODE) && !defined(TARGET_XBOX)
+extern void mash_virtual_base_xbpack_patch();
+#endif

@@ -5,6 +5,10 @@
 #include "memory.h"
 #include "string_hash_entry.h"
 
+#ifdef OPENUSM_XBPACK_V10
+#include "exe_allocator.h"
+#endif
+
 #include <type_traits>
 
 struct from_mash_in_place_constructor;
@@ -29,11 +33,27 @@ struct mAvlNode {
     }
 
     void *operator new(size_t size) {
+#ifdef OPENUSM_XBPACK_V10
+        // The retail AVL implementation destroys nodes through the CRT
+        // operator delete at 0x0082207C (see destroy_element at 0x00567350).
+        // Use its matching operator new at 0x00822046.  Both the slab arena
+        // and the injected MinGW CRT are different allocators and therefore
+        // cannot safely supply memory to that destructor.
+        assert(size == sizeof(mAvlNode<T>));
+        return exe_allocator<mAvlNode<T>> {}.allocate(1);
+#else
         return mem_alloc(size);
+#endif
     }
 
     void operator delete(void *ptr, size_t size) {
+#ifdef OPENUSM_XBPACK_V10
+        (void) size;
+        exe_allocator<mAvlNode<T>> {}.deallocate(
+            static_cast<mAvlNode<T> *>(ptr), 1);
+#else
         mem_dealloc(ptr, size);
+#endif
     }
 
     void unmash(mash_info_struct *a3,
@@ -108,11 +128,25 @@ struct mAvlTree : mContainer {
     mAvlTree(from_mash_in_place_constructor *a2) : mContainer(a2) {}
 
     void *operator new(size_t size) {
+#ifdef OPENUSM_XBPACK_V10
+        // A dynamically-created tree is also released by retail code through
+        // the CRT operator delete, so it must use the same allocator as its
+        // nodes.
+        assert(size == sizeof(mAvlTree<T>));
+        return exe_allocator<mAvlTree<T>> {}.allocate(1);
+#else
         return mem_alloc(size);
+#endif
     }
 
     void operator delete(void *ptr, size_t size) {
+#ifdef OPENUSM_XBPACK_V10
+        (void) size;
+        exe_allocator<mAvlTree<T>> {}.deallocate(
+            static_cast<mAvlTree<T> *>(ptr), 1);
+#else
         mem_dealloc(ptr, size);
+#endif
     }
 
     bool get_destruct_contents() const

@@ -19,8 +19,27 @@
 #include "sin_strip_container.h"
 #include "tlresource_location.h"
 #include "utility.h"
+#include "variables.h"
 
 VALIDATE_SIZE(mashable_vector<int>, 8u);
+
+namespace
+{
+template<typename T>
+void check_mash(mashable_vector<T> *vector)
+{
+#ifdef OPENUSM_XBPACK_MODE
+    if (g_platform == NL_PLATFORM_XBOX && !vector->from_mash()) {
+        assert(vector->m_data == nullptr);
+        assert(vector->m_size == 0);
+        assert(!vector->m_shared);
+        return;
+    }
+#endif
+
+    //assert(vector->from_mash());
+}
+}
 
 
 //0x004C7F50
@@ -31,8 +50,6 @@ void mashable_vector<resource_directory *>::custom_un_mash([[maybe_unused]] gene
                                                            [[maybe_unused]] void *a5)
 {
     TRACE("mashable_vector<resource_directory *>::custom_un_mash");
-
-    assert(from_mash());
 
     if (this->m_shared) {
         auto &buffer = a4->field_4;
@@ -115,7 +132,7 @@ void mashable_vector<resource_location>::custom_un_mash(generic_mash_header *hea
                                                         generic_mash_data_ptrs *a4,
                                                         [[maybe_unused]] void *a5)
 {
-    assert(from_mash());
+    check_mash(this);
 
     if (this->m_shared)
     {
@@ -175,7 +192,7 @@ void mashable_vector<tlresource_location>::custom_un_mash(generic_mash_header *h
                                                           generic_mash_data_ptrs *a4,
                                                           [[maybe_unused]] void *a5)
 {
-    assert(from_mash());
+    check_mash(this);
 
     if (this->is_shared())
     {
@@ -235,7 +252,7 @@ void mashable_vector<resource_pack_group>::custom_un_mash(generic_mash_header *h
                                                           [[maybe_unused]] void *a3,
                                                           generic_mash_data_ptrs *a4,
                                                           [[maybe_unused]] void *a5) {
-    assert(from_mash());
+    check_mash(this);
 
     if (this->is_shared()) {
 
@@ -366,7 +383,7 @@ void mashable_vector<fixedstring<4>>::custom_un_mash([[maybe_unused]] generic_ma
                                                      [[maybe_unused]] void *a3,
                                                      generic_mash_data_ptrs *a4,
                                                      [[maybe_unused]] void *a5) {
-    assert(from_mash());
+    check_mash(this);
 
     if (this->is_shared()) {
 

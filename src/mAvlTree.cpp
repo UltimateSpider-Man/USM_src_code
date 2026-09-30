@@ -193,15 +193,13 @@ void mAvlTree<string_hash_entry>::sub_439AD0(mAvlNode<string_hash_entry> *a1) {
 }
 
 int sub_561350(mAvlNode<string_hash_entry> *a1, mAvlNode<string_hash_entry> *a2) {
-    int result = -1;
-
     auto v2 = a2->m_key->field_0.source_hash_code;
     auto v3 = a1->m_key->field_0.source_hash_code;
     if (v3 <= v2) {
-        result = -(v3 < v2);
+        return -(v3 < v2);
     }
 
-    return result;
+    return 1;
 }
 
 //0x0056AE30
@@ -210,81 +208,58 @@ int mAvlTree<string_hash_entry>::addHelper(mAvlNode<string_hash_entry> *a2,
                                            mAvlNode<string_hash_entry> *&a3,
                                            mAvlNode<string_hash_entry> *a4) {
     if constexpr (1) {
-        int result;
-        auto v4 = a3;
-        auto &v5 = *a3;
-
-        if (a3 != nullptr) {
-            auto v8 = v5.m_key->field_0.source_hash_code;
-            auto v9 = a2;
-            auto v10 = a2->m_key->field_0.source_hash_code;
-            if (v10 > v8) {
-                auto a2b = this->addHelper(a2, v5.m_right, &v5);
-                auto v16 = *a3;
-                auto v17 = a3->m_right;
-                char a1a = -1;
-                if (v17) {
-                    a1a = v17->field_10;
-                }
-
-                char v19 = -1;
-                auto v18 = v16.m_left;
-                if (v18) {
-                    v19 = v18->field_10;
-                }
-
-                if (a1a - v19 == 2) {
-                    if (sub_561350(v9, v17) <= 0) {
-                        this->sub_744960(&v4);
-                    } else {
-                        this->sub_43BF70(&v4);
-                    }
-
-                    result = a2b;
-                } else {
-                    this->sub_439AD0(&v16);
-                    result = a2b;
-                }
-
-            } else if (v10 < v8) {
-                auto v11 = this->addHelper(a2, v5.m_left, &v5);
-                auto v12 = *a3;
-                auto a2a = v11;
-                auto *v13 = (*a3).m_left;
-                char a1 = -1;
-                if (v13) {
-                    a1 = v13->field_10;
-                }
-
-                auto *v14 = v12.m_right;
-                char v15 = -1;
-                if (v14) {
-                    v15 = v14->field_10;
-                }
-
-                if ((char) a1 - v15 == 2) {
-                    if (v9->m_key->field_0.source_hash_code >=
-                        v13->m_key->field_0.source_hash_code) {
-                        this->sub_745DF0(&v4);
-                    } else {
-                        this->sub_564370(&v4);
-                    }
-
-                    result = a2a;
-                } else {
-                    this->sub_439AD0(&v12);
-                    result = a2a;
-                }
-            } else {
-                result = 0;
-            }
-        } else {
+        if (a3 == nullptr) {
             a2->m_parent = a4;
             a3 = a2;
             ++this->m_size;
-            result = 1;
+            return 1;
         }
-        return result;
+
+        auto current_hash = a3->m_key->field_0.source_hash_code;
+        auto new_hash = a2->m_key->field_0.source_hash_code;
+        if (new_hash > current_hash) {
+            auto result = this->addHelper(a2, a3->m_right, a3);
+            auto *node = a3;
+            auto *right = node->m_right;
+            auto right_height = right != nullptr ? right->field_10 : -1;
+            auto *left = node->m_left;
+            auto left_height = left != nullptr ? left->field_10 : -1;
+
+            if (right_height - left_height == 2) {
+                if (sub_561350(a2, right) <= 0) {
+                    this->sub_744960(&a3);
+                } else {
+                    this->sub_43BF70(&a3);
+                }
+            } else {
+                this->sub_439AD0(node);
+            }
+
+            return result;
+        }
+
+        if (new_hash < current_hash) {
+            auto result = this->addHelper(a2, a3->m_left, a3);
+            auto *node = a3;
+            auto *left = node->m_left;
+            auto left_height = left != nullptr ? left->field_10 : -1;
+            auto *right = node->m_right;
+            auto right_height = right != nullptr ? right->field_10 : -1;
+
+            if (left_height - right_height == 2) {
+                if (new_hash >= left->m_key->field_0.source_hash_code) {
+                    this->sub_745DF0(&a3);
+                } else {
+                    this->sub_564370(&a3);
+                }
+            } else {
+                this->sub_439AD0(node);
+            }
+
+            return result;
+        }
+
+        return 0;
     } else {
         return THISCALL(0x0056AE30, this, a2, a3, a4);
     }

@@ -1,6 +1,6 @@
 #pragma once
 
-#ifdef TARGET_XBOX
+#if defined(TARGET_XBOX) || defined(OPENUSM_XBPACK_MODE)
 
 #include "mash_virtual_base.h"
 #include "mash_info_struct.h"
@@ -8,7 +8,7 @@
 template<typename T>
 struct mashable_interface : mash_virtual_base
 {
-    T *ifc;
+    T *ifc = nullptr;
 
     auto *get_interface()
     {
