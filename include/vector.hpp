@@ -650,7 +650,7 @@ const int _VBITS = 8 * sizeof(_Vbase); // at least CHAR_BITS bits per word
 
 // store information common to reference and iterators
 template<class _MycontTy>
-struct _Vb_iter_base : public _Ranit<_Bool, typename _MycontTy::difference_type, bool *, bool> {
+struct _Vb_iter_base : public _Ranit<bool, typename _MycontTy::difference_type, bool *, bool> {
     _Vb_iter_base() : _Myptr(0), _Myoff(0) { // construct with null pointer
     }
 
@@ -738,7 +738,7 @@ public:
     typedef bool const_reference;
 
     typedef std::random_access_iterator_tag iterator_category;
-    typedef _Bool value_type;
+    typedef bool value_type;
     typedef typename _MycontTy::size_type size_type;
     typedef typename _MycontTy::difference_type difference_type;
     typedef const_reference *pointer;
@@ -888,7 +888,7 @@ public:
     typedef bool const_reference;
 
     typedef std::random_access_iterator_tag iterator_category;
-    typedef _Bool value_type;
+    typedef bool value_type;
     typedef typename _MycontTy::size_type size_type;
     typedef typename _MycontTy::difference_type difference_type;
     typedef _Reft *pointer;
@@ -966,13 +966,13 @@ _Vb_iterator<_MycontTy> operator+(typename _Vb_iterator<_MycontTy>::difference_t
 
 // varying size array of bits
 template<class _Alloc>
-struct vector<_Bool, _Alloc> : public _Container_base {
+struct vector<bool, _Alloc> : public _Container_base {
     typedef typename _Alloc::size_type size_type;
     typedef typename _Alloc::difference_type _Dift;
     typedef _std::vector<_Vbase, typename std::allocator_traits<_Alloc>::template rebind_alloc<_Vbase>> _Vbtype;
-    typedef _std::vector<_Bool, _Alloc> _Myt;
+    typedef _std::vector<bool, _Alloc> _Myt;
     typedef _Dift difference_type;
-    typedef _Bool _Ty;
+    typedef bool _Ty;
     typedef _Alloc allocator_type;
 
     typedef _Vb_reference<_Myt> reference;
@@ -1256,7 +1256,7 @@ struct vector<_Bool, _Alloc> : public _Container_base {
 
     void swap(_Myt &_Right) { // exchange contents with right
 
-        std::swap(m_size, _Right._Mysize);
+        std::swap(m_size, _Right.m_size);
         _Myvec.swap(_Right._Myvec);
     }
 

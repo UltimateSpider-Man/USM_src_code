@@ -704,14 +704,14 @@ template<class _Ty>
 	typedef const _Ty& reference;
 	};
 
-template<> struct iterator_traits<_Bool>
+template<> struct iterator_traits<bool>
 	{	// get traits from integer type
 	typedef _Int_iterator_tag iterator_category;
-	typedef _Bool value_type;
-	typedef _Bool difference_type;
-	typedef _Bool distance_type;
-	typedef _Bool * pointer;
-	typedef _Bool& reference;
+	typedef bool value_type;
+	typedef bool difference_type;
+	typedef bool distance_type;
+	typedef bool * pointer;
+	typedef bool& reference;
 	};
 
 template<> struct iterator_traits<char>
@@ -1151,13 +1151,13 @@ struct _Ptr_cat_helper<_Undefined_inner_type_tag, _Undefined_inner_type_tag>
 
 		// INTEGER FUNCTION _Ptr_cat
 template<>
-struct _Ptr_cat_helper<_Bool *, _Bool *>
+struct _Ptr_cat_helper<bool *, bool *>
 	{	// return pointer category from pointer to pointer arguments
 	typedef _Scalar_ptr_iterator_tag _Ptr_cat;
 	};
 
 template<>
-struct _Ptr_cat_helper<const _Bool *, _Bool *>
+struct _Ptr_cat_helper<const bool *, bool *>
 	{	// return pointer category from pointer to pointer arguments
 	typedef _Scalar_ptr_iterator_tag _Ptr_cat;
 	};
@@ -3848,8 +3848,9 @@ _CRTIMP void __cdecl _invalid_parameter(const wchar_t *, const wchar_t *, const 
 
 #else /* _DEBUG */
 
-extern "C"
-_CRTIMP void __cdecl _invalid_parameter_noinfo(void);
+#if !defined(__MINGW32__)
+extern "C" _CRTIMP void __cdecl _invalid_parameter_noinfo(void);
+#endif
 
 #endif /* def _DEBUG */
 
