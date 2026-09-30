@@ -11,6 +11,6 @@ namespace als
         float field_4;
         float field_8;
 
-        void unmash(mash_info_struct *, void *) {}
+        void unmash(mash_info_struct *, void *);
     };
 }

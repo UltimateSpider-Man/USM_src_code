@@ -4,22 +4,31 @@
 #include "als_filter_data.h"
 #include "als_request_data.h"
 #include "mash_info_struct.h"
+#include "mash_config.h"
 #include "common.h"
 #include "state_machine.h"
 #include "trace.h"
 #include "utility.h"
+#include "xbpack.h"
 
 namespace als
 {
     VALIDATE_SIZE(basic_rule_data, 0x24);
     VALIDATE_SIZE(basic_rule_data::post_action_rule_set, 0x28u);
 
+    void filter_data::unmash(mash_info_struct *, void *)
+    {
+#ifdef OPENUSM_XBPACK_V10
+        this->field_0 = xbpack::pc_als_param(this->field_0);
+#endif
+    }
+
     void basic_rule_data::unmash(mash_info_struct *a1, void *)
     {
         a1->unmash_class_in_place(this->field_0, this);
         a1->unmash_class_in_place(this->field_14, this);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
         {
             uint8_t class_mashed = -1;
             class_mashed = *a1->read_from_buffer(mash::SHARED_BUFFER, 1, 1);
@@ -30,7 +39,7 @@ namespace als
         if (this->field_20 != nullptr)
         {
             a1->unmash_class(this->field_20, this
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                 , mash::NORMAL_BUFFER
 #endif
                     );
@@ -76,7 +85,7 @@ namespace als
     {
         a1->unmash_class_in_place(this->field_8, this);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
         {
             uint8_t class_mashed = -1;
             class_mashed = *a1->read_from_buffer(mash::SHARED_BUFFER, 1, 1);
@@ -87,7 +96,7 @@ namespace als
         if (this->destination_states != nullptr)
         {
             a1->unmash_class(this->destination_states, this
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                 , mash::NORMAL_BUFFER
 #endif
                     );

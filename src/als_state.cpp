@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "mash_info_struct.h"
+#include "mash_config.h"
 #include "param_block.h"
 #include "vtbl.h"
 #include "trace.h"
@@ -24,7 +25,7 @@ namespace als {
             a2->unmash_class_in_place(this->m_state_id, a3);
             a2->unmash_class_in_place(this->m_cat_id, a3);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
             {
                 uint8_t class_mashed = -1;
                 class_mashed = *a2->read_from_buffer(mash::SHARED_BUFFER, 1, 1);
@@ -35,7 +36,7 @@ namespace als {
             if ( this->field_10 != nullptr )
             {
                 a2->unmash_class(this->field_10, a3
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                         , mash::NORMAL_BUFFER
 #endif
                         );

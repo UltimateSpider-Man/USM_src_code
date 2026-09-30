@@ -2,6 +2,7 @@
 
 #include "variable.h"
 
+
 #include "actor.h"
 #include "ai_player_controller.h"
 #include "ai_state_jump.h"
@@ -885,4 +886,13 @@ void hero_inode_patch()
         FUNC_ADDRESS(address, &ai::hero_inode::jump_can_go_to);
         SET_JUMP(0x006A6E70, address);
     }
+
+   
+{
+    void *address =
+        reinterpret_cast<void *>(&ai::hero_inode::get_hero_type);
+
+    REDIRECT(0x006EC609, address);
+}
+		
 }

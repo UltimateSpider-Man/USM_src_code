@@ -15,3 +15,4 @@ struct als_resource_handler : base_engine_resource_handler {
 };
 
 extern void als_resource_handler_patch();
+extern void als_resource_handler_xbpack_patch();

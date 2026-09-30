@@ -3,6 +3,7 @@
 #include "als_meta_anim_base.h"
 #include "als_nal_meta_anim.h"
 #include "common.h"
+#include "exe_allocator.h"
 #include "func_wrapper.h"
 #include "trace.h"
 
@@ -13,7 +14,18 @@ namespace als {
     als_meta_anim_table_shared::als_meta_anim_table_shared(
         from_mash_in_place_constructor *a2)
     {
+#ifdef OPENUSM_XBPACK_V10
         this->field_0 = {a2};
+        for (auto i = 0; i < this->field_0.size(); ++i) {
+            auto *&anim = this->field_0.m_data[i];
+            if (anim != nullptr) {
+                anim = static_cast<als_meta_anim_base *>(
+                    mash_virtual_base::construct_class_helper(anim));
+            }
+        }
+#else
+        this->field_0 = {a2};
+#endif
         this->initialize(mash::FROM_MASH);
     }
 
@@ -24,11 +36,12 @@ namespace als {
         if constexpr (1) {
             if ( a2 == mash::FROM_MASH ) {
                 auto count = this->field_0.size();
-                auto *mem = operator new(sizeof(als_nal_meta_anim) * count);
-                this->field_14 = new (mem) als_nal_meta_anim [count];
+                auto *mem = exe_allocator<als_nal_meta_anim> {}.allocate(count);
+                this->field_14 = static_cast<als_nal_meta_anim *>(mem);
 
                 for ( auto i = 0; i < count; ++i )
                 {
+                    new (&this->field_14[i]) als_nal_meta_anim;
                     auto *anim_ptr = this->field_0.at(i);
                     this->field_14[i].create(anim_ptr);
                 }

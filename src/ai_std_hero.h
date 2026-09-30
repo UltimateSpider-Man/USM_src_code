@@ -22,7 +22,17 @@ enum hero_type_enum {
     SPIDEY = 1,
     VENOM = 2,
     PARKER = 3,
+    CARNAGE = 4
 };
+
+// Retail scripts, mission/token filters and controller code only understand
+// the original hero values. Carnage has its own source/UI identity, but uses
+// Venom's gameplay family at those native boundaries.
+constexpr hero_type_enum native_hero_type(hero_type_enum type)
+{
+    return type == hero_type_enum::CARNAGE ? hero_type_enum::VENOM : type;
+}
+
 
 namespace ai {
 

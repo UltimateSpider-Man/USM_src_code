@@ -1,11 +1,14 @@
 #include "als_animation_logic_system_shared.h"
 
 #include "als_meta_anim_table_shared.h"
+#include "als_nal_meta_anim.h"
+#include "exe_allocator.h"
 #include "func_wrapper.h"
 #include "layer_state_machine_shared.h"
 #include "mash_info_struct.h"
 #include "common.h"
 #include "mash_virtual_base.h"
+#include "mash_config.h"
 #include "state_machine_shared.h"
 #include "trace.h"
 
@@ -47,7 +50,9 @@ namespace als {
             auto *v3 = this->field_18;
             if ( v3 != nullptr )
             {
-                operator delete[](v3->field_14);
+                exe_allocator<als_nal_meta_anim> {}.deallocate(
+                    v3->field_14,
+                    v3->field_0.size());
                 v3->field_14 = nullptr;
 
                 v3->field_0.destruct_mashed_class();
@@ -67,7 +72,7 @@ namespace als {
         {
             a1->unmash_class_in_place(this->field_0, this);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
             {
                 uint8_t class_mashed = -1;
                 class_mashed = *a1->read_from_buffer(mash::SHARED_BUFFER, 1, 1);
@@ -78,7 +83,7 @@ namespace als {
             if ( this->field_14 != nullptr )
             {
                 auto *v4 = a1->read_from_buffer(
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                     mash::NORMAL_BUFFER,
 #endif
                         sizeof(state_machine_shared), 0);
@@ -88,7 +93,7 @@ namespace als {
 
                 auto v5 = this->field_14->get_mash_sizeof();
                 a1->advance_buffer(
-#ifdef TARGET_XBOX 
+#if OPENUSM_XBOX_MASH_FORMAT
                     mash::NORMAL_BUFFER,
 #endif 
                     v5 - sizeof(als::state_machine_shared));
@@ -96,7 +101,7 @@ namespace als {
                 this->field_14->unmash(a1, this);
             }
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
             {
                 uint8_t class_mashed = -1;
                 class_mashed = *a1->read_from_buffer(mash::SHARED_BUFFER, 1, 1);
@@ -107,7 +112,7 @@ namespace als {
             if ( this->field_18 != nullptr )
             {
                 a1->unmash_class(this->field_18, this
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                     , mash::NORMAL_BUFFER
 #endif
                         );

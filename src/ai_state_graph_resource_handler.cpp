@@ -23,7 +23,7 @@ bool ai_state_graph_resource_handler::_handle(worldly_resource_handler::eBehavio
 {
     TRACE("ai_state_graph_resource_handler::handle");
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
     this->field_10 = RESOURCE_KEY_TYPE_AI_STATE_GRAPH;
 #endif
 
@@ -50,20 +50,20 @@ bool ai_state_graph_resource_handler::_handle_resource(worldly_resource_handler:
             ai::state_graph *new_state_graph = CAST(new_state_graph, resource);
             assert(new_state_graph != nullptr);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
             mash_info_struct a1 {mash::UNMASH_MODE, resource, a3->m_size, true};
 #else
             mash_info_struct a1 {resource, a3->m_size};
 #endif
 
             a1.unmash_class(new_state_graph, nullptr
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                 , mash::NORMAL_BUFFER
 #endif
                     );
             mash_info_struct::construct_class(new_state_graph);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
             a3->m_offset += a1.get_header_size();
 #endif
         }
@@ -75,6 +75,14 @@ bool ai_state_graph_resource_handler::_handle_resource(worldly_resource_handler:
     {
         return (bool) THISCALL(0x00568AF0, this, a2, a3);
     }
+}
+
+void ai_state_graph_resource_handler_xbpack_patch()
+{
+#ifdef OPENUSM_XBPACK_MODE
+    FUNC_ADDRESS(address, &ai_state_graph_resource_handler::_handle_resource);
+    set_vfunc(0x00888A24, address);
+#endif
 }
 
 void ai_state_graph_resource_handler_patch()
