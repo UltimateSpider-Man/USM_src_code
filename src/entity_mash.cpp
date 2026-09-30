@@ -7,14 +7,68 @@
 #include "utility.h"
 
 #include <cassert>
+#ifdef OPENUSM_XBPACK_MODE
+#include <cstdio>
+#include <windows.h>
+#endif
 
 Var<int[28]> ent_v_table_lookup{0x0095A5F0};
 Var<int[28]> ent_size_lookup{0x0095A2A0};
 
 Var<int [11]> ifc_v_table_lookup {0x0095A66C};
 
+uint16_t pc_entity_mash_type(uint16_t type)
+{
+#ifdef OPENUSM_XBPACK_V10
+    if ( type >= 27 )
+        return type - 1;
+#endif
+    return type;
+}
+
+uint32_t entity_mash_size(uint16_t type)
+{
+#ifdef OPENUSM_XBPACK_V10
+    static constexpr uint16_t v10_sizes[] = {
+        0x44,  0x48,  0x68,  0xBC,  0xE8,  0x12C, 0xCC,  0x1A0,
+        0xFC,  0x110, 0x328, 0x148, 0x340, 0x274, 0x6C,  0x158,
+        0x68,  0x68,  0x68,  0x70,  0x68,  0x84,  0xBC,  0x6C,
+        0x150, 0xDC,  0xD8,  0xC4,  0x78,
+    };
+
+    assert(type < sizeof(v10_sizes) / sizeof(v10_sizes[0]));
+    return v10_sizes[type];
+#else
+    assert(type < 28);
+    return ent_size_lookup()[type];
+#endif
+}
+
 void fix_entity_v_table(char *addr, eEntityMashTypeEnum type)
 {
+#ifdef OPENUSM_XBPACK_MODE
+#ifndef OPENUSM_XBPACK_V10
+    uint32_t current_vtable = 0;
+    uint32_t mashed_vtable = 0;
+    std::memcpy(&current_vtable, addr, sizeof(current_vtable));
+    std::memcpy(&mashed_vtable, MASH_V_TABLE_VAL, sizeof(mashed_vtable));
+    const auto expected_vtable = static_cast<uint32_t>(ent_v_table_lookup()[type]);
+
+    if (current_vtable != mashed_vtable && current_vtable != expected_vtable) {
+        char message[192];
+        std::snprintf(message,
+                      sizeof(message),
+                      "XBPACK invalid entity vtable: addr=%p type=%d actual=0x%08X expected=0x%08X\n",
+                      addr,
+                      static_cast<int>(type),
+                      current_vtable,
+                      expected_vtable);
+        OutputDebugStringA(message);
+        DebugBreak();
+        return;
+    }
+#endif
+#else
     assert(addr[0] == ((char *)&MASH_V_TABLE_VAL)[0] || addr[0] == ((char *)&ent_v_table_lookup()[type])[0]);
 
     assert(addr[1] == ((char *)&MASH_V_TABLE_VAL)[1] || addr[1] == ((char *)&ent_v_table_lookup()[type])[1]);
@@ -22,12 +76,14 @@ void fix_entity_v_table(char *addr, eEntityMashTypeEnum type)
     assert(addr[2] == ((char *)&MASH_V_TABLE_VAL)[2] || addr[2] == ((char *)&ent_v_table_lookup()[type])[2]);
 
     assert(addr[3] == ((char *)&MASH_V_TABLE_VAL)[3] || addr[3] == ((char *)&ent_v_table_lookup()[type])[3]);
+#endif
 
     std::memcpy(addr, &ent_v_table_lookup()[type], 4);
 }
 
 void fix_ifc_v_table(char *addr, eEntityMashIFCTypeEnum ifc_type)
 {
+#ifndef OPENUSM_XBPACK_V10
     assert(addr[0] == ((char *)&MASH_V_TABLE_VAL)[0] || addr[0] == ((char *)&ifc_v_table_lookup()[ifc_type])[0]);
 
     assert(addr[1] == ((char *)&MASH_V_TABLE_VAL)[1] || addr[1] == ((char *)&ifc_v_table_lookup()[ifc_type])[1]);
@@ -35,6 +91,7 @@ void fix_ifc_v_table(char *addr, eEntityMashIFCTypeEnum ifc_type)
     assert(addr[2] == ((char *)&MASH_V_TABLE_VAL)[2] || addr[2] == ((char *)&ifc_v_table_lookup()[ifc_type])[2]);
 
     assert(addr[3] == ((char *)&MASH_V_TABLE_VAL)[3] || addr[3] == ((char *)&ifc_v_table_lookup()[ifc_type])[3]);
+#endif
 
     std::memcpy(addr, &ifc_v_table_lookup()[ifc_type], 4);
 }

@@ -90,7 +90,7 @@ struct entity_base_disk {
     int16_t bone_idx;
     int8_t field_40;
     int8_t field_41;
-    int8_t rel_po_idx;
+    uint8_t rel_po_idx;
     int8_t proximity_map_reference_count;
 };
 #pragma pack(pop)
@@ -216,7 +216,7 @@ struct entity_base : entity_base_vtable {
     int16_t field_3E;
     int8_t field_40;
     int8_t field_41;
-    int8_t rel_po_idx;
+    uint8_t rel_po_idx;
     int8_t proximity_map_reference_count;
 
     entity_base() = default;

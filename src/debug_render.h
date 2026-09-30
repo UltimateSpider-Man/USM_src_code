@@ -131,6 +131,19 @@ extern void render_debug_spheres();
 
 extern void render_debug_lines();
 
+extern void clear_debug_spheres();
+
+extern void clear_debug_lines();
+
+extern void add_debug_cylinder(const vector3d &start,
+                               const vector3d &end,
+                               Float radius,
+                               color32 color);
+
+extern void render_debug_cylinders();
+
+extern void clear_debug_cylinders();
+
 //0x00578480
 extern int debug_render_get_ival(debug_render_items_e item);
 
@@ -143,6 +156,8 @@ extern bool debug_render_get_bval(debug_render_items_e item);
 extern int debug_render_get_min(debug_render_items_e item);
 
 extern int debug_render_get_max(debug_render_items_e item);
+
+extern const char *debug_render_get_name(debug_render_items_e item);
 
 //0x005784F0
 extern void debug_render_init();
@@ -187,7 +202,6 @@ struct PCUV_ShaderMaterial;
 
 extern PCUV_ShaderMaterial *debug_material;
 
-extern Var<int[34]> debug_render_items;
+extern Var<int[DEBUG_RENDER_ITEMS_COUNT]> debug_render_items;
 
 extern void debug_render_patch();
-

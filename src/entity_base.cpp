@@ -3,6 +3,9 @@
 #include "common.h"
 
 #include "actor.h"
+#ifdef OPENUSM_XBPACK_MODE
+#include "actor_xbpack.h"
+#endif
 #include "box_trigger.h"
 #include "conglom.h"
 #include "convex_box.h"
@@ -557,12 +560,13 @@ time_interface *entity_base::time_ifc() {
 }
 
 bool entity_base::has_damage_ifc() {
-    return false;
+    bool (__fastcall *func)(entity_base *) = CAST(func, get_vfunc(m_vtbl, 0x114));
+    return func(this);
 }
 
 damage_interface *entity_base::damage_ifc() {
-    assert(0 && "Accessing an invalid interface");
-    return nullptr;
+    damage_interface * (__fastcall *func)(entity_base *) = CAST(func, get_vfunc(m_vtbl, 0x118));
+    return func(this);
 }
 
 bool entity_base::has_facial_expression_ifc() {
@@ -965,6 +969,9 @@ void entity_base::un_mash_start(generic_mash_header *a2,
     this->my_handle = entity_handle_manager::add_entity(this);
 
     this->un_mash(a2, a3, a4);
+#ifdef OPENUSM_XBPACK_MODE
+    actor_xbpack_finish(a4);
+#endif
     if (!this->is_conglom_member()) {
         entity_handle_manager::register_entity(this);
     }

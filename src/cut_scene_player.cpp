@@ -1,6 +1,7 @@
 #include "cut_scene_player.h"
 
 #include "common.h"
+#include "comic_panels.h"
 #include "func_wrapper.h"
 #include "input_mgr.h"
 #include "nal_system.h"
@@ -12,6 +13,29 @@
 #include <cstdlib>
 
 VALIDATE_SIZE(cut_scene_player, 360u);
+
+#ifdef OPENUSM_XBPACK_V10
+namespace {
+struct cut_scene_panel_entry {
+    uint32_t name_hash;
+    comic_panels::panel *panel;
+};
+
+void *__fastcall create_tracking_panel(cut_scene_player *player, void *,
+                                       uint32_t name_hash, bool create)
+{
+    auto *entry = reinterpret_cast<cut_scene_panel_entry *>(
+        THISCALL(0x0073A710, player, name_hash, create));
+    // Retail unhides existing panels before setting up tracking panels.
+    // V10 feed closeups have no preceding NAL panel, so setup creates a
+    // hidden panel after that pass. Publish it once playback is ready.
+    if (player->field_E0 && entry != nullptr && entry->panel != nullptr) {
+        entry->panel->field_67 = false;
+    }
+    return entry;
+}
+} // namespace
+#endif
 
 cut_scene_player::cut_scene_player()
 {
@@ -135,6 +159,13 @@ void cut_scene_player::stop(cut_scene *a2)
     {
         THISCALL(0x00740660, this, a2);
     }
+}
+
+void cut_scene_player_xbpack_v10_patch()
+{
+#ifdef OPENUSM_XBPACK_V10
+    REDIRECT(0x0073F39B, create_tracking_panel);
+#endif
 }
 
 void cut_scene_player_patch() {

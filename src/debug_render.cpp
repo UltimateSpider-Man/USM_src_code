@@ -27,9 +27,12 @@
 
 #include <ngl_mesh.h>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 
 VALIDATE_SIZE(debug_line, 0x20);
 VALIDATE_SIZE(debug_lines_t, 0x2808);
@@ -270,6 +273,59 @@ void render_debug_spheres()
     debug_spheres.render();
 }
 
+void clear_debug_spheres()
+{
+    debug_spheres.clear();
+}
+
+namespace {
+
+struct queued_debug_cylinder {
+    vector3d start;
+    vector3d end;
+    float radius;
+    color32 color;
+};
+
+constexpr auto MAX_DEBUG_CYLINDERS = 128u;
+std::array<queued_debug_cylinder, MAX_DEBUG_CYLINDERS> debug_cylinders{};
+std::uint32_t num_debug_cylinders = 0;
+
+} // namespace
+
+void add_debug_cylinder(const vector3d &start,
+                        const vector3d &end,
+                        Float radius,
+                        color32 color)
+{
+    if (num_debug_cylinders == MAX_DEBUG_CYLINDERS) {
+        std::move(debug_cylinders.begin() + 1,
+                  debug_cylinders.end(),
+                  debug_cylinders.begin());
+        --num_debug_cylinders;
+    }
+
+    debug_cylinders[num_debug_cylinders++] = {
+        start, end, static_cast<float>(radius), color
+    };
+}
+
+void render_debug_cylinders()
+{
+    for (std::uint32_t i = 0; i < num_debug_cylinders; ++i) {
+        const auto &cylinder = debug_cylinders[i];
+        render_debug_capsule(cylinder.start,
+                             cylinder.end,
+                             cylinder.radius,
+                             cylinder.color);
+    }
+}
+
+void clear_debug_cylinders()
+{
+    num_debug_cylinders = 0;
+}
+
 void sub_CB3F80(const vector3d &a1,
                 const vector3d &a2,
                 const vector3d &a3,
@@ -343,11 +399,71 @@ void render_quad(const vector3d &pt1, const vector3d &pt2, const vector3d &pt3, 
     }
 }
 
-Var<int[51]> min_values{0x009617A0};
+namespace {
 
-Var<int[51]> max_values{0x009227E8};
+constexpr const char *debug_render_item_names[DEBUG_RENDER_ITEMS_COUNT] = {
+    "CAPSULE_HISTORY",
+    "LIGHTS",
+    "BOX_TRIGGERS",
+    "WATER_EXCLUSION_TRIGGERS",
+    "POINT_TRIGGERS",
+    "ENTITY_TRIGGERS",
+    "INTERACTABLE_TRIGGERS",
+    "OCCLUSION",
+    "LEGOS",
+    "REGION_MESHES",
+    "ENTITIES",
+    "LOW_LODS",
+    "ACTIVITY_INFO",
+    "RENDER_INFO",
+    "COLLIDE_INFO",
+    "MARKERS",
+    "PARKING_MARKERS",
+    "WATER_EXIT_MARKERS",
+    "MISSION_MARKERS",
+    "PATHS",
+    "GLASS_HOUSE",
+    "OBBS",
+    "TRAFFIC_PATHS",
+    "MINI_GAME",
+    "BRAINS",
+    "VOICE",
+    "PATROLS",
+    "PAUSE_TIMERS",
+    "ANIM_INFO",
+    "SCENE_ANIM_INFO",
+    "TARGETING",
+    "VIS_SPHERES",
+    "LADDERS",
+    "COLLISIONS",
+    "BRAINS_ENABLED",
+    "ANCHORS",
+    "LINE_INFO",
+    "SUBDIVISION",
+    "SKELETONS",
+    "SOUND_STREAM_USAGE",
+    "SPHERES",
+    "LINES",
+    "CYLINDERS",
+    "DGRAPH",
+    "PEDS",
+    "TRAFFIC",
+    "ALS",
+    "AI_COVER_MARKERS",
+    "LIMBO_GLOW",
+    "BIPED_COLL_VOLUMES",
+    "DECALS",
+};
 
-Var<int[34]> debug_render_items = {0x00960D30};
+static_assert(std::size(debug_render_item_names) == DEBUG_RENDER_ITEMS_COUNT);
+
+} // namespace
+
+Var<int[DEBUG_RENDER_ITEMS_COUNT]> min_values{0x009617A0};
+
+Var<int[DEBUG_RENDER_ITEMS_COUNT]> max_values{0x009227E8};
+
+Var<int[DEBUG_RENDER_ITEMS_COUNT]> debug_render_items = {0x00960D30};
 
 int debug_render_get_ival(debug_render_items_e item) {
     assert(item < DEBUG_RENDER_ITEMS_COUNT);
@@ -357,6 +473,8 @@ int debug_render_get_ival(debug_render_items_e item) {
 
 void debug_render_set_ival(debug_render_items_e a1, int a2)
 {
+    assert(a1 >= 0 && a1 < DEBUG_RENDER_ITEMS_COUNT);
+
     auto max = a2;
     if ( a2 > debug_render_get_max(a1) )
     {
@@ -394,6 +512,12 @@ int debug_render_get_max(debug_render_items_e item)
     return max_values()[item];
 }
 
+const char *debug_render_get_name(debug_render_items_e item)
+{
+    assert(item >= 0 && item < DEBUG_RENDER_ITEMS_COUNT);
+    return debug_render_item_names[item];
+}
+
 //std::vector<vector3d> s_debug_hemisphere_pos{};
 
 nglMesh *s_debug_hemisphere{nullptr};
@@ -409,8 +533,9 @@ void debug_render_init()
     TRACE("debug_render_init");
 
     if constexpr (1) {
-        static Var<std::array<int, 51>> initial_values {0x00922718};
-        std::memcpy(debug_render_items(), &initial_values(), sizeof(debug_render_items()));
+        static Var<std::array<int, DEBUG_RENDER_ITEMS_COUNT>> initial_values {0x00922718};
+        static_assert(sizeof(debug_render_items()) == sizeof(initial_values()));
+        std::memcpy(debug_render_items(), initial_values().data(), sizeof(debug_render_items()));
     } else {
         CDECL_CALL(0x005784F0);
     }
@@ -462,6 +587,13 @@ void debug_render_done()
         }
 
         debug_material = nullptr;
+
+        delete debug_strings;
+        debug_strings = nullptr;
+
+        debug_lines.clear();
+        debug_spheres.clear();
+        clear_debug_cylinders();
     }
 }
 
@@ -482,6 +614,7 @@ void render_debug_capsule(const vector3d &a2, const vector3d &a3, Float a4, colo
     auto v33 = v36.length();
     if ( v33 < 0.0049999999 ) {
         render_debug_hemisphere(a2, a4, a5);
+        return;
     }
 
     v36.normalize();
@@ -567,9 +700,20 @@ static color32 stru_1589F90[] = {color32{0, 255, 0, 128},
 
 void render_billboard(const vector3d &arg0, color32 a2, float a5, const char *a4)
 {
-    if ( os_developer_options::instance->get_flag(mString {"SHOW_DEBUG_TEXT"}) )
+#ifdef OPENUSM_ULTIMATE_RELEASE
+    const bool show_debug_text = true;
+#else
+    auto *options = os_developer_options::instance;
+    const bool show_debug_text =
+        options != nullptr && options->get_flag(mString{"SHOW_DEBUG_TEXT"});
+#endif
+
+    if (show_debug_text && a4 != nullptr && app::instance != nullptr)
     {
         auto *Font = g_femanager.GetFont(static_cast<font_index>(0));
+        if (Font == nullptr || app::instance->m_game == nullptr) {
+            return;
+        }
 
         uint32_t v39, v38;
         nglGetStringDimensions(Font, &v39, &v38, "M");
@@ -577,6 +721,10 @@ void render_billboard(const vector3d &arg0, color32 a2, float a5, const char *a4
         auto *v5 = app::instance;
         auto *v6 = v5->m_game;
         auto *v7 = v6->get_current_view_camera(0);
+        if (v7 == nullptr) {
+            return;
+        }
+
         auto &v8 = v7->get_abs_po();
         auto &v9 = v8.get_z_facing();
         auto v35 = v9;
@@ -603,8 +751,11 @@ void render_billboard(const vector3d &arg0, color32 a2, float a5, const char *a4
                     auto v16 = sub_501B20(v15, v30);
                     v30 = v16;
 
+                    std::array<char, 2048> text{};
+                    std::strncpy(text.data(), a4, text.size() - 1);
+
                     char *v29 = nullptr;
-                    auto *a1 = a4;
+                    auto *a1 = text.data();
                     for (;; a1 = v29 + 1 )
                     {
                         v29 = strchr(a1, 10);
@@ -616,13 +767,21 @@ void render_billboard(const vector3d &arg0, color32 a2, float a5, const char *a4
                         v29[0] = '\0';
                         mString v25 {a1};
                         vector2di v17 {v30[0], v30[1]};
+#ifdef OPENUSM_ULTIMATE_RELEASE
+                        render_text_unchecked(v25, v17, a2, 0.0, a5);
+#else
                         render_text(v25, v17, a2, 0.0, a5);
+#endif
                         v30[1] += v37;
                     }
 
                     mString v27 {a1};
                     vector2di v18 {v30[0], v30[1]};
+#ifdef OPENUSM_ULTIMATE_RELEASE
+                    render_text_unchecked(v27, v18, a2, 0.0, a5);
+#else
                     render_text(v27, v18, a2, 0.0, a5);
+#endif
                 }
             }
         }
@@ -635,7 +794,8 @@ void print_3d_text(const vector3d &arg0, color32 arg4, float a3, const char *a2,
     va_start(va, a2);
 
     char a1[2048] {};
-    vsprintf(a1, a2, va);
+    vsnprintf(a1, sizeof(a1), a2, va);
+    va_end(va);
     render_billboard(arg0, arg4, a3, a1);
 }
 
@@ -645,7 +805,8 @@ void print_3d_text(const vector3d &arg0, color32 arg4, const char *a2, ...)
     va_list va;
 
     va_start(va, a2);
-    vsprintf(a1, a2, va);
+    vsnprintf(a1, sizeof(a1), a2, va);
+    va_end(va);
     render_billboard(arg0, arg4, 1.0, a1);
 }
 

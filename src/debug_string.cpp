@@ -1,5 +1,7 @@
 #include "debug_string.h"
 
+#include "debug_render.h"
+
 fixed_vector<debug_string_t, 25> *debug_strings{nullptr};
 
 debug_string_t::debug_string_t(
@@ -26,6 +28,7 @@ void add_3d_debug_str(const vector3d &arg0, color32 a2, Float a3, const mString 
                 it->field_14 = arg0;
                 it->field_10 = a2;
                 it->field_20 = a3;
+                it->field_24 = 0.5f;
                 return;
             }
 
@@ -40,4 +43,53 @@ void add_3d_debug_str(const vector3d &arg0, color32 a2, Float a3, const mString 
 
         debug_strings->push_back(v4);
     }
+}
+
+void render_3d_debug_strings()
+{
+    if (debug_strings == nullptr) {
+        return;
+    }
+
+    for (auto &entry : *debug_strings) {
+        if (entry.field_0 && entry.field_20 > 0.0f && !entry.field_4.empty()) {
+            render_billboard(entry.field_14,
+                             entry.field_10,
+                             entry.field_24,
+                             entry.field_4.c_str());
+        }
+    }
+}
+
+void frame_advance_3d_debug_strings(Float time_inc)
+{
+    if (debug_strings == nullptr || time_inc <= 0.0f) {
+        return;
+    }
+
+    for (auto &entry : *debug_strings) {
+        if (!entry.field_0) {
+            continue;
+        }
+
+        entry.field_20 -= time_inc;
+        if (entry.field_20 <= 0.0f) {
+            entry.field_20 = 0.0f;
+            entry.field_0 = false;
+        }
+    }
+}
+
+void clear_3d_debug_strings()
+{
+    if (debug_strings == nullptr) {
+        return;
+    }
+
+    for (auto &entry : *debug_strings) {
+        entry.field_0 = false;
+        entry.field_20 = 0.0f;
+    }
+
+    debug_strings->m_size = 0;
 }

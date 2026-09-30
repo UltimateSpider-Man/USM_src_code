@@ -1044,25 +1044,32 @@ void create_ngl_menu(debug_menu *parent)
     }
 }
 
-//inline Var<mString [51]> debug_render_items_names {0x00961168};
-
-//inline Var<int [51]> debug_render_items {0x00960D30};
-
 #include "debug_render.h"
-// enum debug_render_items_e {};
 
-inline int debug_render_get_min(int a1)
+namespace {
+
+debug_render_items_e debug_render_item_for_entry(const debug_menu_entry *entry)
 {
-    static Var<int [51]> min_values {0x009617A0};
-
-    return min_values()[a1];
+    const auto item = static_cast<debug_render_items_e>(entry->get_id());
+    assert(item >= 0 && item < DEBUG_RENDER_ITEMS_COUNT);
+    return item;
 }
 
-inline int debug_render_get_max(int a1)
+std::string debug_render_entry_callback(debug_menu_entry *entry)
 {
-    static Var<int [51]> max_values {0x009227E8};
-    return max_values()[a1];
+    const auto item = debug_render_item_for_entry(entry);
+    entry->m_value.ival = debug_render_get_ival(item);
+    return entry_render_callback_default(entry);
 }
+
+void debug_render_entry_handler(debug_menu_entry *entry)
+{
+    const auto item = debug_render_item_for_entry(entry);
+    debug_render_set_ival(item, entry->get_ival());
+    entry->m_value.ival = debug_render_get_ival(item);
+}
+
+} // namespace
 
 void create_debug_render_menu(debug_menu *parent)
 {
@@ -1071,30 +1078,21 @@ void create_debug_render_menu(debug_menu *parent)
     assert(parent != nullptr);
 
     auto *debug_render_menu = create_menu("Debug Render", debug_menu::sort_mode_t::ascending);
-    	
-		            debug_menu_entry v1;
-    debug_menu_entry* block = v1.alloc_block(debug_render_menu, 4);
-    block[0] = debug_menu_entry { debug_render_menu };
 	create_ngl_menu(debug_render_menu);
     auto *v4 = create_menu_entry(debug_render_menu);
     parent->add_entry(v4);
 
-    for ( auto i = 0u; i < 51u; ++i ) {
-        auto *v5 = create_menu_entry((debug_render_items_names())[i]);
-        v5->set_id(i);
-        v5->set_ival(debug_render_items()[i]);
-        v5->set_p_ival(&debug_render_items()[i]);
-
-        auto v1 = debug_render_get_min((debug_render_items_e)i);
-        v5->set_min_value((float)v1);
-
-        auto v2 = debug_render_get_max((debug_render_items_e)i);
-        v5->set_max_value((float)v2);
-
-        debug_render_menu->add_entry(v5);
+    for (int i = 0; i < DEBUG_RENDER_ITEMS_COUNT; ++i) {
+        const auto item = static_cast<debug_render_items_e>(i);
+        auto *entry = create_menu_entry(mString {debug_render_get_name(item)});
+        entry->set_id(i);
+        entry->set_min_value(static_cast<float>(debug_render_get_min(item)));
+        entry->set_max_value(static_cast<float>(debug_render_get_max(item)));
+        entry->set_ival(debug_render_get_ival(item));
+        entry->set_game_flags_handler(debug_render_entry_handler);
+        entry->set_render_cb(debug_render_entry_callback);
+        debug_render_menu->add_entry(entry);
     }
-
-
 }
 
 std::string camera_render_callback(debug_menu_entry *a2)

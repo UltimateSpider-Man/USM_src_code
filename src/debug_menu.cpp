@@ -107,6 +107,9 @@ typedef void (*menu_handler_function)(debug_menu_entry*, custom_key_type key_typ
 
 void close_debug();
 
+extern int debug_enabled;
+extern int debug_disabled;
+
 debug_menu* current_menu = nullptr;
 
     debug_menu_entry* debug_menu_entry::alloc_block(debug_menu* m, std::size_t n)
@@ -303,7 +306,11 @@ bool debug_menu_entry::set_script_handler_from_char(script_instance *inst, const
 void debug_menu::show()
 {
     active_menu = root_menu;
+    current_menu = root_menu;
+    debug_enabled = 1;
+    debug_disabled = 0;
     grab_focus();
+    had_menu_this_frame = true;
 }
 
 inline void nglGetStringDimensions2(nglFont* Font, const char* a2, int* a3, int* a4, Float a5, Float a6) {
@@ -348,84 +355,81 @@ static constexpr DWORD MAX_ELEMENTS_PAGE = 18;
 
 void debug_menu::render_current_debug_menu()
 {
-    auto UP_ARROW { " ^ ^ ^ " };
-    auto DOWN_ARROW { " v v v " };
+    if (current_menu == nullptr) {
+        return;
+    }
 
-    int num_elements = std::min((DWORD)MAX_ELEMENTS_PAGE, current_menu->used_slots - current_menu->window_start);
-    int needs_down_arrow = ((current_menu->window_start + MAX_ELEMENTS_PAGE) < current_menu->used_slots) ? 1 : 0;
+    constexpr const char *up_arrow = " ^ ^ ^ ";
+    constexpr const char *down_arrow = " v v v ";
+    constexpr int menu_x = 25;
+    constexpr int menu_y = 45;
 
+    pause_menu_system_ptr->Deactivate();
 
-    int cur_width, cur_height;
-    int debug_width = 0;
-    int debug_height = 0;
-	pause_menu_system_ptr->Deactivate();
+    const DWORD remaining = current_menu->used_slots - current_menu->window_start;
+    const int entry_count = static_cast<int>(std::min<DWORD>(MAX_ELEMENTS_PAGE, remaining));
+    const bool show_up_arrow = current_menu->window_start != 0;
+    const bool show_down_arrow = current_menu->window_start + MAX_ELEMENTS_PAGE < current_menu->used_slots;
 
-
-    auto get_and_update = [&](auto* x) {
-        getStringDimensions2(x, &cur_width, &cur_height);
-        debug_height += cur_height;
-        debug_width = std::max(debug_width, cur_width);
+    int menu_width = 0;
+    int menu_height = 0;
+    int line_height = 0;
+    auto measure = [&](const char *text) {
+        int width = 0;
+        int height = 0;
+        getStringDimensions2(text, &width, &height);
+        menu_width = std::max(menu_width, width);
+        menu_height += height;
+        line_height = height;
     };
 
-    // printf("new size: %s %d %d (%d %d)\n", x, debug_width, debug_height, cur_width, cur_height);
-
-    get_and_update(current_menu->title);
-    get_and_update(UP_ARROW);
-
-    int total_elements_page = needs_down_arrow ? MAX_ELEMENTS_PAGE : current_menu->used_slots - current_menu->window_start;
-
-    for (int i = 0; i < total_elements_page; ++i) {
-        debug_menu_entry* entry = &current_menu->entries[current_menu->window_start + i];
-        auto cur = getRealText2(entry);
-        get_and_update(cur.c_str());
+    measure(current_menu->title);
+    if (show_up_arrow) {
+        measure(up_arrow);
+    }
+    for (int i = 0; i < entry_count; ++i) {
+        const auto text = getRealText2(&current_menu->entries[current_menu->window_start + i]);
+        measure(text.c_str());
+    }
+    if (show_down_arrow) {
+        measure(down_arrow);
     }
 
-    if (needs_down_arrow) {
-        get_and_update(DOWN_ARROW);
+    nglQuad background{};
+    nglInitQuad(&background);
+    nglSetQuadRect(&background,
+                   static_cast<float>(menu_x - 5),
+                   static_cast<float>(menu_y - 5),
+                   static_cast<float>(menu_x + menu_width + 10),
+                   static_cast<float>(menu_y + menu_height + 10));
+    nglSetQuadColor(&background, debug_menu::has_focus ? 0xC8141414 : 0x64141414);
+    nglSetQuadZ(&background, 0.5f);
+    nglListAddQuad(&background);
+
+    int y = menu_y;
+    nglListAddString(nglSysFont(), static_cast<float>(menu_x), static_cast<float>(y),
+                     0.0f, 0xFFFFFF00, current_menu->title);
+    y += line_height;
+
+    if (show_up_arrow) {
+        nglListAddString(nglSysFont(), static_cast<float>(menu_x), static_cast<float>(y),
+                         0.0f, 0xFFFF00FF, up_arrow);
+        y += line_height;
     }
 
-    nglQuad quad;
-
-    int menu_x_start = 20, menu_y_start = 40;
-    int menu_x_pad = 24, menu_y_pad = 18;
-
-    nglInitQuad(&quad);
-    nglSetQuadRect(&quad, menu_x_start, menu_y_start, menu_x_start + debug_width + menu_x_pad, menu_y_start + debug_height + menu_y_pad);
-    nglSetQuadColor(&quad, debug_menu::has_focus ? 0xC8141414 : 0x64141414);
-    nglSetQuadZ(&quad, 0.5);
-    nglListAddQuad(&quad);
-
-    int white_color = nglColor2(255, 255, 255, 255);
-    int yellow_color = nglColor2(255, 255, 0, 255);
-    int green_color = nglColor2(0, 255, 0, 255);
-    int pink_color = nglColor2(255, 0, 255, 255);
-
-    int render_height = menu_y_start;
-    render_height += 12;
-    int render_x = menu_x_start;
-    render_x += 8;
-    nglListAddString(nglSysFont(), render_x, render_height, 0.2f, green_color, 1.f, 1.f, current_menu->title);
-    render_height += getStringHeight2(current_menu->title);
-
-    if (current_menu->window_start) {
-        nglListAddString(*nglSysFont, render_x, render_height, 0.2f, pink_color, 1.f, 1.f, UP_ARROW);
+    for (int i = 0; i < entry_count; ++i) {
+        const auto text = getRealText2(&current_menu->entries[current_menu->window_start + i]);
+        const uint32_t color = current_menu->cur_index == static_cast<DWORD>(i)
+            ? 0xFF00DC00
+            : 0xFFDCDCDC;
+        nglListAddString(nglSysFont(), static_cast<float>(menu_x), static_cast<float>(y),
+                         0.0f, color, text.c_str());
+        y += line_height;
     }
 
-    render_height += getStringHeight2(UP_ARROW);
-
-    for (int i = 0; i < total_elements_page; i++) {
-
-        int current_color = current_menu->cur_index == i ? yellow_color : white_color;
-
-        debug_menu_entry* entry = &current_menu->entries[current_menu->window_start + i];
-        auto cur = getRealText2(entry);
-        nglListAddString(*nglSysFont, render_x, render_height, 0.2f, current_color, 1.f, 1.f, cur.c_str());
-        render_height += getStringHeight2(cur.c_str());
-    }
-
-    if (needs_down_arrow) {
-        nglListAddString(*nglSysFont, render_x, render_height, 0.2f, pink_color, 1.f, 1.f, DOWN_ARROW);
-        render_height += getStringHeight2(DOWN_ARROW);
+    if (show_down_arrow) {
+        nglListAddString(nglSysFont(), static_cast<float>(menu_x), static_cast<float>(y),
+                         0.0f, 0xFFFF00FF, down_arrow);
     }
 }
 
@@ -546,6 +550,7 @@ void debug_menu_entry::on_select(float a2)
     case BOOLEAN_E:
     case POINTER_BOOL:
         this->on_change(a2, false);
+        break;
     case BOOLEAN_NUM:
         this->on_change(a2, false);
         break;

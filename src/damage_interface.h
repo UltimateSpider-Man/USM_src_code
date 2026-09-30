@@ -57,3 +57,4 @@ struct damage_interface : generic_interface {
 
 
 extern void damage_interface_patch();
+extern void damage_interface_xbpack_patch();

@@ -101,3 +101,6 @@ struct cut_scene_player {
 extern cut_scene_player *g_cut_scene_player();
 
 extern void cut_scene_player_patch();
+
+// Installs only the V10 tracking-panel creation compatibility hook.
+extern void cut_scene_player_xbpack_v10_patch();

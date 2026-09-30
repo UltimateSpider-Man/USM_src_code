@@ -2,6 +2,7 @@
 
 #include "variable.h"
 
+#include <cstdint>
 #include <vector.hpp>
 
 struct entity;
@@ -28,6 +29,9 @@ extern Var<int[28]> ent_v_table_lookup;
 extern Var<int[28]> ent_size_lookup;
 
 extern Var<int [11]> ifc_v_table_lookup;
+
+extern uint16_t pc_entity_mash_type(uint16_t type);
+extern uint32_t entity_mash_size(uint16_t type);
 
 enum eEntityMashTypeEnum
 {};

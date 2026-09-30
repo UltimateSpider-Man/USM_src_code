@@ -25,3 +25,9 @@ struct debug_string_t {
 extern fixed_vector<debug_string_t, 25> *debug_strings;
 
 extern void add_3d_debug_str(const vector3d &arg0, color32 a2, Float a3, const mString &a1);
+
+extern void render_3d_debug_strings();
+
+extern void frame_advance_3d_debug_strings(Float time_inc);
+
+extern void clear_3d_debug_strings();
