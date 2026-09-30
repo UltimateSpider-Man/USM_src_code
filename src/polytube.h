@@ -147,3 +147,4 @@ struct polytube : entity {
 };
 
 extern void polytube_patch();
+extern void mod_polytube_attachment_patch();

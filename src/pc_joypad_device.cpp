@@ -1,4 +1,5 @@
 #include "pc_joypad_device.h"
+#include "multiplayer_mode.h"
 
 #include "app.h"
 #include "common.h"
@@ -191,6 +192,12 @@ int InputGetState(unsigned int dwUserIndex, InputState &pState)
     if constexpr (1)
     {
         Input::instance()->poll();
+        // The online session UI owns input only while open. During gameplay
+        // preserve the native hero/camera and merge one local controller.
+        if (multiplayer_mode_captures_native_input()) {
+            std::memset(&pState, 0, sizeof(pState));
+            return 0;
+        }
         auto *v2 = (InputSettings *) *(&Input::instance()->m_current_connected + dwUserIndex);
         auto &v20 = pState.m_flags;
         *(uint32_t *) &pState.m_flags = 0;
@@ -204,9 +211,24 @@ int InputGetState(unsigned int dwUserIndex, InputState &pState)
 
         auto &v3 = v2->field_18;
 
-        auto func = [&v3](int &result, InputAction minInput, InputAction maxInput) {
-            int min = v3.get_state(minInput) * -32767.0f;
-            int max = v3.get_state(maxInput) * 32767.0f;
+        // Exclude only cached joystick bindings when our online pad bridge owns
+        // the local handle. Keep the user's native keyboard/mouse settings, and
+        // never edit/save their bindings. This prevents one pad causing two actions.
+        const bool bridge = multiplayer_mode_owns_native_pad(dwUserIndex);
+        auto native_state = [&v3,bridge](InputAction action) {
+            if (!bridge) return v3.get_state(action);
+            const auto index = static_cast<unsigned>(action);
+            if (index >= v3.m_size || index >= 50) return 0.0f;
+            float result = 0;
+            for (const auto &binding : v3.field_4[index]) {
+                if (binding.m_input_type != InputType::Key && binding.m_input_type != InputType::Mouse) continue;
+                if (std::abs(binding.field_8) > std::abs(result)) result = binding.field_8;
+            }
+            return result;
+        };
+        auto func = [&native_state](int &result, InputAction minInput, InputAction maxInput) {
+            int min = native_state(minInput) * -32767.0f;
+            int max = native_state(maxInput) * 32767.0f;
             auto abs_min = std::abs(min);
             auto abs_max = std::abs(max);
             if (abs_min <= abs_max) {
@@ -228,14 +250,14 @@ int InputGetState(unsigned int dwUserIndex, InputState &pState)
 
         static constexpr float flt_871978 = 255.f;
 
-        pState.m_jump = v3.get_state(InputAction::Jump) * flt_871978;
-        pState.m_stick_to_walls = v3.get_state(InputAction::StickToWalls) * flt_871978;
-        pState.m_punch = v3.get_state(InputAction::Punch) * flt_871978;
-        pState.m_kick = v3.get_state(InputAction::Kick) * flt_871978;
-        pState.m_black_button = v3.get_state(InputAction::BlackButton) * flt_871978;
-        pState.m_throw_web = v3.get_state(InputAction::ThrowWeb) * flt_871978;
-        pState.field_C = v3.get_state(static_cast<InputAction>(10u)) * flt_871978;
-        pState.field_D = v3.get_state(static_cast<InputAction>(11u)) * flt_871978;
+        pState.m_jump = native_state(InputAction::Jump) * flt_871978;
+        pState.m_stick_to_walls = native_state(InputAction::StickToWalls) * flt_871978;
+        pState.m_punch = native_state(InputAction::Punch) * flt_871978;
+        pState.m_kick = native_state(InputAction::Kick) * flt_871978;
+        pState.m_black_button = native_state(InputAction::BlackButton) * flt_871978;
+        pState.m_throw_web = native_state(InputAction::ThrowWeb) * flt_871978;
+        pState.field_C = native_state(static_cast<InputAction>(10u)) * flt_871978;
+        pState.field_D = native_state(static_cast<InputAction>(11u)) * flt_871978;
 
         // Pause flag (Start button -> 0x10 -> game::pause() + sound fade).
         // While the debug menu is on screen we don't want Start to trigger
@@ -243,38 +265,39 @@ int InputGetState(unsigned int dwUserIndex, InputState &pState)
         // Keeping this gated on (debug_enabled || debug_disabled) means
         // game::pause() itself stays usable from the console or scripts.
         const bool debug_menu_on_screen = (debug_enabled != 0) || (debug_disabled != 0);
-        if (0.0f != v3.get_state(InputAction::Pause) && !debug_menu_on_screen) {
+        if (0.0f != native_state(InputAction::Pause) && !debug_menu_on_screen) {
             v20 |= 0x10u;
         }
 
-        if (0.0f != v3.get_state(InputAction::BackButton)) {
+        if (0.0f != native_state(InputAction::BackButton)) {
             v20 |= 0x20u;
         }
 
-        if (0.0f != v3.get_state(static_cast<InputAction>(14u))) {
+        if (0.0f != native_state(static_cast<InputAction>(14u))) {
             v20 |= 0x40u;
         }
 
-        if (0.0f != v3.get_state(InputAction::CameraCenter)) {
+        if (0.0f != native_state(InputAction::CameraCenter)) {
             v20 |= 0x80u;
         }
 
-        if (0.0f != v3.get_state(static_cast<InputAction>(24u))) {
+        if (0.0f != native_state(static_cast<InputAction>(24u))) {
             v20 |= 1u;
         }
 
-        if (0.0f != v3.get_state(static_cast<InputAction>(25u))) {
+        if (0.0f != native_state(static_cast<InputAction>(25u))) {
             v20 |= 2u;
         }
 
-        if (0.0f != v3.get_state(static_cast<InputAction>(26u))) {
+        if (0.0f != native_state(static_cast<InputAction>(26u))) {
             v20 |= 4u;
         }
 
-        if (0.0f != v3.get_state(static_cast<InputAction>(27u))) {
+        if (0.0f != native_state(static_cast<InputAction>(27u))) {
             v20 |= 8u;
         }
 
+        multiplayer_mode_merge_native_input(dwUserIndex, pState);
         return 0;
     }
     else

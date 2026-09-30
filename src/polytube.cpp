@@ -1,6 +1,7 @@
 #include "polytube.h"
 
 #include "common.h"
+#include "game.h"
 #include "func_wrapper.h"
 #include "memory.h"
 #include "oldmath_po.h"
@@ -11,6 +12,129 @@
 #include "vtbl.h"
 
 #include <cassert>
+
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+#include "base_ai_core.h"
+#include "conglom.h"
+#include "exe_allocator.h"
+#include "mod_polytube_attachment.h"
+#include "tentacle_interface.h"
+#include "wds.h"
+
+extern bool modMeshAttachmentDelta(conglomerate *, entity_base *, vector3d &);
+
+namespace {
+struct ModNativeTentacleRecord {
+    std::uint32_t prefix[14];
+    entity_base *resolvedEntity;
+    mashable_vector<std::uint64_t> controlHashes;
+    mashable_vector<entity_base *> controlEntities;
+};
+static_assert(sizeof(ModNativeTentacleRecord) == 0x4c, "PC tentacle definition size");
+static_assert(offsetof(ModNativeTentacleRecord, controlEntities) == 0x44, "PC tentacle point entities");
+
+bool modMatchTentacleOwner(entity *candidate, polytube *tube,
+                          conglomerate *&owner, entity_base *&base)
+{
+    if (!candidate || !candidate->is_a_conglomerate()) return false;
+    auto *conglom = static_cast<conglomerate *>(candidate);
+    auto *ifc = conglom->field_124;
+    if (!ifc || ifc->field_4 != candidate) return false;
+    modmesh::attachment::NativeTentacleInterface view;
+    std::memcpy(&view, ifc, sizeof(view));
+    auto *tubes = reinterpret_cast<const std::uint32_t *>(view.tubes);
+    const int index = modmesh::attachment::matchingTubeIndex(view, tubes,
+                          static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(tube)));
+    if (index < 0) return false;
+    const auto &record = reinterpret_cast<const ModNativeTentacleRecord *>(view.definitions)[index];
+    if (record.controlEntities.m_size > 4096) return false;
+    // initialize_polytubes fills control point zero from exactly this entity.
+    // The optional source entity is only a fallback for an absent first point.
+    base = record.controlEntities.m_data && record.controlEntities.m_size
+        ? record.controlEntities.m_data[0] : nullptr;
+    if (!base) base = record.resolvedEntity;
+    if (!base) return false;
+    owner = conglom;
+    return true;
+}
+
+bool modResolveTentacleOwner(polytube *tube, conglomerate *&owner, entity_base *&base)
+{
+    auto *info = tube->field_130;
+    if (info && info->tentacle == tube && info->my_ai && info->base_node) {
+        auto *actor = info->my_ai->field_64;
+        if (actor && actor->is_a_conglomerate()) {
+            owner = static_cast<conglomerate *>(actor);
+            base = info->base_node;
+            return true;
+        }
+    }
+    auto *world = g_world_ptr;
+    if (!world) return false;
+    // A tube created by tentacle_interface has no AI info or parent. Resolve
+    // ownership by exact tube-array membership, never by distance or appearance.
+    if (world->get_num_players() > 0 &&
+        modMatchTentacleOwner(world->get_hero_ptr(0), tube, owner, base)) return true;
+    std::size_t blocks = 0, entities = 0;
+    for (auto &block : world->ent_mgr.entities.field_0) {
+        if (++blocks > 4096 || block.size() > 100000) return false;
+        for (auto *candidate : block) {
+            if (++entities > 100000) return false;
+            if (modMatchTentacleOwner(candidate, tube, owner, base)) return true;
+        }
+    }
+    return false;
+}
+
+bool modRenderAttachedPolytube(polytube *tube, Float distance)
+{
+    // Endpoint-driven webs rebuild their entire line inside native render.
+    if (!tube->field_78 || tube->field_11C || tube->field_120) return false;
+    auto &spline = tube->the_spline;
+    std::size_t count = 0;
+    if (!modmesh::attachment::vectorCount(spline.control_pts, 4096, count) ||
+        !modmesh::attachment::hasExtendedSpan(spline.control_pts.m_first, count) ||
+        (tube->field_79 && (spline.field_30 < 0 || spline.field_30 > 256 ||
+            (count + 2) * std::size_t(spline.field_30) > 65536))) return false;
+    // Check original controls before resolving/repositioning an attachment or
+    // copying its cached curve: collapsed native tubes must remain collapsed.
+    conglomerate *owner = nullptr;
+    entity_base *base = nullptr;
+    if (!modResolveTentacleOwner(tube, owner, base)) return false;
+    vector3d worldDelta;
+    if (!modMeshAttachmentDelta(owner, base, worldDelta)) return false;
+    if (!modmesh::attachment::finitePoint(worldDelta)) return false;
+
+    const po &world = tube->get_abs_po();
+    const vector3d localDelta = world.non_affine_inverse_xform(worldDelta);
+    if (!modmesh::attachment::finitePoint(localDelta)) return false;
+
+    // Retail rebuild frees arrays through 0x82207C and allocates at 0x822046.
+    // Every shadow array therefore uses that same heap. The original spline,
+    // including all pointers/cache flags, is restored before this scope exits.
+    modmesh::attachment::ScopedSplineShadow<::spline, exe_allocator> shadow(spline);
+    if (!shadow.valid()) return false;
+    if (tube->field_79 && spline.need_rebuild) spline.rebuild_helper();
+    auto &points = tube->field_79 ? spline.curve_pts : spline.control_pts;
+    if (!modmesh::attachment::vectorCount(points, 65536, count) ||
+        !modmesh::attachment::shiftRenderPoints(points.m_first, count, localDelta)) return false;
+    // At 0x5A5D19 native render selects this array, then copies its positions
+    // into scratch vertices synchronously. No queued node borrows these points.
+    THISCALL(0x005A5B10, tube, distance);
+    static polytube *reported[8] = {};
+    static unsigned reportedCount = 0;
+    bool seen = false;
+    for (unsigned i = 0; i < reportedCount; ++i) seen |= reported[i] == tube;
+    if (!seen && reportedCount < 8) {
+        reported[reportedCount++] = tube;
+        sp_log("[modmesh] attachment draw owner=%s tube=%p base-bone=%u points=%u delta=(%.6f %.6f %.6f)",
+               owner->get_id().to_string(), tube, unsigned(base->get_bone_idx()),
+               unsigned(count), worldDelta.x, worldDelta.y, worldDelta.z);
+    }
+    return true;
+}
+}
+#endif
 
 VALIDATE_SIZE(polytube, 0x178u);
 VALIDATE_SIZE(polytube_pt_anim, 0x2C);
@@ -114,13 +238,14 @@ void polytube::init() {
 void polytube::_render(Float a2)
 {
     TRACE("polytube::render");
-    
-    if constexpr (0)
-    {}
-    else
-    {
-        THISCALL(0x005A5B10, this, a2);
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+    try {
+        if (modRenderAttachedPolytube(this, a2)) return;
+    } catch (const std::bad_alloc &) {
+        // Allocation failure leaves native spline storage intact.
     }
+#endif
+    THISCALL(0x005A5B10, this, a2);
 }
 
 void polytube::set_control_pt(int index, const vector3d &a2) {
@@ -346,12 +471,17 @@ void PolytubeCustomVertex::Iterator::Write(
     }
 }
 
+void mod_polytube_attachment_patch()
+{
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+    FUNC_ADDRESS(address, &polytube::_render);
+    set_vfunc(0x0088F46C, address);
+#endif
+}
+
 void polytube_patch()
 {
-    {
-        FUNC_ADDRESS(address, &polytube::_render);
-        //set_vfunc(0x0088F46C, address);
-    }
+    mod_polytube_attachment_patch();
 
     REDIRECT(0x005584E8, polytube::frame_advance_all_polytubes);
 
