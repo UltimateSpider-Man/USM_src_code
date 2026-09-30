@@ -34,6 +34,10 @@
 #include "wds.h"
 
 #include <cassert>
+#ifdef OPENUSM_XBPACK_V10
+#include <cstdio>
+#include <windows.h>
+#endif
 
 VALIDATE_SIZE(worldly_pack_slot, 0xFC);
 
@@ -358,6 +362,21 @@ bool entity_resource_handler::_handle_resource(worldly_resource_handler::eBehavi
             auto &v4 = this->my_slot->entity_instances->at(this->field_C);
             if (v4 != nullptr)
             {
+#ifdef OPENUSM_XBPACK_V10
+                if (v4->is_conglom_member())
+                {
+                    char message[192];
+                    std::snprintf(
+                        message,
+                        sizeof(message),
+                        "xbp skipped member %p %p flags=0x%08X ext=0x%08X\n",
+                        v4,
+                        v4->my_conglom_root,
+                        static_cast<unsigned int>(v4->field_4),
+                        static_cast<unsigned int>(v4->field_8));
+                    OutputDebugStringA(message);
+                }
+#endif
                 if (!v4->is_conglom_member())
                 {
                     g_world_ptr->ent_mgr.remove_entity_from_misc_lists(v4);

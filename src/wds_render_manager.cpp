@@ -5,6 +5,7 @@
 #include "aeps.h"
 #include "beam.h"
 #include "bitvector.h"
+#include "box_trigger.h"
 #include "camera.h"
 #include "camera_teleport_update_visitor.h"
 #include "city_lod.h"
@@ -13,6 +14,8 @@
 #include "culling_params.h"
 #include "cut_scene_player.h"
 #include "debug_render.h"
+#include "debug_string.h"
+#include "entity_trigger.h"
 #include "femanager.h"
 #include "filespec.h"
 #include "func_wrapper.h"
@@ -34,6 +37,7 @@
 #include "oriented_bounding_box_root_node.h"
 #include "os_developer_options.h"
 #include "physical_interface.h"
+#include "point_trigger.h"
 #include "proximity_map.h"
 #include "region.h"
 #include "renderoptimizations.h"
@@ -41,6 +45,7 @@
 #include "shadow.h"
 #include "subdivision_node_obb_base.h"
 #include "trace.h"
+#include "trigger_manager.h"
 #include "terrain.h"
 #include "us_colorvol.h"
 #include "us_pcuv_shader.h"
@@ -50,6 +55,7 @@
 #include "vector2d.h"
 #include "wds.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 
@@ -115,8 +121,147 @@ void show_terrain_info()
     }
 }
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+namespace {
+
+void render_trigger_debug_overlays()
+{
+    const bool show_boxes = debug_render_get_bval(BOX_TRIGGERS);
+    const bool show_water_boxes =
+        debug_render_get_bval(WATER_EXCLUSION_TRIGGERS);
+    const bool show_points = debug_render_get_bval(POINT_TRIGGERS);
+    const bool show_entities = debug_render_get_bval(ENTITY_TRIGGERS);
+
+    auto *manager = trigger_manager::instance;
+    if (manager == nullptr ||
+        (!show_boxes && !show_water_boxes && !show_points && !show_entities)) {
+        return;
+    }
+
+    for (auto *base = manager->m_triggers;
+         base != nullptr;
+         base = base->m_next_trigger) {
+        vector3d label_position{};
+        color32 label_color{};
+        bool rendered = false;
+
+        if (base->is_point_trigger() && show_points) {
+            auto *point = static_cast<point_trigger *>(base);
+            const auto radius = std::max(point->field_48, 0.05f);
+            label_position = point->field_58 + YVEC * (radius + 0.15f);
+            label_color = color32{64, 255, 64, 255};
+            render_debug_hemisphere(point->field_58,
+                                    radius,
+                                    color32{64, 255, 64, 96});
+            rendered = true;
+        } else if (base->is_box_trigger()) {
+            auto *box = static_cast<box_trigger *>(base);
+            const bool is_water_box = (box->field_4 & 0x20000u) != 0;
+            if (show_boxes || (show_water_boxes && is_water_box)) {
+                auto *box_entity = box->get_box_ent();
+                const auto origin = box_entity != nullptr
+                    ? box_entity->get_abs_position()
+                    : box->field_5C;
+                const auto min_extent = origin + box->box.bbox.field_0[0];
+                const auto max_extent = origin + box->box.bbox.field_0[1];
+                label_position = origin + YVEC * (box->field_48 + 0.15f);
+                label_color = is_water_box
+                    ? color32{64, 160, 255, 255}
+                    : color32{255, 192, 32, 255};
+                render_debug_box(min_extent,
+                                 max_extent,
+                                 is_water_box
+                                     ? color32{64, 160, 255, 80}
+                                     : color32{255, 192, 32, 80});
+                rendered = true;
+            }
+        } else if (base->is_entity_trigger() && show_entities) {
+            auto *entity_trig = static_cast<entity_trigger *>(base);
+            if (auto *target = entity_trig->get_ent()) {
+                const auto radius = std::max(entity_trig->field_48, 0.05f);
+                const auto &position = target->get_abs_position();
+                label_position = position + YVEC * (radius + 0.15f);
+                label_color = color32{255, 64, 255, 255};
+                render_debug_hemisphere(position,
+                                        radius,
+                                        color32{255, 64, 255, 96});
+                rendered = true;
+            }
+        }
+
+        if (rendered) {
+            auto id = base->get_id();
+            print_3d_text(label_position,
+                          label_color,
+                          0.5f,
+                          "%s",
+                          id.to_string());
+        }
+    }
+}
+
+void render_visibility_spheres()
+{
+    const int requested = debug_render_get_ival(VIS_SPHERES);
+    if (requested <= 0 || g_world_ptr == nullptr) {
+        return;
+    }
+
+    int rendered = 0;
+    for (auto *entity : g_world_ptr->ent_mgr.entities) {
+        if (entity == nullptr || !entity->is_visible()) {
+            continue;
+        }
+
+        const float radius = std::clamp(entity->get_visual_radius(), 0.05f, 50.0f);
+        const auto &position = entity->get_abs_position();
+        const color32 sphere_color{64, 192, 255, 72};
+        render_debug_hemisphere(position, radius, sphere_color);
+
+        auto id = entity->get_id();
+        print_3d_text(position + YVEC * (radius + 0.1f),
+                      color32{96, 224, 255, 255},
+                      0.45f,
+                      "%s",
+                      id.to_string());
+
+        if (++rendered >= requested) {
+            break;
+        }
+    }
+}
+
+} // namespace
+#endif
+
 void sub_6A9863()
 {
+#ifdef OPENUSM_ULTIMATE_RELEASE
+    render_trigger_debug_overlays();
+    render_visibility_spheres();
+
+    if ( debug_render_get_bval(SPHERES) ) {
+        render_debug_spheres();
+    }
+
+    if ( debug_render_get_bval(LINES) ) {
+        render_debug_lines();
+    }
+
+    if ( debug_render_get_ival(LINE_INFO) ) {
+        debug_render_line_info();
+    }
+
+    if ( debug_render_get_bval(CYLINDERS) ) {
+        render_debug_cylinders();
+    }
+
+    // Mission scripts enqueue timed world-space strings.  The retail build
+    // kept the producer but omitted the render/update side of that queue.
+    render_3d_debug_strings();
+    static Var<float> frame_time_inc{0x009682D0};
+    frame_advance_3d_debug_strings(frame_time_inc());
+#else
     if ( debug_render_get_bval(SPHERES) ) {
         render_debug_spheres();
     }
@@ -131,6 +276,7 @@ void sub_6A9863()
 
     render_debug_lines();
     render_debug_spheres();
+#endif
 }
 
 void wds_render_manager::debug_render()
@@ -414,7 +560,9 @@ void wds_render_manager::render(camera &a2, int a3)
                 occlusion::debug_render_occluders();
             }
 
+#ifndef OPENUSM_ULTIMATE_RELEASE
             this->debug_render();
+#endif
             this->clear_colorvol_scene();
         }
 
@@ -428,10 +576,12 @@ void wds_render_manager::render(camera &a2, int a3)
 
     //_populate_missions();
 
+#ifndef OPENUSM_ULTIMATE_RELEASE
     if ( debug_render_get_bval(OCCLUSION) )
     {
         occlusion::debug_render_occluders();
     }
+#endif
 
     this->debug_render();
 }

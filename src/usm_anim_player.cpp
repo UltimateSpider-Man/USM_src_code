@@ -81,7 +81,8 @@ void __fastcall sub_4AD850(
 
 void usm_anim_player_patch()
 {
-    REDIRECT(0x004B06D7, sub_4B0020);
+    // Keep the original call to 0x004B0020.  The diagnostic wrapper assumes
+    // state->play_method is non-null, although the game supports a null state.
 
     if constexpr (0)
     {

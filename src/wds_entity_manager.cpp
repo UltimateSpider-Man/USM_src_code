@@ -14,6 +14,7 @@
 #include "osassert.h"
 #include "resource_key.h"
 #include "resource_manager.h"
+#include "script_lib_debug_menu.h"
 #include "trace.h"
 #include "trigger_manager.h"
 #include "utility.h"
@@ -107,6 +108,30 @@ void wds_entity_manager::destroy_all_entities_and_items() {
     THISCALL(0x005D9060, this);
 }
 
+void __fastcall debug_character_destroy_all_entities(wds_entity_manager *self, void *)
+{
+    // The PC character-list spawner owns any packs it pushed. Destroy its
+    // actors and release those packs before stock world teardown invalidates
+    // the tracked handles.
+    clear_debug_character_spawns();
+    self->destroy_all_entities_and_items();
+}
+
+#ifdef OPENUSM_XBPACK_MODE
+void __fastcall xbpack_destroy_all_entities(wds_entity_manager *self, void *)
+{
+    // Destroy native Script-menu characters and release their pushed CH_ packs
+    // before the world removes players and tears down the remaining entities.
+    clear_debug_character_spawns();
+
+    while (g_world_ptr != nullptr && g_world_ptr->num_players > 0) {
+        g_world_ptr->remove_player(g_world_ptr->num_players - 1);
+    }
+
+    self->destroy_all_entities_and_items();
+}
+#endif
+
 void wds_entity_manager::destroy_entity(entity *e) {
     assert(e != nullptr);
 
@@ -122,9 +147,13 @@ void wds_entity_manager::destroy_entity(entity *e) {
 
         if (v4) {
             if ((e->field_8 & 0x80000000) == 0) {
-                e->release_mem();
+                void (__fastcall *release_mem)(entity *, void *) =
+                    CAST(release_mem, get_vfunc(e->m_vtbl, 0x10));
+                release_mem(e, nullptr);
             } else {
-                e->~entity();
+                void (__fastcall *finalize)(entity *, void *, bool) =
+                    CAST(finalize, get_vfunc(e->m_vtbl, 0x0));
+                finalize(e, nullptr, true);
             }
         }
     } else {
