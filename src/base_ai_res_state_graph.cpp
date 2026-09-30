@@ -6,6 +6,7 @@
 #include "mashed_state.h"
 #include "trace.h"
 #include "utility.h"
+#include "xbpack.h"
 
 namespace ai {
 
@@ -26,10 +27,19 @@ void state_graph::unmash(mash_info_struct *a1, void *)
     TRACE("ai::state_graph::unmash");
 
     a1->unmash_class_in_place(this->field_0, this);
+
+#ifdef OPENUSM_XBPACK_MODE
+    if (this->field_0.m_type != RESOURCE_KEY_TYPE_AI_STATE_GRAPH) {
+        this->field_0.m_type = static_cast<resource_key_type>(
+            xbpack::pc_type(static_cast<int>(this->field_0.m_type)));
+    }
+    assert(this->field_0.m_type == RESOURCE_KEY_TYPE_AI_STATE_GRAPH);
+#endif
+
     a1->unmash_class_in_place(this->my_states, this);
     a1->unmash_class_in_place(this->field_20, this);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
     {
         uint8_t class_mashed = -1;
         class_mashed = *a1->read_from_buffer(mash::SHARED_BUFFER, 1, 1);
@@ -40,10 +50,26 @@ void state_graph::unmash(mash_info_struct *a1, void *)
     if ( this->field_1C != nullptr )
     {
         a1->unmash_class(this->field_1C, this
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
             , mash::NORMAL_BUFFER
 #endif
                 );
+
+#ifdef OPENUSM_XBPACK_V10
+        bool converted_with_states = false;
+        for (auto *state : this->my_states) {
+            if (state == this->field_1C) {
+                converted_with_states = true;
+                break;
+            }
+        }
+
+        if (!converted_with_states) {
+            auto &type = this->field_1C->field_14;
+            type = static_cast<mash::virtual_types_enum>(
+                xbpack::pc_state_type(static_cast<uint32_t>(type)));
+        }
+#endif
     }
 }
 
@@ -94,6 +120,11 @@ mashed_state *state_graph::find_state(string_hash a2) const
 } // namespace ai
 
 void state_graph_patch() {
+    {
+        FUNC_ADDRESS(address, &ai::state_graph::unmash);
+        SET_JUMP(0x006DA070, address);
+    }
+
     {
         FUNC_ADDRESS(address, &ai::state_graph::find_state);
         SET_JUMP(0x006D8480, address);

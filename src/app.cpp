@@ -146,7 +146,9 @@ app::app()
 
     unit_tests();
     mem_print_stats("after unit tests");
+#ifndef OPENUSM_XBPACK_MODE
     g_platform = NL_PLATFORM_PC;
+#endif
     if (link_system::use_link_system())
     {
         /*
@@ -211,7 +213,9 @@ void app::app1()
 
     unit_tests();
     mem_print_stats("after unit tests");
+#ifndef OPENUSM_XBPACK_MODE
     g_platform = NL_PLATFORM_PC;
+#endif
     if (link_system::use_link_system())
     {
         /*

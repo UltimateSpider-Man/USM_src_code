@@ -17,4 +17,14 @@ struct anim_record : mash_virtual_base {
     int get_mash_sizeof();
 };
 
+struct attach_anim_record : anim_record {
+    int field_C;
+    string_hash field_10;
+    int field_14;
+    int field_18;
+
+    void _unmash(mash_info_struct *a2, void *a3);
+};
+
 extern void anim_record_patch();
+extern void anim_record_v10_patch();

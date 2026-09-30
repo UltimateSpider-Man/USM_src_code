@@ -17,6 +17,6 @@ nal_anim_control *anim_handle_t::get_anim()
 
 void anim_handle_patch()
 {
-    FUNC_ADDRESS(address, &anim_handle_t::get_anim);
-    SET_JUMP(0x00492440, address);
+    // Preserve the stock nullable lookup.  The diagnostic wrapper logs through
+    // the returned pointer even when a stale handle legitimately yields null.
 }

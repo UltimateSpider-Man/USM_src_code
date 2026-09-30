@@ -297,7 +297,6 @@ double animation_controller::get_anim_speed(Float a2)
 
 void animation_controller::frame_advance(Float a2, bool a3, bool a4)
 {
-    sp_log("0x%08X", m_vtbl);
     void (__fastcall *func)(void *, void *, Float, bool, bool) = CAST(func, get_vfunc(m_vtbl, 0x70));
     func(this, nullptr, a2, a3, a4);
 }

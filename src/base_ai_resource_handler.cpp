@@ -22,7 +22,7 @@ bool base_ai_resource_handler::_handle(worldly_resource_handler::eBehavior a2, l
 {
     TRACE("base_ai_resource_handler::handle");
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
     this->field_10 = RESOURCE_KEY_TYPE_BASE_AI;
 #endif
 
@@ -49,20 +49,20 @@ bool base_ai_resource_handler::_handle_resource(worldly_resource_handler::eBehav
             auto *new_ai_resource = bit_cast<ai::core_ai_resource *>(resource);
             assert(new_ai_resource != nullptr);
 
-#ifndef TARGET_XBOX
-            mash_info_struct info_struct {resource, a3->m_size};
-#else
+#if OPENUSM_XBOX_MASH_FORMAT
             mash_info_struct info_struct {mash::UNMASH_MODE, resource, a3->m_size, true};
+#else
+            mash_info_struct info_struct {resource, a3->m_size};
 #endif
 
             info_struct.unmash_class(new_ai_resource, nullptr
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                 , mash::NORMAL_BUFFER
 #endif 
                     );
             mash_info_struct::construct_class(new_ai_resource);
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
             a3->m_offset += info_struct.get_header_size();
 #endif
         }
@@ -76,6 +76,14 @@ bool base_ai_resource_handler::_handle_resource(worldly_resource_handler::eBehav
                                                resource_location *) = CAST(func, 0x00568A10);
         return func(this, nullptr, behavior, a3); 
     }
+}
+
+void base_ai_resource_handler_xbpack_patch()
+{
+#ifdef OPENUSM_XBPACK_MODE
+    FUNC_ADDRESS(address, &base_ai_resource_handler::_handle_resource);
+    set_vfunc(0x00888A14, address);
+#endif
 }
 
 void base_ai_resource_handler_patch()

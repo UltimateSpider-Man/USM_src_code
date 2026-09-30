@@ -21,6 +21,9 @@
 
 VALIDATE_SIZE(camera_mode, 0xC);
 
+VALIDATE_OFFSET(camera_mode_shake, frame_fwd, 0x24);
+VALIDATE_OFFSET(camera_mode_shake, frame_eye, 0x30);
+
 VALIDATE_SIZE(camera_mode_lookaround, 0x78);
 
 VALIDATE_SIZE(camera_mode_fixedstatic, 0x28u);
@@ -142,11 +145,16 @@ void camera_mode_shake::_frame_advance(
 {
     TRACE("camera_mode_shake::frame_advance");
 
-    if (this->field_8 != nullptr) {
-        // sp_log("0x%08X", this->field_8->m_vtbl);
-    }
-
     THISCALL(0x004B6CE0, this, a2, &a3, &a4);
+
+#ifdef OPENUSM_XBPACK_V10
+    if (!a3.is_valid()) {
+        if (frame_eye.is_valid() && frame_fwd.is_valid() && frame_fwd.is_normal()) {
+            a3.eye = frame_eye;
+            a3.fwd = frame_fwd;
+        }
+    }
+#endif
 }
 
 camera_mode_lookaround::camera_mode_lookaround(

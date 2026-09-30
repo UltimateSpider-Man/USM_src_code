@@ -12,15 +12,15 @@ int compare_resource_key(const resource_key &a1, const resource_key &a2)
 {
     if constexpr (1)
     {
+        if (a1 == a2) {
+            return 0;
+        }
+
         if (a1 >= a2) {
             return 1;
         }
 
-        if (a1 <= a2) {
-            return -1;
-        }
-
-        return 0;
+        return -1;
     }
     else
     {
@@ -29,8 +29,24 @@ int compare_resource_key(const resource_key &a1, const resource_key &a2)
 }
 
 int compare_resource_key_resource_pack_location(const resource_key &a1,
-                                                const resource_pack_location &a2) {
+                                                const resource_pack_location &a2)
+{
+#ifdef OPENUSM_XBPACK_MODE
+    const auto requested_hash = a1.m_hash.source_hash_code;
+    const auto location_hash = a2.loc.field_0.m_hash.source_hash_code;
+
+    if (requested_hash < location_hash) {
+        return -1;
+    }
+
+    if (requested_hash > location_hash) {
+        return 1;
+    }
+
+    return 0;
+#else
     return compare_resource_key(a1, a2.loc.field_0);
+#endif
 }
 
 template<>

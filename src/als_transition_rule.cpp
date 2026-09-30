@@ -63,16 +63,18 @@ namespace als
     void incoming_transition_rule::unmash(mash_info_struct *a1, void *a3)
     {
         this->field_0.unmash(a1, a3);
-    }
 
+#ifdef OPENUSM_XBPACK_V10
+        this->field_28 = static_cast<uint8_t>(this->field_28);
+#endif
+    }
 
     bool incoming_transition_rule::can_transition(als_data &a2) const
     {
         TRACE("als::incoming_transition_rule::can_transition");
 
-        // Converted from 0x004A0000. field_24 is an optional source-state or
-        // source-category hash filter. field_28 selects category-id matching;
-        // when clear the filter is matched against the current state id.
+        // field_24 optionally filters the current source state/category.
+        // field_28 selects category-id matching when nonzero.
         if (this->field_24 != 0) {
             auto *curr_state = a2.field_4->get_curr_state();
             if (curr_state == nullptr) {
