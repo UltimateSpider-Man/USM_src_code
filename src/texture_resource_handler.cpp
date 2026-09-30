@@ -7,6 +7,7 @@
 #include "resource_directory.h"
 #include "utility.h"
 #include "trace.h"
+#include "variables.h"
 #include "worldly_pack_slot.h"
 
 #include <cassert>
@@ -32,52 +33,64 @@ void texture_resource_handler::handle_resource_internal(tlresource_location *loc
 {
     TRACE("texture_resource_handler::handle_resource_internal", loc->name.to_string());
 
-    if constexpr (1)
+    if (a3 == static_cast<nglTextureFileFormat>(1))
     {
         assert(loc != nullptr);
 
-        auto *v4 = loc->name.to_string();
-
-        auto *Tex = nglConstructTexture(tlFixedString{v4}, a3, loc->field_8, loc->get_size());
+        // Keep texture construction byte-for-byte native.  The resource
+        // backlink pass below makes the retail representation explicit:
+        // DDSMP PaletteFrames is one contiguous nglTexture array; ordinary
+        // IFL Frames remains a pointer table at the same ABI offset.
+        // Use the retail helpers here as well: 0x005374B0 resolves the pack
+        // hash through the native dictionary, and 0x004018D0 zeroes all 0x20
+        // bytes before copying/lowercasing the bounded name.
+        const auto *texture_name_text = reinterpret_cast<const char *>(
+            THISCALL(0x005374B0, &loc->name));
+        tlFixedString texture_name {};
+        THISCALL(0x004018D0, &texture_name, texture_name_text);
+        auto *Tex = reinterpret_cast<nglTexture *>(
+            CDECL_CALL(0x0077AB30,
+                       &texture_name,
+                       a3,
+                       loc->field_8,
+                       loc->get_size()));
 
         if (Tex == nullptr) {
             Tex = nglDefaultTex();
         }
 
         loc->field_8 = bit_cast<char *>(Tex);
-        if (a3 == 1)
-        {
-            if (Tex == nglDefaultTex()) {
-                error("ERROR: multipalette texture not found: %s", loc->name.to_string());
-            }
-
-            for (auto i = 0u; i < Tex->m_num_palettes; ++i)
-            {
-                auto &v19 = Tex->Frames[i]->field_60;
-
-                tlresource_location *found_tlres_loc = nullptr;
-
-                auto &dir = this->my_slot->get_resource_directory();
-
-                auto found = dir.find_tlresource(v19.m_hash,
-                                                 TLRESOURCE_TYPE_TEXTURE,
-                                                 nullptr,
-                                                 &found_tlres_loc);
-
-                if (!found || found_tlres_loc == nullptr) {
-                    auto *v7 = v19.to_string();
-                    error("ERROR: multipalette sub-texture not found: %s", v7);
-                }
-
-                found_tlres_loc->field_8 = bit_cast<char *>(&Tex->Frames[i]);
-            }
+        if (Tex == nglDefaultTex()) {
+            sp_log("ERROR: multipalette texture not found: %s", loc->name.to_string());
+            return;
         }
 
+        auto &dir = this->my_slot->get_resource_directory();
+        for (uint32_t i = 0; i < Tex->m_num_palettes; ++i)
+        {
+            auto *frame = &Tex->PaletteFrames[i];
+            tlresource_location *frame_loc = nullptr;
+            const bool found = dir.find_tlresource(frame->field_60.m_hash,
+                                                   TLRESOURCE_TYPE_TEXTURE,
+                                                   nullptr,
+                                                   &frame_loc);
+
+            if (!found || frame_loc == nullptr) {
+                sp_log("ERROR: multipalette sub-texture not found: %s",
+                       frame->field_60.to_string());
+                continue;
+            }
+
+            // Publish the actual inline frame object.  Interpreting a DDSMP
+            // owner through the IFL Frames view reads the frame's m_format
+            // (0x11) as though it were a pointer.
+            frame_loc->field_8 = bit_cast<char *>(frame);
+        }
+
+        return;
     }
-    else
-    {
-        THISCALL(0x0056BBC0, this, loc, a3);
-    }
+
+    THISCALL(0x0056BBC0, this, loc, a3);
 }
 
 void texture_resource_handler::_pre_handle_resources(worldly_resource_handler::eBehavior a2)
@@ -201,4 +214,14 @@ void texture_resource_handler_patch() {
         FUNC_ADDRESS(address, &texture_resource_handler::_handle_resource);
         set_vfunc(0x00888A34, address);
     }
+}
+
+void texture_resource_handler_xbpack_patch()
+{
+    // Patch the sole native caller rather than replacing 0x0056BBC0.  This
+    // keeps ordinary textures on the stock implementation. PC arena packs
+    // can also omit DDSMP sub-texture entries: the native backlink pass
+    // writes through null at 0x0056BCD8 when that lookup fails.
+    FUNC_ADDRESS(address, &texture_resource_handler::handle_resource_internal);
+    REDIRECT(0x0056BB3E, address);
 }

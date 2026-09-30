@@ -209,3 +209,7 @@ struct terrain {
 extern void find_ideal_terrain_packs_callback(_std::vector<ideal_pack_info> *a1);
 
 extern void terrain_patch();
+
+#ifdef OPENUSM_XBPACK_MODE
+extern void terrain_xbpack_patch();
+#endif

@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "func_wrapper.h"
+#include "game.h" // MOD_MESH_SUPPORT must be defined for mesh unload cleanup.
 #include "log.h"
 #include "nal_system.h"
 #include "ngl.h"
@@ -283,6 +284,9 @@ nglFont *tlInstanceBankResourceDirectory<nglFont, tlFixedString>::Find(const tlF
 
 void tlReleaseFile(tlFileBuf *File)
 {
+#if MOD_MESH_SUPPORT && !defined(TARGET_XBOX)
+    if (modReleaseMeshFileBuffer(File)) return;
+#endif
     if (tlCurSystemCallbacks.ReleaseFile != nullptr) {
         tlCurSystemCallbacks.ReleaseFile(File);
     } else {

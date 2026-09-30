@@ -3,6 +3,7 @@
 #include "tlresourcedirectory.h"
 
 struct resource_directory;
+struct nglTexture;
 
 template<typename, typename>
 struct tlInstanceBankResourceDirectory;
@@ -25,6 +26,11 @@ struct tlresource_directory : tlResourceDirectory<T0, T1> {
 };
 
 extern void tlresource_directory_patch();
+
+// Loads a loose DDS into the global NGL texture bank and retains it for
+// external resources (for example a loose scene-PCANIM) that resolve textures
+// directly through nglTextureDirectory rather than a packed resource slot.
+extern nglTexture *modEnsureExternalTexture(uint32_t nameHash);
 
 
 extern void tlresource_directory2_patch();

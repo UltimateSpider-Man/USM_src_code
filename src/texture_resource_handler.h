@@ -25,3 +25,4 @@ struct texture_resource_handler : base_tl_resource_handler {
 };
 
 extern void texture_resource_handler_patch();
+extern void texture_resource_handler_xbpack_patch();

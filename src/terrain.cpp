@@ -1644,3 +1644,19 @@ void terrain_patch()
     }
 
 }
+
+#ifdef OPENUSM_XBPACK_MODE
+namespace
+{
+void clear_region_callbacks(void *callbacks)
+{
+    CDECL_CALL(0x0082207C, callbacks);
+    terrain::region_change_callbacks = nullptr;
+}
+}
+
+void terrain_xbpack_patch()
+{
+    REDIRECT(0x0054EB4A, clear_region_callbacks);
+}
+#endif

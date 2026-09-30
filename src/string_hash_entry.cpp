@@ -3,10 +3,28 @@
 #include "string_hash.h"
 
 #include "common.h"
+#ifdef OPENUSM_XBPACK_V10
+#include "exe_allocator.h"
+#endif
 #include "func_wrapper.h"
 #include "mash_info_struct.h"
 
 VALIDATE_SIZE(string_hash_entry, 20u);
+
+#ifdef OPENUSM_XBPACK_V10
+void *string_hash_entry::operator new(std::size_t size)
+{
+    assert(size == sizeof(string_hash_entry));
+    return exe_allocator<string_hash_entry> {}.allocate(1);
+}
+
+void string_hash_entry::operator delete(void *ptr, std::size_t size) noexcept
+{
+    (void) size;
+    exe_allocator<string_hash_entry> {}.deallocate(
+        static_cast<string_hash_entry *>(ptr), 1);
+}
+#endif
 
 string_hash_entry::string_hash_entry()
 {

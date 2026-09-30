@@ -5,6 +5,8 @@
 #include "debugutil.h"
 #include "func_wrapper.h"
 #include "nal_system.h"
+#include "mod_nal_overrides.h"
+#include "nal_skeleton.h"
 #include "nal_anim.h"  // complete nalAnimClass<nalAnyPose>; needed for clip->field_4
 #include "ngl.h"
 #include "ngl_mesh.h"
@@ -221,6 +223,7 @@ static void tlLoadLoosePCAnimBanksForDirectory()
     for (const auto &entry : Mods)
     {
         const Mod &mod = entry.second;
+        if (modNalConfiguredSource(mod.Path)) continue;
         if (mod.Type != TLRESOURCE_TYPE_ANIM_FILE || mod.Data.empty())
             continue;
         if (transformToLower(mod.Path.extension().string()) != ".pcanim")
@@ -331,7 +334,7 @@ static nalAnimClass<nalAnyPose> *tlFindLoosePCAnimClip(uint32_t clipHash)
 }
 
 
-// PCMESH loose-file bridge ---------------------------------------------------
+// PCMESH/XBMESH loose-file bridge ---------------------------------------------------
 //
 // IMPORTANT: this directory hook must NOT call the directory Load vfunc by
 // itself.  nglLoadMeshFile() already has the correct ownership sequence:
@@ -344,22 +347,22 @@ static nalAnimClass<nalAnyPose> *tlFindLoosePCAnimClip(uint32_t clipHash)
 // That is the crash seen when a loose .PCMESH is exercised.
 //
 // The only job performed here is to make the filename/request hash visible to
-// modBindRawPCMesh().  The normal caller then performs the one legitimate Load,
-// and nglLoadMeshFileInternalPC() owns parsing/rebasing the writable copy.
+// modBindRawMesh().  The normal caller then performs the one legitimate Load,
+// and nglLoadMeshFileInternal() owns parsing/rebasing the writable copy.
 
-static std::set<std::filesystem::path> &tlLoosePCMeshRejectedPaths()
+static std::set<std::filesystem::path> &tlLooseMeshRejectedPaths()
 {
     static std::set<std::filesystem::path> paths;
     return paths;
 }
 
-static Mod *tlFindLoosePCMeshMod(const tlFixedString &requested)
+static Mod *tlFindLooseMeshMod(const tlFixedString &requested)
 {
-    // enumerate_mods() normally registers .pcmesh by stem hash.
+    // enumerate_mods() registers both native formats by stem and path hashes.
     if (Mod *mod = getMod(requested.m_hash, TLRESOURCE_TYPE_MESH_FILE))
     {
-        if (!mod->Data.empty()
-            && transformToLower(mod->Path.extension().string()) == ".pcmesh")
+        const std::string extension = transformToLower(mod->Path.extension().string());
+        if (!mod->Data.empty() && (extension == ".pcmesh" || extension == ".xbmesh"))
             return mod;
     }
 
@@ -372,35 +375,53 @@ static Mod *tlFindLoosePCMeshMod(const tlFixedString &requested)
     const size_t slash = request.find_last_of('/');
     if (slash != std::string::npos)
         request.erase(0, slash + 1);
-    if (request.size() > 7u && request.substr(request.size() - 7u) == ".pcmesh")
-        request.resize(request.size() - 7u);
+    if (request.size() > 7u) {
+        const std::string extension = request.substr(request.size() - 7u);
+        if (extension == ".pcmesh" || extension == ".xbmesh")
+            request.resize(request.size() - 7u);
+    }
 
+    Mod *best = nullptr;
+    std::pair<size_t, unsigned> bestPriority {modRootDirs().size(), 2u};
     std::set<std::filesystem::path> seen;
     for (auto &entry : Mods)
     {
         Mod &mod = entry.second;
         if (mod.Type != TLRESOURCE_TYPE_MESH_FILE || mod.Data.empty())
             continue;
-        if (transformToLower(mod.Path.extension().string()) != ".pcmesh")
+        const std::string extension = transformToLower(mod.Path.extension().string());
+        if (extension != ".pcmesh" && extension != ".xbmesh")
             continue;
 
         const std::filesystem::path normalized = mod.Path.lexically_normal();
         if (!seen.insert(normalized).second)
             continue;
 
-        if (transformToLower(mod.Path.stem().string()) == request)
-            return &mod;
+        if (transformToLower(mod.Path.stem().string()) != request
+            && entry.first != requested.m_hash)
+            continue;
 
-        // Literal-hash aliases remain supported.
-        if (entry.first == requested.m_hash)
-            return &mod;
+        // Filename fallback must use the same root/format priority as typed
+        // hash lookup, regardless of the multimap's hash ordering.
+        size_t rootIndex = 0;
+        for (const auto &root : modRootDirs()) {
+            const auto relative = normalized.lexically_relative(root.lexically_normal());
+            if (!relative.empty() && *relative.begin() != "..")
+                break;
+            ++rootIndex;
+        }
+        const auto priority = std::make_pair(rootIndex, extension == ".pcmesh" ? 0u : 1u);
+        if (best == nullptr || priority < bestPriority) {
+            best = &mod;
+            bestPriority = priority;
+        }
     }
-    return nullptr;
+    return best;
 }
 
-static bool tlLoosePCMeshLooksValid(const Mod &mod)
+static bool tlLooseMeshLooksValid(const Mod &mod)
 {
-    return modPCMESHDetectTLType(mod.Data.data(), mod.Data.size(),
+    return modMeshDetectTLType(mod.Data.data(), mod.Data.size(),
                                  TLRESOURCE_TYPE_MESH_FILE)
         == TLRESOURCE_TYPE_MESH_FILE;
 }
@@ -429,10 +450,14 @@ static nglTexture *tlFindExternalOnlyTexture(const tlFixedString &requested)
 
     // nglLoadTextureTM2 sees the typed Mod entry and chooses D3DX for ordinary
     // DDS or the engine parser for its serialized texture container.
-    nglTexture *tex = nglConstructTexture(
+    // Loose scene animations and panel components look textures up through
+    // the global NGL bank, bypassing this tlresource_directory.  Load and Add
+    // atomically through the engine helper so both lookup paths see the same
+    // persistent texture object.
+    nglTexture *tex = nglLoadTextureInPlace(
         requested, static_cast<nglTextureFileFormat>(0),
-        mod->Data.data(), static_cast<unsigned int>(mod->Data.size()));
-    if (tex == nullptr)
+        mod->Data.data(), static_cast<int>(mod->Data.size()));
+    if (tex == nullptr || tex == nglDefaultTex())
         return nullptr;
 
     cache[requested.m_hash] = tex;
@@ -485,22 +510,22 @@ static nalBaseSkeleton *tlFindExternalOnlySkeleton(const tlFixedString &requeste
     return skel;
 }
 
-static void tlPrepareLoosePCMeshForRequest(const tlFixedString &requested)
+static void tlPrepareLooseMeshForRequest(const tlFixedString &requested)
 {
-    Mod *mod = tlFindLoosePCMeshMod(requested);
+    Mod *mod = tlFindLooseMeshMod(requested);
     if (mod == nullptr)
         return;
 
-    if (!tlLoosePCMeshLooksValid(*mod))
+    if (!tlLooseMeshLooksValid(*mod))
     {
         const std::filesystem::path key = mod->Path.lexically_normal();
-        if (tlLoosePCMeshRejectedPaths().insert(key).second)
-            sp_log("[mod][tlresource] rejected loose PCMESH \"%s\": invalid raw PCM 0x601 image",
+        if (tlLooseMeshRejectedPaths().insert(key).second)
+            sp_log("[mod][tlresource] rejected loose mesh \"%s\": invalid pristine PCMESH/XBMESH image",
                    mod->Path.string().c_str());
         return;
     }
 
-    // modBindRawPCMesh() prefers the canonical request hash. Publish an
+    // modBindRawMesh() prefers the canonical request hash. Publish an
     // alias when the file was found by filename/path fallback. std::multimap
     // insertion does not invalidate the Mod object we just inspected.
     bool aliasPresent = false;
@@ -522,7 +547,7 @@ static void tlPrepareLoosePCMeshForRequest(const tlFixedString &requested)
     const auto key = std::make_pair(requested.m_hash, mod->Path.lexically_normal());
     if (logged.insert(key).second)
     {
-        sp_log("[mod][tlresource] PCMESH \"%s\" prepared for \"%s\" "
+        sp_log("[mod][tlresource] mesh \"%s\" prepared for \"%s\" "
                "(hash 0x%08X, %u bytes); normal mesh loader owns parsing",
                mod->Path.string().c_str(), requested.to_string(), requested.m_hash,
                static_cast<unsigned>(mod->Data.size()));
@@ -530,6 +555,26 @@ static void tlPrepareLoosePCMeshForRequest(const tlFixedString &requested)
 }
 
 } // namespace
+
+nglTexture *modEnsureExternalTexture(uint32_t nameHash)
+{
+    if (nameHash == 0)
+        return nullptr;
+
+    Mod *mod = getMod(nameHash, TLRESOURCE_TYPE_TEXTURE);
+    if (mod == nullptr || mod->Data.empty()
+        || transformToLower(mod->Path.extension().string()) != ".dds")
+        return nullptr;
+
+    const std::string stem = transformToLower(mod->Path.stem().string());
+    if (stem.empty())
+        return nullptr;
+
+    tlFixedString requested{stem.c_str()};
+    requested.field_4[sizeof(requested.field_4) - 1] = '\0';
+    requested.m_hash = nameHash;
+    return tlFindExternalOnlyTexture(requested);
+}
 
 template<>
 nglMeshFile *tlresource_directory<nglMeshFile, tlFixedString>::Find(const tlFixedString &a2)
@@ -575,7 +620,11 @@ nglMeshFile *tlresource_directory<nglMeshFile, tlFixedString>::Find(const tlFixe
         // Directory layer only prepares the loose-file alias. Never call Load
         // here: nglLoadMeshFile() / the worldly resource handler owns the
         // single valid Find -> Load lifetime and registration sequence.
-        tlPrepareLoosePCMeshForRequest(a2);
+        // If the request names an FBX-only mod, synthesize the PCMESH scaffold
+        // first so a missing native mesh file can still enter that same load
+        // sequence.
+       // modEnsureExternalFbxMesh(a2.m_hash);
+        tlPrepareLooseMeshForRequest(a2);
         return (nglMeshFile *) THISCALL(0x005692B0, this, &a2);
     }
 }

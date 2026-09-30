@@ -6,14 +6,21 @@
 
 #include "nal_system.h"
 #include "ngl.h"
+#include "ngl_mesh.h"
 #include "return_address.h"
+#include "tlresource_directory.h"
 #include "trace.h"
 #include "utility.h"
 #include "variables.h"
 #include "vtbl.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
+#include <string>
 
 template<>
 nglTexture *tlResourceDirectory<nglTexture, tlFixedString>::StandardLoad(const tlFixedString &str) {
@@ -181,11 +188,149 @@ nalAnimFile *tlResourceDirectory<nalAnimFile, tlFixedString>::StandardLoad(const
 }
 
 template<>
+nglMeshFile *tlResourceDirectory<nglMeshFile, tlFixedString>::StandardLoad(const tlFixedString &a1);
+
+namespace {
+
+using tlMeshFileBank = tlInstanceBankResourceDirectory<nglMeshFile, tlFixedString>;
+using tlMeshBank = tlInstanceBankResourceDirectory<nglMesh, tlHashString>;
+
+tlMeshBank::Node *tlMeshBankNext(tlMeshBank::Node *node, unsigned level)
+{
+    // Native skip-list nodes have a variable number of links after field_0;
+    // the C++ ABI declaration only names the first link. Read the allocated
+    // tail without indexing beyond that one-element declared array.
+    tlMeshBank::Node *next = nullptr;
+    std::memcpy(&next, reinterpret_cast<const unsigned char *>(node)
+        + offsetof(tlMeshBank::Node, field_4) + level * sizeof(next), sizeof(next));
+    return next;
+}
+
+nglMesh *__fastcall tlFindSystemMeshByHash(tlMeshBank *bank, void *, uint32_t hash)
+{
+    if (bank == nullptr || bank->field_4.field_8 == nullptr
+        || bank->field_4.m_size < 0 || bank->field_4.m_size > 15) return nullptr;
+
+    // Native Add sorts first by the unsigned hash, then by the full name.
+    // XBXM only stores that hash, so its generated display name must not
+    // participate in lookup. Both a four-byte hash and a normal PC name use
+    // this same key; no lookup reads 32 bytes from a tlHashString.
+    auto *node = bank->field_4.field_8;
+    for (int level = bank->field_4.m_size; level >= 0; --level) {
+        while (auto *next = tlMeshBankNext(node, static_cast<unsigned>(level))) {
+            auto *mesh = next->field_0;
+            if (mesh == nullptr || mesh->Name == nullptr) return nullptr;
+            if (mesh->Name->m_hash >= hash) break;
+            node = next;
+        }
+    }
+    auto *next = tlMeshBankNext(node, 0);
+    return next != nullptr && next->field_0 != nullptr
+        && next->field_0->Name != nullptr && next->field_0->Name->m_hash == hash
+        ? next->field_0 : nullptr;
+}
+
+nglMesh *__fastcall tlFindSystemMeshByName(
+    tlMeshBank *bank, void *, const tlHashString *name)
+{
+    return name != nullptr ? tlFindSystemMeshByHash(bank, nullptr, name->GetHash()) : nullptr;
+}
+
+bool tlSystemMeshDirectoriesReady()
+{
+    return tlresource_directory<nglMeshFile, tlFixedString>::system_dir != nullptr
+        && tlresource_directory<nglMesh, tlHashString>::system_dir != nullptr
+        && tlresource_directory<nglMorphSet, tlHashString>::system_dir != nullptr
+        && tlresource_directory<nglMaterialBase, tlHashString>::system_dir != nullptr;
+}
+
+// Packed directories only look up resources; their Add/Load/Release slots are
+// intentionally empty. Loose files instead belong to the existing system
+// banks. Use the same bank context while parsing and while native Release
+// deletes their children, then restore the caller's active pack context.
+class tlScopedSystemMeshDirectories {
+    tlMeshFileBank *files = nglMeshFileDirectory();
+    tlInstanceBankResourceDirectory<nglMesh, tlHashString> *meshes = nglMeshDirectory();
+    tlInstanceBankResourceDirectory<nglMorphSet, tlHashString> *morphs = nglMorphDirectory();
+    tlInstanceBankResourceDirectory<nglMaterialBase, tlHashString> *materials = nglMaterialDirectory();
+    bool enabled;
+
+public:
+    explicit tlScopedSystemMeshDirectories(bool enable) : enabled(enable)
+    {
+        if (!enabled) return;
+        nglMeshFileDirectory() = tlresource_directory<nglMeshFile, tlFixedString>::system_dir;
+        nglMeshDirectory() = tlresource_directory<nglMesh, tlHashString>::system_dir;
+        nglMorphDirectory() = tlresource_directory<nglMorphSet, tlHashString>::system_dir;
+        nglMaterialDirectory() = tlresource_directory<nglMaterialBase, tlHashString>::system_dir;
+    }
+
+    ~tlScopedSystemMeshDirectories()
+    {
+        if (!enabled) return;
+        nglMeshFileDirectory() = files;
+        nglMeshDirectory() = meshes;
+        nglMorphDirectory() = morphs;
+        nglMaterialDirectory() = materials;
+    }
+
+    tlScopedSystemMeshDirectories(const tlScopedSystemMeshDirectories &) = delete;
+    tlScopedSystemMeshDirectories &operator=(const tlScopedSystemMeshDirectories &) = delete;
+};
+
+nglMeshFile *tlFindSystemMeshFile(tlMeshFileBank *bank, const tlFixedString &name)
+{
+    if (bank == nullptr) return nullptr;
+    auto find = bit_cast<nglMeshFile *(__fastcall *)(void *, void *, const tlFixedString *)>(
+        get_vfunc(bank->m_vtbl, 0xC));
+    return find(bank, nullptr, &name);
+}
+
+int tlReleaseSystemMeshFile(tlMeshFileBank *bank, nglMeshFile *file, int mode, bool force)
+{
+    const tlScopedSystemMeshDirectories scope(tlSystemMeshDirectoriesReady());
+    // Native Release only removes the file-bank entry for a nonempty textual
+    // name. A raw override can also be requested by hash alone; remove exactly
+    // that entry before its final release instead of leaving a dangling node.
+    if (file->FileName.field_4[0] == '\0' && (mode != 0 || file->field_120 == 1)) {
+        auto del = bit_cast<bool (__fastcall *)(void *, void *, nglMeshFile *)>(
+            get_vfunc(bank->m_vtbl, 0x14));
+        del(bank, nullptr, file);
+    }
+    return THISCALL(0x0076F1C0, bank, file, mode, force);
+}
+
+nglMeshFile *__fastcall tlLoadLooseMeshFromPackedDirectory(
+    void *, void *, const tlFixedString *name)
+{
+    auto *bank = tlresource_directory<nglMeshFile, tlFixedString>::system_dir;
+    if (name == nullptr || !tlSystemMeshDirectoriesReady()) return nullptr;
+    if (auto *existing = tlFindSystemMeshFile(bank, *name)) {
+        ++existing->field_120;
+        return existing;
+    }
+    // StandardLoad scopes the child directories and adds this file to bank.
+    return bank->StandardLoad(*name);
+}
+
+int __fastcall tlReleaseLooseMeshFromPackedDirectory(
+    void *, void *, nglMeshFile *file, int mode, bool force)
+{
+    auto *bank = tlresource_directory<nglMeshFile, tlFixedString>::system_dir;
+    if (file != nullptr && tlFindSystemMeshFile(bank, file->FileName) == file)
+        return tlReleaseSystemMeshFile(bank, file, mode, force);
+    // The pack owns its original resources. Preserve the original empty
+    // Release slot for any file which is not this system bank's exact object.
+    return 0;
+}
+
+} // namespace
+
+template<>
 int tlResourceDirectory<nglMeshFile, tlFixedString>::Release(nglMeshFile *a2, int a3, bool a4) {
-    sp_log("return to 0x%08X", getReturnAddress());
-
-    //sp_log("Release %s", a2->field_124.Buf);
-
+    auto *bank = tlresource_directory<nglMeshFile, tlFixedString>::system_dir;
+    if (this == bank && a2 != nullptr && tlFindSystemMeshFile(bank, a2->FileName) == a2)
+        return tlReleaseSystemMeshFile(bank, a2, a3, a4);
     return THISCALL(0x005606F0, this, a2, a3, a4);
 }
 
@@ -196,14 +341,24 @@ nglMeshFile *tlResourceDirectory<nglMeshFile, tlFixedString>::StandardLoad(const
 
     if constexpr (1)
     {
+        const tlScopedSystemMeshDirectories directoryScope(
+            this == tlresource_directory<nglMeshFile, tlFixedString>::system_dir
+            && tlSystemMeshDirectoriesReady());
         char Dest[256] {};
-        _snprintf(Dest, 256u, "%s%s%s", nglMeshPath(), a1.to_string(), ".pcmesh");
+        std::string requestName = a1.to_string();
+        if (requestName.size() > 7u) {
+            std::string extension = requestName.substr(requestName.size() - 7u);
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (extension == ".pcmesh" || extension == ".xbmesh")
+                requestName.resize(requestName.size() - 7u);
+        }
         auto *MeshFile = static_cast<nglMeshFile *>(tlMemAlloc(sizeof(nglMeshFile), 8, 0x1000000u));
         if (MeshFile == nullptr)
             return nullptr;
 
         // tlMemAlloc returns raw/recycled storage.  Clear all pointer-bearing
-        // loader state before tlReadFile/modBindRawPCMesh sees this shell; stale
+        // loader state before file reading/modBindRawMesh sees this shell; stale
         // FirstMesh/FileBuf values can otherwise make an address-reused character
         // load look like the previous live PCMESH instance.
         MeshFile->FileBuf.Buf = nullptr;
@@ -221,15 +376,37 @@ nglMeshFile *tlResourceDirectory<nglMeshFile, tlFixedString>::StandardLoad(const
         MeshFile->field_130 = false;
 
         nglMeshFile *result = nullptr;
-        if (tlReadFile(Dest, &MeshFile->FileBuf, 4u, 0))
+        // Bind registered PCMESH/XBMESH bytes before reading: an external
+        // mesh need not have an entry in the current PC pack. The typed
+        // registry already decides root and same-name format precedence.
+        const char *extension = ".pcmesh";
+        bool haveFile = modBindRawMesh(MeshFile, extension);
+        if (haveFile && MeshFile->FileBuf.Size >= 4u
+            && std::memcmp(MeshFile->FileBuf.Buf, "XBXM", 4u) == 0)
+            extension = ".xbmesh";
+
+        // Keep the game's file callbacks/pack reader. Reusing its original
+        // entry point avoids enabling the unrelated tl_patch() replacements.
+        auto readNativeFile = [&](const char *suffix) {
+            const int length = std::snprintf(Dest, sizeof(Dest), "%s%s%s",
+                                             nglMeshPath(), requestName.c_str(), suffix);
+            if (length < 0 || static_cast<size_t>(length) >= sizeof(Dest))
+                return false;
+            return static_cast<bool>(CDECL_CALL(
+                0x0074A710, Dest, &MeshFile->FileBuf, 4u, 0u));
+        };
+        if (!haveFile) {
+            haveFile = readNativeFile(extension);
+            if (!haveFile) {
+                if (MeshFile->FileBuf.Buf != nullptr)
+                    tlReleaseFile(&MeshFile->FileBuf);
+                extension = ".xbmesh";
+                haveFile = readNativeFile(extension);
+            }
+        }
+        if (haveFile)
         {
-            if (nglLoadMeshFileInternal(a1, MeshFile,
-#ifdef TARGET_XBOX
-                        ".xbmesh"
-#else
-                        ".pcmesh"
-#endif
-                        ))
+            if (nglLoadMeshFileInternal(a1, MeshFile, extension))
             {
                 bool (__fastcall *Add)(void *, void *, nglMeshFile *) = CAST(Add, get_vfunc(this->m_vtbl, 0x10));
 
@@ -240,6 +417,8 @@ nglMeshFile *tlResourceDirectory<nglMeshFile, tlFixedString>::StandardLoad(const
 
                 result = MeshFile;
             } else {
+                // Failed conversion may already have allocated private
+                // storage. Release both raw overrides and ordinary file data.
                 tlReleaseFile(&MeshFile->FileBuf);
                 tlMemFree(MeshFile);
 
@@ -248,8 +427,10 @@ nglMeshFile *tlResourceDirectory<nglMeshFile, tlFixedString>::StandardLoad(const
 
         } else {
             auto *v3 = a1.to_string();
-            sp_log("Unable to open %s%s%s.\n", nglMeshPath(), v3, ".pcmesh");
+            sp_log("Unable to open mesh %s%s (.pcmesh or .xbmesh).\n", nglMeshPath(), v3);
 
+            if (MeshFile->FileBuf.Buf != nullptr)
+                tlReleaseFile(&MeshFile->FileBuf);
             tlMemFree(MeshFile);
             result = nullptr;
         }
@@ -279,6 +460,20 @@ void tlResourceDirectory_patch() {
         auto func = &tlResourceDirectory<nglMeshFile, tlFixedString>::StandardLoad;
         FUNC_ADDRESS(address, func);
         SET_JUMP(0x00770000, address);
+    }
+    // Native pack Find already falls back to the system bank. Its Load and
+    // Release slots do not, so bridge only these mesh-file operations.
+    set_vfunc(0x00889698, bit_cast<std::intptr_t>(&tlLoadLooseMeshFromPackedDirectory));
+    set_vfunc(0x0088969C, bit_cast<std::intptr_t>(&tlReleaseLooseMeshFromPackedDirectory));
+    // Packed Find already delegates missing meshes to these two system-bank
+    // slots. Retail leaves hash Find empty and compares all 32 name bytes in
+    // name Find, which cannot match an XBXM hash against a friendly PC name.
+    set_vfunc(0x008B81DC, bit_cast<std::intptr_t>(&tlFindSystemMeshByHash));
+    set_vfunc(0x008B81E0, bit_cast<std::intptr_t>(&tlFindSystemMeshByName));
+    {
+        auto func = &tlResourceDirectory<nglMeshFile, tlFixedString>::Release;
+        FUNC_ADDRESS(address, func);
+        set_vfunc(0x008B81A8, address);
     }
     return;
     {
