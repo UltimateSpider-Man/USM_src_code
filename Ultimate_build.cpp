@@ -1,10 +1,9 @@
-#include "forwards.h"
+﻿#include "forwards.h"
 
 #include "src/mod_fbx_names.h"
 
 #include "mod_gif.h"  // GIF texture mods (mods/*.gif -> animated textures)
 #include "mod_png.h"  // PNG texture mods (mods/*.png)
-#include "main_menu_start_prelib.h"
 #include <unordered_map>
 #include "resource_versions.h"
 #include "main.h"
@@ -270,6 +269,8 @@
 #include "vm_thread.h"
 #include "vtbl.h"
 #include "wds.h"
+#include "wds_entity_manager.h"
+#include "xbpack.h"
 #include "web_interface.h"
 #include "web_polytube.h"
 #include "window_manager.h"
@@ -320,7 +321,6 @@
 #include "info_node.h"
 #include "entity_base_vhandle.h"
 
-static Var<bool> sounds_paused3{0x00960044};
 
 namespace fs = std::filesystem;
 
@@ -349,7 +349,6 @@ BOOL set_text_to_writable() {
 BOOL restore_text_perms() {
     return VirtualProtect((void*)(TEXT_START), TEXT_END - TEXT_START, old_perms, &old_perms);
 }
-
 
 
 // Toggles between windowed and exclusive-fullscreen at runtime.
@@ -2629,17 +2628,16 @@ void read_and_update_controller_key_dpad(LPDIJOYSTATE2 joy, int angle, MenuKey k
 
 
 // Helper: treat a DirectInput axis as a digital direction.
-//   axis_value  : raw DIJOYSTATE2 axis (default DInput range 0..65535, centered at 32768)
+//   axis_value  : raw DIJOYSTATE2 axis (configured by the game to -1000..1000)
 //   positive    : true => fires when axis is past center + threshold
 //                 false => fires when axis is below center - threshold
 //   key         : MenuKey slot to update
 static void read_and_update_controller_key_axis(LONG axis_value, bool positive, MenuKey key) {
-    constexpr LONG CENTER    = 32768;
-    constexpr LONG THRESHOLD = 8192;     // ~25% deflection
+    constexpr LONG THRESHOLD = 250;     // 25% deflection
 
     bool active = positive
-        ? (axis_value > CENTER + THRESHOLD)
-        : (axis_value < CENTER - THRESHOLD);
+        ? (axis_value > THRESHOLD)
+        : (axis_value < -THRESHOLD);
 
     if (active) {
         ++controllerKeys[key];
@@ -2672,18 +2670,17 @@ void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
 	read_and_update_controller_key_button(joy, 11, MENU_R3);
 
 	// Left analog stick directions (lX = horizontal, lY = vertical, up = small Y).
-	read_and_update_controller_key_axis(joy->lX, 13, MENU_L3_LEFT);
-	read_and_update_controller_key_axis(joy->lX, 14,  MENU_L3_RIGHT);
-	read_and_update_controller_key_axis(joy->lY, 15, MENU_L3_UP);
-	read_and_update_controller_key_axis(joy->lY, 16,  MENU_L3_DOWN);
+	read_and_update_controller_key_axis(joy->lX, false, MENU_L3_LEFT);
+	read_and_update_controller_key_axis(joy->lX, true,  MENU_L3_RIGHT);
+	read_and_update_controller_key_axis(joy->lY, false, MENU_L3_UP);
+	read_and_update_controller_key_axis(joy->lY, true,  MENU_L3_DOWN);
 
 	// Right analog stick directions (DS4: lZ = horizontal, lRz = vertical, up = small).
-	read_and_update_controller_key_axis(joy->lZ,  17, MENU_R3_LEFT);
-	read_and_update_controller_key_axis(joy->lZ,  18,  MENU_R3_RIGHT);
-	read_and_update_controller_key_axis(joy->lRz, 19, MENU_R3_UP);
-	read_and_update_controller_key_axis(joy->lRz, 20,  MENU_R3_DOWN);
+	read_and_update_controller_key_axis(joy->lZ,  false, MENU_R3_LEFT);
+	read_and_update_controller_key_axis(joy->lZ,  true,  MENU_R3_RIGHT);
+	read_and_update_controller_key_axis(joy->lRz, false, MENU_R3_UP);
+	read_and_update_controller_key_axis(joy->lRz, true,  MENU_R3_DOWN);
 }
-
 
 
 DWORD modulo(int num, DWORD mod) {
@@ -2790,6 +2787,24 @@ static bool scroll_repeat_should_step(int key_val, int scroll_speed)
 
     return (key_val >= period) && (key_val % period == 0);
 }
+
+
+
+
+// ----------------------------------------------------------------------
+// Scroll auto-repeat acceleration for MENU_UP / MENU_DOWN.
+//
+// key_val is the number of frames the key has been held (keys[i] is
+// ++'d every frame the key is down, reset to 0 on release - see
+// GetDeviceStateHandleKeyboardInput). The base repeat fires one step
+// every SCROLL_SPEED frames. After the key has been held for
+// kScrollAccelHoldFrames frames (2 s at 60 fps = 120), the repeat
+// period is shortened by kScrollAccelFactor (1.5x), so the cursor
+// scrolls faster the longer up/down is held.
+//
+//   base period   = SCROLL_SPEED            (e.g. 5 frames/step)
+//   fast period   = SCROLL_SPEED / 1.5      (e.g. 3 frames/step)
+// ----------------------------------------------------------------------
 void menu_input_handler(int keyboard, int SCROLL_SPEED) {
     if (is_menu_key_clicked(MENU_DOWN, keyboard)) {
 
@@ -2841,7 +2856,7 @@ else if (is_menu_key_clicked(MENU_LEFT, keyboard)) { // Use is_menu_key_clicked 
     }
 
     debug_menu_entry* highlighted = &current_menu->entries[current_menu->window_start + current_menu->cur_index];
-    assert(highlighted->frame_advance_callback != nullptr);
+ //   assert(highlighted->frame_advance_callback != nullptr);
     highlighted->frame_advance_callback(highlighted);
 }
 
@@ -3431,7 +3446,7 @@ void vm_debug_menu_entry_garbage_collection_callback(void* a1, list* lst) {
     for (list* cur = end->next; cur != end; cur = cur->next) {
 
         debug_menu_entry* entry = ((debug_menu_entry*)cur->data);
-        //printf("Will delete %s %08X\n", entry->text, entry);
+        printf("Will delete %s %08X\n", entry->text, entry);
         remove_debug_menu_entry(entry);
     }
 }
@@ -5136,8 +5151,7 @@ void devopt_flags_handler(debug_menu_entry *a1)
     }
 }
 
-#include "os_developer_options_build.h"
-#include "devopt_build.h"
+
 
 void create_devopt_menu(debug_menu* parent)
 {
@@ -6056,10 +6070,10 @@ void create_devopt_menu(debug_menu* parent)
     
 		    for (auto idx = 0u; idx < NUM_OPTIONS; ++idx)
     {
-        auto* v21 = get_option_build(idx);
+        auto* v21 = get_option(idx);
         switch (v21->m_type)
         {
-        case game_option_build_t::INT_OPTION:
+        case game_option_t::INT_OPTION:
         {
             v89 = debug_menu_entry(mString{ v21->m_name });
             v89.set_p_ival(v21->m_value.p_ival);
@@ -6346,8 +6360,9 @@ static entity *spawn_character_at_hero(
     float offset_x = 0.0f,
     float offset_z = 2.0f)
 {
-    // Resource/pack work is unsafe inside the debug-menu callback.  The
-    // shared worker loads the character pack and creates the entity next tick.
+    // Debug-menu input is dispatched from resource_manager::frame_advance().
+    // Loading a pack or constructing an entity from that callback re-enters
+    // resource state.  The shared worker performs both on the next game tick.
     queue_debug_character_spawn(char_name, offset_x, offset_z);
     return nullptr;
 }
@@ -6424,7 +6439,9 @@ void create_script_menu()
         debug_menu_entry* block = v1.alloc_block(script_menu, 4);
         block[0] = debug_menu_entry{ script_menu };
         debug_menu::root_menu->add_entry(script_menu);
+#ifndef OPENUSM_XBPACK_MODE
         populate_character_list_menu(script_menu);
+#endif
     }
 }
 
@@ -6625,8 +6642,8 @@ const char* hero_list[NUM_HEROES] = {
     "shocker",
     "silver_sable",
     "johnny_storm",
-	"black_suit",
-	"spider-man",
+	"usm_blacksuit",
+	"venom_eddie",
 };
 
 enum class hero_status_e {
@@ -7324,9 +7341,7 @@ void menu_setup(int game_state, int keyboard) {
                 debug_enabled = !debug_enabled;
                 current_menu = debug_menu::root_menu;
                 custom();
-		
-												                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
-                sounds_paused3() = true;
+				
             }
 
  }
@@ -7362,6 +7377,7 @@ void menu_setup(int game_state, int keyboard) {
 
 
 
+
 void init_shadow_targets2()
 {
     debug_menu::init();
@@ -7383,8 +7399,10 @@ uint8_t __stdcall slf__debug_menu_entry__set_handler__str(vm_stack* stack, void*
 
     string_hash strhash{ scrpttext };
 
-    script_instance* instance = stack->my_thread->inst;
-    entry->set_script_handler(instance, mString{ scrpttext });
+    if (!install_native_debug_menu_handler(entry, scrpttext)) {
+        script_instance* instance = stack->my_thread->inst;
+        entry->set_script_handler(instance, mString{ scrpttext });
+    }
 
     return true;
 }
@@ -7432,7 +7450,9 @@ uint8_t __fastcall slf__create_progression_menu_entry(script_library_class::func
     script_instance* instance = stack->my_thread->inst;
 
     debug_menu_entry entry{ strs[0] };
-    entry.set_script_handler(instance, { strs[1] });
+    if (!install_native_debug_menu_handler(&entry, strs[1])) {
+        entry.set_script_handler(instance, { strs[1] });
+    }
 
     progression_menu->add_entry(&entry);
 
@@ -7568,6 +7588,7 @@ string_hash names[120] = {
 
 
 
+
 bool __fastcall slf__create_debug_menu_entry(script_library_class::function* func, void*, vm_stack* stack, void* unk)
 {
     stack->pop(4);
@@ -7589,6 +7610,32 @@ bool __fastcall slf__create_debug_menu_entry(script_library_class::function* fun
     script_executable* se = stack->my_thread->ex->owner->parent;
     printf("total_script_objects = %d\n", se->total_script_objects);
     
+    for (auto i = 0; i < se->total_script_objects; ++i) {
+        auto* so = se->script_objects[i];
+        printf("Name of script_object = %s\n", so->name.to_string());
+
+        auto* so_menu = create_menu(so->name.to_string(), debug_menu::sort_mode_t::ascending);
+        auto* so_entry = create_menu_entry(so->name.to_string());
+        so_entry->set_data(so);
+        so_entry->set_submenu(so_menu);
+        script_menu->add_entry(so_entry);
+
+        for (auto j = 0; j < so->total_funcs; ++j) {
+            auto* fn = so->funcs[j];
+            printf("Func name: %s\n", fn->fullname.to_string());
+
+            debug_menu_entry fn_entry{ fn->fullname.to_string() };
+            script_instance* instance = stack->my_thread->inst;
+
+            fn_entry.set_data(nullptr);
+            fn_entry.set_submenu(nullptr);
+            fn_entry.m_id = j;
+            fn_entry.set_script_handler_from_char(instance, fn->fullname.to_string());
+            add_debug_menu_entry(so_menu, &fn_entry);
+        }
+
+        printf("\n");
+    }
 
     se->add_allocated_stuff_for_debug_menu(vm_debug_menu_entry_garbage_collection_id, (int)res, 0);
 
@@ -7598,6 +7645,8 @@ bool __fastcall slf__create_debug_menu_entry(script_library_class::function* fun
     stack->SP += sz;
     return 1;
 }
+
+
 
 
 
@@ -7627,18 +7676,15 @@ BOOL install_redirects()
 	
 	FEMultiLineText_patch();
 	
-	    main_menu_start_build_patch();
+	    
 		
 		    //    fe_mini_map_widget_patch();
 	
-	resource_amalgapak_header_patch();
+
 	
 	        cursor_patch();
 	
-	   
-	   FrontEndMenuSystem_build_patch();
-	   
-	   resource_directory_patch();
+	       FrontEndMenuSystem_build_patch();
 			
 			script_file_loader_patch();
 			
@@ -7646,7 +7692,7 @@ BOOL install_redirects()
 			
 			PauseMenuSystem_patch();
 			
-			IGOZoomOutMap_patch();
+			IGOZoomOutMap_build_patch();
 			
 			pause_menu_awards_patch();	
 
@@ -7718,6 +7764,16 @@ BOOL install_redirects()
         game_patch();
     }
 
+#ifdef OPENUSM_XBPACK_V10
+    game_v10_patch();
+    fe_mission_text_v10_patch();
+#endif
+
+#ifdef OPENUSM_XBPACK_MODE
+    REDIRECT(0x00557EC1, xbpack_destroy_all_entities);
+    REDIRECT(0x0051D2F0, xbpack_load_frontend);
+#endif
+
 
     // @todo: windowed
     REDIRECT(0x005AC4A9, register_class_and_create_window);
@@ -7745,8 +7801,29 @@ BOOL install_redirects()
     }
 	
 
-    //SET_JUMP(0x0077A870, nglLoadTextureTM2);
+    // Keep loose TM2/DDS texture replacement active even though the broader
+    // ngl_patch() block below is intentionally unreachable in this loader.
+    // Preserve the stock multipalette decoder used by Xbox DDSM/DSM city and
+    // character textures; intercept only the nglConstructTexture call so the
+    // wrapper can handle explicit loose texture Mods.
+    REDIRECT(0x0077ABBF, nglLoadTextureTM2);
+
+
+#ifdef OPENUSM_XBPACK_MODE
+    // Install the v10 Xbox pack/data-layout bridge before the existing early
+    // return. This keeps the normal PC path unchanged when xbpack mode is off.
+    localized_string_table_patch();
+    if (!install_xbpack_support()) {
+        return false;
+    }
+    path_resource_handler_patch();
+    state_graph_patch();
+#endif
+
     tlresource_directory2_patch();		
+
+    // Apply the configured HERO_NAME after a Continue/Load Game save load.
+    game_settings_continue_hero_patch();
 
     return true;
 
@@ -7755,6 +7832,8 @@ BOOL install_redirects()
     wds_camera_manager_patch();
 
     resource_directory_patch();
+
+    tlresource_directory_patch();
 
 
     input_settings_patch();
@@ -7834,7 +7913,7 @@ BOOL install_redirects()
         game_camera_patch();
 
         region_patch();
-        
+
         matrix4x4_patch();
 
         ai_interaction_data_patch();
@@ -8444,7 +8523,6 @@ std::vector<uint8_t> read_file(const fs::path& filePath) {
 }
 
 
-
 int modPCANIMDetectTLType(const uint8_t *raw, size_t size, int preferredType);
 // Typed external-resource registries implemented in resource_manager.cpp.
 bool modBaiRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
@@ -8459,13 +8537,26 @@ void enumerate_mods() {
     Mods.clear();
     nflSystem::ModFileOverrides.clear();
 
-    // External typed resources live in extra/. Keep the legacy mods/ root as
-    // a fallback for older installs that have not moved their loose files yet.
-    fs::path modsDir = fs::current_path() / "extra";
-    if (!fs::is_directory(modsDir))
-        modsDir = fs::current_path() / "mods";
-    if (!fs::is_directory(modsDir))
-        return;
+    // Enumerate the same roots used by texture, PCMESH and animation lookup.
+    // Keep one file list so every root is walked once and all name sidecars
+    // are available before any resource is registered.
+    std::vector<std::pair<fs::path, fs::path>> modFiles;
+    std::set<std::string> seenFiles;
+    for (const auto &root : modRootDirs()) {
+        std::error_code ec;
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+        while (!ec && it != end) {
+            const auto entry = *it;
+            if (entry.is_regular_file(ec) && !ec) {
+                auto resolved = fs::weakly_canonical(entry.path(), ec);
+                if (ec) { ec.clear(); resolved = entry.path().lexically_normal(); }
+                if (seenFiles.insert(transformToLower(resolved.generic_string())).second)
+                    modFiles.emplace_back(entry.path(), root);
+            }
+            ec.clear();
+            it.increment(ec);
+        }
+    }
 
     auto normalize_rel = [](std::string s) {
         std::transform(s.begin(), s.end(), s.begin(),
@@ -8481,24 +8572,26 @@ void enumerate_mods() {
     ModWavHashNames.clear();
     ModWavNameHashes.clear();
     ModWavHashAliases.clear();
-    for (const auto& entry : fs::recursive_directory_iterator(modsDir)) {
-        if (!entry.is_regular_file())
-            continue;
-        const fs::path& path = entry.path();
+    for (const auto &file : modFiles) {
+        const fs::path &path = file.first;
         const std::string fname = transformToLower(path.filename().string());
         if (transformToLower(path.extension().string()) == ".txt"
             && fname.find("hash") != std::string::npos)
             modWavLoadHashNames(path);
     }
 
-    for (const auto& entry : fs::recursive_directory_iterator(modsDir)) {
-        if (!entry.is_regular_file())
-            continue;
-
-        const fs::path& path = entry.path();
+    for (const auto &file : modFiles) {
+        const fs::path &path = file.first;
+        const fs::path &modsDir = file.second;
         std::string ext = transformToLower(path.extension().string());
-        const std::string stem = path.stem().string();
+        const std::string stem = transformToLower(path.stem().string());
         const uint32_t hash = to_hash(stem.c_str());
+
+        // The music stream bank has a validated native NSL loader. Do not
+        // duplicate its whole payload in Mods or let an unvalidated NFL
+        // alias bypass validation when the external attempt falls back.
+        if (ext == ".wbk" && stem == "streams_music")
+            continue;
 
         // Structured external resources use their typed loaders so pristine
         // source bytes are never handed to a consumer that rebases in place.
@@ -8519,8 +8612,6 @@ void enumerate_mods() {
             // PCM/float WAV (mono or stereo) -> PCM16 DirectSound override,
             // keyed by stem in the engine sound-hash space (see mod.h)
             modWavRegister(path, read_file(path));
-								                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
-                sounds_paused3() = true;
             continue;
         }
 
@@ -8734,7 +8825,7 @@ void enumerate_mods() {
         tlresource_type resType = TLRESOURCE_TYPE_NONE;
         if (ext == ".dds" || ext == ".tga")
             resType = TLRESOURCE_TYPE_TEXTURE;
-        else if (ext == ".obj" || ext == ".fbx" || ext == ".dae" || ext == ".gltf" || ext == ".glb")
+        else if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb")
             resType = TLRESOURCE_TYPE_MESH;
         // @todo platform
         else if (ext == ".pcmesh")
@@ -8745,6 +8836,13 @@ void enumerate_mods() {
         // resource_directory's generic override path resolves them by stem
 
         Mods.emplace(hash, Mod{path, resType, read_file(path)});
+        if (ext == ".obj" || ext == ".fbx" || ext == ".glb" || ext == ".gltf") {
+            bool objectTarget = false;
+            const bool knownTarget = modmesh::isKnownFbxTarget(stem, &objectTarget);
+            sp_log("[modmesh] mesh registered: %s -> %s target '%s' (0x%08X)",
+                   path.string().c_str(), knownTarget ? (objectTarget ? "object" : "character") : "custom",
+                   stem.c_str(), hash);
+        }
         printf("name = %s\nhash = 0x%08X\n", stem.c_str(), hash);
     }
 

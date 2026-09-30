@@ -1,3 +1,4 @@
+#include "src/multiplayer_mode.h"
 #include "forwards.h"
 
 #include "src/mod_fbx_names.h"
@@ -269,6 +270,8 @@
 #include "vm_thread.h"
 #include "vtbl.h"
 #include "wds.h"
+#include "wds_entity_manager.h"
+#include "xbpack.h"
 #include "web_interface.h"
 #include "web_polytube.h"
 #include "window_manager.h"
@@ -348,7 +351,6 @@ BOOL restore_text_perms() {
     return VirtualProtect((void*)(TEXT_START), TEXT_END - TEXT_START, old_perms, &old_perms);
 }
 
-static Var<bool> sounds_paused3{0x00960044};
 
 // Toggles between windowed and exclusive-fullscreen at runtime.
 //
@@ -2627,17 +2629,16 @@ void read_and_update_controller_key_dpad(LPDIJOYSTATE2 joy, int angle, MenuKey k
 
 
 // Helper: treat a DirectInput axis as a digital direction.
-//   axis_value  : raw DIJOYSTATE2 axis (default DInput range 0..65535, centered at 32768)
+//   axis_value  : raw DIJOYSTATE2 axis (configured by the game to -1000..1000)
 //   positive    : true => fires when axis is past center + threshold
 //                 false => fires when axis is below center - threshold
 //   key         : MenuKey slot to update
 static void read_and_update_controller_key_axis(LONG axis_value, bool positive, MenuKey key) {
-    constexpr LONG CENTER    = 32768;
-    constexpr LONG THRESHOLD = 8192;     // ~25% deflection
+    constexpr LONG THRESHOLD = 250;     // 25% deflection
 
     bool active = positive
-        ? (axis_value > CENTER + THRESHOLD)
-        : (axis_value < CENTER - THRESHOLD);
+        ? (axis_value > THRESHOLD)
+        : (axis_value < -THRESHOLD);
 
     if (active) {
         ++controllerKeys[key];
@@ -2670,16 +2671,16 @@ void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
 	read_and_update_controller_key_button(joy, 11, MENU_R3);
 
 	// Left analog stick directions (lX = horizontal, lY = vertical, up = small Y).
-	read_and_update_controller_key_axis(joy->lX, 13, MENU_L3_LEFT);
-	read_and_update_controller_key_axis(joy->lX, 14,  MENU_L3_RIGHT);
-	read_and_update_controller_key_axis(joy->lY, 15, MENU_L3_UP);
-	read_and_update_controller_key_axis(joy->lY, 16,  MENU_L3_DOWN);
+	read_and_update_controller_key_axis(joy->lX, false, MENU_L3_LEFT);
+	read_and_update_controller_key_axis(joy->lX, true,  MENU_L3_RIGHT);
+	read_and_update_controller_key_axis(joy->lY, false, MENU_L3_UP);
+	read_and_update_controller_key_axis(joy->lY, true,  MENU_L3_DOWN);
 
 	// Right analog stick directions (DS4: lZ = horizontal, lRz = vertical, up = small).
-	read_and_update_controller_key_axis(joy->lZ,  17, MENU_R3_LEFT);
-	read_and_update_controller_key_axis(joy->lZ,  18,  MENU_R3_RIGHT);
-	read_and_update_controller_key_axis(joy->lRz, 19, MENU_R3_UP);
-	read_and_update_controller_key_axis(joy->lRz, 20,  MENU_R3_DOWN);
+	read_and_update_controller_key_axis(joy->lZ,  false, MENU_R3_LEFT);
+	read_and_update_controller_key_axis(joy->lZ,  true,  MENU_R3_RIGHT);
+	read_and_update_controller_key_axis(joy->lRz, false, MENU_R3_UP);
+	read_and_update_controller_key_axis(joy->lRz, true,  MENU_R3_DOWN);
 }
 
 
@@ -3026,7 +3027,7 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* self, DWORD cbData, LP
 
     if (cbData == 256 || cbData == sizeof(DIJOYSTATE2)) {
         int keyboard = cbData == 256;
-        menu_setup((int)g_state, keyboard);
+        //menu_setup((int)g_state, keyboard);
 
         // --- Debug-menu focus toggle ---
         // While the debug menu is on-screen (debug_enabled || debug_disabled),
@@ -6526,6 +6527,7 @@ void debug_nglListEndScene_hook() {
     debug_menu::active_menu->render_current_debug_menu();
 
 
+    multiplayer_mode_draw_overlay();
     nglListEndScene();
 }
 static bool s_hero_frozen = false;
@@ -7296,12 +7298,13 @@ void hero_entry_callback(debug_menu_entry*)
             auto v17 = 0;
             auto* v5 = (actor*)g_world_ptr->get_hero_ptr(0);
             auto* v6 = v5->get_player_controller();
-            auto v9 = v6->m_hero_type;
+            auto v9 = v6->find_hero_type();
             switch (v9)
             {
                 case hero_type_enum::SPIDEY:
                     v17 = 0;
                     break;
+                case hero_type_enum::CARNAGE:
                 case hero_type_enum::VENOM:
                     v17 = 4;
                     break;
@@ -7312,6 +7315,8 @@ void hero_entry_callback(debug_menu_entry*)
 
             auto* v7 = g_world_ptr->get_hero_ptr(0);
             auto v8 = v7->my_handle;
+            if (!g_femanager.IGO->hero_health->SelectCarnagePanel(v9 == hero_type_enum::CARNAGE))
+                sp_log("Carnage HUD unavailable: install the matching GAME.PCPACK.");
             g_femanager.IGO->hero_health->SetType(v17, v8.field_0);
             g_femanager.IGO->hero_health->SetShown(true);
             close_debug();
@@ -7339,8 +7344,6 @@ void menu_setup(int game_state, int keyboard) {
                 debug_enabled = !debug_enabled;
                 current_menu = debug_menu::root_menu;
                 custom();
-										                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
-                sounds_paused3() = true;
 				
             }
 
@@ -7377,6 +7380,7 @@ void menu_setup(int game_state, int keyboard) {
 
 
 
+
 void init_shadow_targets2()
 {
     debug_menu::init();
@@ -7398,8 +7402,10 @@ uint8_t __stdcall slf__debug_menu_entry__set_handler__str(vm_stack* stack, void*
 
     string_hash strhash{ scrpttext };
 
-    script_instance* instance = stack->my_thread->inst;
-    entry->set_script_handler(instance, mString{ scrpttext });
+    if (!install_native_debug_menu_handler(entry, scrpttext)) {
+        script_instance* instance = stack->my_thread->inst;
+        entry->set_script_handler(instance, mString{ scrpttext });
+    }
 
     return true;
 }
@@ -7447,7 +7453,9 @@ uint8_t __fastcall slf__create_progression_menu_entry(script_library_class::func
     script_instance* instance = stack->my_thread->inst;
 
     debug_menu_entry entry{ strs[0] };
-    entry.set_script_handler(instance, { strs[1] });
+    if (!install_native_debug_menu_handler(&entry, strs[1])) {
+        entry.set_script_handler(instance, { strs[1] });
+    }
 
     progression_menu->add_entry(&entry);
 
@@ -7759,6 +7767,20 @@ BOOL install_redirects()
         game_patch();
     }
 
+#ifdef OPENUSM_XBPACK_V10
+    game_v10_patch();
+    fe_mission_text_v10_patch();
+#endif
+
+#ifdef OPENUSM_XBPACK_MODE
+    REDIRECT(0x00557EC1, xbpack_destroy_all_entities);
+    REDIRECT(0x0051D2F0, xbpack_load_frontend);
+#else
+    // Mirror the XBPACK character-spawner lifetime on retail PC: destroy
+    // native lineup actors and pop their owned PC packs before world teardown.
+    REDIRECT(0x00557EC1, debug_character_destroy_all_entities);
+#endif
+
 
     // @todo: windowed
     REDIRECT(0x005AC4A9, register_class_and_create_window);
@@ -7786,10 +7808,38 @@ BOOL install_redirects()
     }
 	
 
-    //SET_JUMP(0x0077A870, nglLoadTextureTM2);
+    // Keep loose TM2/DDS texture replacement active even though the broader
+    // ngl_patch() block below is intentionally unreachable in this loader.
+    // Preserve the stock multipalette decoder used by Xbox DDSM/DSM city and
+    // character textures; intercept only the nglConstructTexture call so the
+    // wrapper can handle explicit loose texture Mods.
+    REDIRECT(0x0077ABBF, nglLoadTextureTM2);
 
 
-    tlresource_directory2_patch();		
+#ifdef OPENUSM_XBPACK_MODE
+    // Install the v10 Xbox pack/data-layout bridge before the existing early
+    // return. This keeps the normal PC path unchanged when xbpack mode is off.
+    localized_string_table_patch();
+    if (!install_xbpack_support()) {
+        return false;
+    }
+    path_resource_handler_patch();
+    state_graph_patch();
+#endif
+
+    tlresource_directory2_patch();
+
+    // Mesh-only loading and cleanup must run before the early return. This
+    // enables pristine PCMESH/XBMESH overrides even without a packed file;
+    // the game's PC platform, pack format and other resource hooks stay intact.
+    tlResourceDirectory_patch();
+    SET_JUMP(0x0074A6C0, tlReleaseFile);
+
+    // Apply the configured HERO_NAME after a Continue/Load Game save load.
+    game_settings_continue_hero_patch();
+
+    // Retail-only, sidecar seventh main-menu entry; never enlarges the native ABI.
+    multiplayer_mode_install();
 
     return true;
 
@@ -8490,6 +8540,8 @@ std::vector<uint8_t> read_file(const fs::path& filePath) {
 
 
 int modPCANIMDetectTLType(const uint8_t *raw, size_t size, int preferredType);
+// Implemented in ngl.cpp. Validates pristine PC and Xbox mesh-file images.
+int modMeshDetectTLType(const uint8_t *raw, size_t size, int preferredType);
 // Typed external-resource registries implemented in resource_manager.cpp.
 bool modBaiRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
 bool modAsgRegister(const std::filesystem::path &path, std::vector<uint8_t> &&fileData);
@@ -8503,13 +8555,36 @@ void enumerate_mods() {
     Mods.clear();
     nflSystem::ModFileOverrides.clear();
 
-    // External typed resources live in extra/. Keep the legacy mods/ root as
-    // a fallback for older installs that have not moved their loose files yet.
-    fs::path modsDir = fs::current_path() / "extra";
-    if (!fs::is_directory(modsDir))
-        modsDir = fs::current_path() / "mods";
-    if (!fs::is_directory(modsDir))
-        return;
+    // Enumerate the same roots used by texture, PCMESH and animation lookup.
+    // Keep one file list so every root is walked once and all name sidecars
+    // are available before any resource is registered.
+    std::vector<std::pair<fs::path, fs::path>> modFiles;
+    std::set<std::string> seenFiles;
+    for (const auto &root : modRootDirs()) {
+        const auto rootFirstFile = modFiles.size();
+        std::error_code ec;
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+        while (!ec && it != end) {
+            const auto entry = *it;
+            if (entry.is_regular_file(ec) && !ec) {
+                auto resolved = fs::weakly_canonical(entry.path(), ec);
+                if (ec) { ec.clear(); resolved = entry.path().lexically_normal(); }
+                if (seenFiles.insert(transformToLower(resolved.generic_string())).second)
+                    modFiles.emplace_back(entry.path(), root);
+            }
+            ec.clear();
+            it.increment(ec);
+        }
+
+        // Typed lookup returns the first registered file for a hash. Keep the
+        // established mods -> extra root order, but within each root register
+        // PC meshes before Xbox meshes so an equal-stem pair has a stable PC
+        // preference. Other files retain their relative enumeration order.
+        std::stable_partition(modFiles.begin() + rootFirstFile, modFiles.end(),
+            [](const auto &file) {
+                return transformToLower(file.first.extension().string()) != ".xbmesh";
+            });
+    }
 
     auto normalize_rel = [](std::string s) {
         std::transform(s.begin(), s.end(), s.begin(),
@@ -8525,29 +8600,31 @@ void enumerate_mods() {
     ModWavHashNames.clear();
     ModWavNameHashes.clear();
     ModWavHashAliases.clear();
-    for (const auto& entry : fs::recursive_directory_iterator(modsDir)) {
-        if (!entry.is_regular_file())
-            continue;
-        const fs::path& path = entry.path();
+    for (const auto &file : modFiles) {
+        const fs::path &path = file.first;
         const std::string fname = transformToLower(path.filename().string());
         if (transformToLower(path.extension().string()) == ".txt"
             && fname.find("hash") != std::string::npos)
             modWavLoadHashNames(path);
     }
 
-    for (const auto& entry : fs::recursive_directory_iterator(modsDir)) {
-        if (!entry.is_regular_file())
-            continue;
-
-        const fs::path& path = entry.path();
+    for (const auto &file : modFiles) {
+        const fs::path &path = file.first;
+        const fs::path &modsDir = file.second;
         std::string ext = transformToLower(path.extension().string());
-        const std::string stem = path.stem().string();
+        const std::string stem = transformToLower(path.stem().string());
         const uint32_t hash = to_hash(stem.c_str());
+
+        // The music stream bank has a validated native NSL loader. Do not
+        // duplicate its whole payload in Mods or let an unvalidated NFL
+        // alias bypass validation when the external attempt falls back.
+        if (ext == ".wbk" && stem == "streams_music")
+            continue;
 
         // Structured external resources use their typed loaders so pristine
         // source bytes are never handed to a consumer that rebases in place.
         // This also lets them resolve when no same-name PCPACK entry exists.
-        if (ext != ".pcanim" && ext != ".pcsanim" && ext != ".pcmesh"
+        if (ext != ".pcanim" && ext != ".pcsanim" && ext != ".pcmesh" && ext != ".xbmesh"
             && ext != ".als" && ext != ".bai" && ext != ".asg"
             && ext != ".msn" && ext != ".panel" && ext != ".coll"
             && ext != ".pcmeshdef")
@@ -8563,8 +8640,6 @@ void enumerate_mods() {
             // PCM/float WAV (mono or stereo) -> PCM16 DirectSound override,
             // keyed by stem in the engine sound-hash space (see mod.h)
             modWavRegister(path, read_file(path));
-								                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
-                sounds_paused3() = true;
             continue;
         }
 
@@ -8658,6 +8733,72 @@ void enumerate_mods() {
         // layout to a native PCSX image and retains the hash -> name mapping.
         if (ext == ".ps2sx") {
             modPS2SXRegister(path, read_file(path));
+            continue;
+        }
+
+        // Native PC/Xbox mesh-file images share one typed override path.
+        // Detect by content, not extension. NGL owns the private writable
+        // parse copy; raw source bytes never enter generic NFL overrides.
+        if (ext == ".pcmesh" || ext == ".xbmesh") {
+            const std::vector<uint8_t> fileData = read_file(path);
+            const int meshType = modMeshDetectTLType(
+                fileData.data(), fileData.size(), TLRESOURCE_TYPE_MESH_FILE);
+            if (meshType != TLRESOURCE_TYPE_MESH_FILE) {
+                printf("mod: invalid PCMESH/XBMESH ignored: %s\n", path.string().c_str());
+                continue;
+            }
+
+            std::set<uint32_t> aliases;
+            const std::string stemKey = transformToLower(path.stem().string());
+            aliases.insert(to_hash(stemKey.c_str()));
+            aliases.insert(to_hash((stemKey + ".pcmesh").c_str()));
+            aliases.insert(to_hash((stemKey + ".xbmesh").c_str()));
+            aliases.insert(hash);
+
+            // Relative-path aliases help loose files organized in subfolders.
+            // Iterator paths already descend from this root; avoid another
+            // filesystem canonicalization, which can fail on readable files.
+            fs::path relNoExt = path.lexically_relative(modsDir);
+            relNoExt.replace_extension();
+            std::string relKey = transformToLower(relNoExt.generic_string());
+            if (!relKey.empty()) {
+                aliases.insert(to_hash(relKey.c_str()));
+                aliases.insert(to_hash((relKey + ".pcmesh").c_str()));
+                aliases.insert(to_hash((relKey + ".xbmesh").c_str()));
+                std::replace(relKey.begin(), relKey.end(), '/', '\\');
+                aliases.insert(to_hash(relKey.c_str()));
+                aliases.insert(to_hash((relKey + ".pcmesh").c_str()));
+                aliases.insert(to_hash((relKey + ".xbmesh").c_str()));
+            }
+
+            // Literal hashes support mesh names unavailable in the dictionary.
+            if (stemKey.size() == 10u && stemKey[0] == '0' && stemKey[1] == 'x') {
+                char *end = nullptr;
+                const unsigned long literal = std::strtoul(stemKey.c_str() + 2, &end, 16);
+                if (end != nullptr && *end == '\0' && literal <= 0xFFFFFFFFul)
+                    aliases.insert(static_cast<uint32_t>(literal));
+            }
+
+            for (uint32_t alias : aliases) {
+                bool duplicate = false;
+                const auto range = Mods.equal_range(alias);
+                for (auto it = range.first; it != range.second; ++it) {
+                    if (it->second.Type == meshType && it->second.Path == path) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate)
+                    Mods.emplace(alias, Mod{path, meshType, fileData});
+            }
+
+            printf("mod: %s REGISTERED %s -> stem_hash=0x%08X "
+                   "(%u bytes, %u hash aliases, explicit mesh override)\n",
+                   ext == ".xbmesh" ? "XBMESH" : "PCMESH",
+                   path.string().c_str(),
+                   to_hash(stemKey.c_str()),
+                   static_cast<unsigned>(fileData.size()),
+                   static_cast<unsigned>(aliases.size()));
             continue;
         }
 
@@ -8778,17 +8919,21 @@ void enumerate_mods() {
         tlresource_type resType = TLRESOURCE_TYPE_NONE;
         if (ext == ".dds" || ext == ".tga")
             resType = TLRESOURCE_TYPE_TEXTURE;
-        else if (ext == ".obj" || ext == ".fbx" || ext == ".dae" || ext == ".gltf" || ext == ".glb")
+        else if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb")
             resType = TLRESOURCE_TYPE_MESH;
-        // @todo platform
-        else if (ext == ".pcmesh")
-            resType = TLRESOURCE_TYPE_MESH_FILE;
 		        else if (ext == ".pcskel")
             resType = TLRESOURCE_TYPE_SKELETON;
         // unknown extensions stay registered as TYPE_NONE with their bytes:
         // resource_directory's generic override path resolves them by stem
 
         Mods.emplace(hash, Mod{path, resType, read_file(path)});
+        if (ext == ".obj" || ext == ".fbx" || ext == ".glb" || ext == ".gltf") {
+            bool objectTarget = false;
+            const bool knownTarget = modmesh::isKnownFbxTarget(stem, &objectTarget);
+            sp_log("[modmesh] mesh registered: %s -> %s target '%s' (0x%08X)",
+                   path.string().c_str(), knownTarget ? (objectTarget ? "object" : "character") : "custom",
+                   stem.c_str(), hash);
+        }
         printf("name = %s\nhash = 0x%08X\n", stem.c_str(), hash);
     }
 

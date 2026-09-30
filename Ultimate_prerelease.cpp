@@ -1,5 +1,7 @@
-#include "forwards.h"
+﻿#include "forwards.h"
 
+
+#include "scnanims.h"
 #include "src/mod_fbx_names.h"
 #include "mod_gif.h"  // GIF texture mods (mods/*.gif -> animated textures)
 #include "mod_png.h"  // PNG texture mods (mods/*.png)
@@ -163,6 +165,7 @@
 #include "nslbank.h"
 #include "oldmath_po.h"
 #include "os_developer_options.h"
+#include "optional_venom_patches.h"
 #include "os_file.h"
 #include "panel_resource_handler.h"
 #include "panelanimfile.h"
@@ -269,6 +272,8 @@
 #include "vm_thread.h"
 #include "vtbl.h"
 #include "wds.h"
+#include "wds_entity_manager.h"
+#include "xbpack.h"
 #include "web_interface.h"
 #include "web_polytube.h"
 #include "window_manager.h"
@@ -323,7 +328,6 @@
 
 namespace fs = std::filesystem;
 
-static Var<bool> sounds_paused3{0x00960044};
 
 std::multimap<uint32_t, Mod> Mods;
 std::unordered_map<std::string, std::filesystem::path> ModFileOverrides;
@@ -634,7 +638,7 @@ BOOL install_patches()
 		
 		
 #ifdef OPENUSM_XBPACK_MODE
-        ngl_xbpack_patch();
+   //     ngl_xbpack_patch();
 #endif
 
 
@@ -2646,17 +2650,16 @@ void read_and_update_controller_key_dpad(LPDIJOYSTATE2 joy, int angle, MenuKey k
 
 
 // Helper: treat a DirectInput axis as a digital direction.
-//   axis_value  : raw DIJOYSTATE2 axis (default DInput range 0..65535, centered at 32768)
+//   axis_value  : raw DIJOYSTATE2 axis (configured by the game to -1000..1000)
 //   positive    : true => fires when axis is past center + threshold
 //                 false => fires when axis is below center - threshold
 //   key         : MenuKey slot to update
 static void read_and_update_controller_key_axis(LONG axis_value, bool positive, MenuKey key) {
-    constexpr LONG CENTER    = 32768;
-    constexpr LONG THRESHOLD = 8192;     // ~25% deflection
+    constexpr LONG THRESHOLD = 250;     // 25% deflection
 
     bool active = positive
-        ? (axis_value > CENTER + THRESHOLD)
-        : (axis_value < CENTER - THRESHOLD);
+        ? (axis_value > THRESHOLD)
+        : (axis_value < -THRESHOLD);
 
     if (active) {
         ++controllerKeys[key];
@@ -2689,16 +2692,16 @@ void GetDeviceStateHandleControllerInput(LPVOID lpvData) {
 	read_and_update_controller_key_button(joy, 11, MENU_R3);
 
 	// Left analog stick directions (lX = horizontal, lY = vertical, up = small Y).
-	read_and_update_controller_key_axis(joy->lX, 13, MENU_L3_LEFT);
-	read_and_update_controller_key_axis(joy->lX, 14,  MENU_L3_RIGHT);
-	read_and_update_controller_key_axis(joy->lY, 15, MENU_L3_UP);
-	read_and_update_controller_key_axis(joy->lY, 16,  MENU_L3_DOWN);
+	read_and_update_controller_key_axis(joy->lX, false, MENU_L3_LEFT);
+	read_and_update_controller_key_axis(joy->lX, true,  MENU_L3_RIGHT);
+	read_and_update_controller_key_axis(joy->lY, false, MENU_L3_UP);
+	read_and_update_controller_key_axis(joy->lY, true,  MENU_L3_DOWN);
 
 	// Right analog stick directions (DS4: lZ = horizontal, lRz = vertical, up = small).
-	read_and_update_controller_key_axis(joy->lZ,  17, MENU_R3_LEFT);
-	read_and_update_controller_key_axis(joy->lZ,  18,  MENU_R3_RIGHT);
-	read_and_update_controller_key_axis(joy->lRz, 19, MENU_R3_UP);
-	read_and_update_controller_key_axis(joy->lRz, 20,  MENU_R3_DOWN);
+	read_and_update_controller_key_axis(joy->lZ,  false, MENU_R3_LEFT);
+	read_and_update_controller_key_axis(joy->lZ,  true,  MENU_R3_RIGHT);
+	read_and_update_controller_key_axis(joy->lRz, false, MENU_R3_UP);
+	read_and_update_controller_key_axis(joy->lRz, true,  MENU_R3_DOWN);
 }
 
 
@@ -4184,33 +4187,50 @@ std::vector<mission_t> menu_missions;
 void mission_unload_handler(debug_menu_entry *)
 {
     auto *v1 = mission_manager::s_inst;
+    if (v1 == nullptr)
+    {
+        debug_menu::hide();
+        return;
+    }
+
     v1->prepare_unload_script();
     debug_menu::hide();
 }
 
 void mission_select_handler(debug_menu_entry *entry)
 {
-    auto v1 = entry->m_id;
-    const auto &v7 = menu_missions[v1];
+    auto *manager = mission_manager::s_inst;
+    if (entry == nullptr || manager == nullptr)
+    {
+        debug_menu::hide();
+        return;
+    }
+
+    const auto mission_index = static_cast<std::size_t>(entry->m_id);
+    if (mission_index >= menu_missions.size())
+    {
+        debug_menu::hide();
+        return;
+    }
+
+    const auto &v7 = menu_missions[mission_index];
     auto v6 = v7.field_C;
     auto v5 = v7.field_14;
     auto *v4 = v7.field_0.c_str();
     auto v3 = v7.m_district_id;
-    auto *v2 = mission_manager::s_inst;
-    v2->force_mission(v3, v4, v5, v6);
+    manager->force_mission(v3, v4, v5, v6);
     debug_menu::hide();
 }
-
-typedef int (*resource_manager_can_reload_amalgapak_ptr)(void);
-resource_manager_can_reload_amalgapak_ptr resource_manager_can_reload_amalgapak = (resource_manager_can_reload_amalgapak_ptr)0x0053DE90;
-
-typedef void (*resource_manager_reload_amalgapak_ptr)(void);
-resource_manager_reload_amalgapak_ptr resource_manager_reload_amalgapak = (resource_manager_reload_amalgapak_ptr)0x0054C2E0;
 
 
 // Helper function to add a mission entry
 void add_mission_entry(const mission_table_container::script_info &info, int district_id, debug_menu *target_menu)
 {
+    if (target_menu == nullptr || info.field_0 == nullptr || info.field_4 == nullptr)
+    {
+        return;
+    }
+
     auto v50 = menu_missions.size();
     const auto v19 = std::string {"pk_"} + info.field_0;
     auto *v11 = v19.c_str();
@@ -4248,10 +4268,15 @@ void add_mission_entry(const mission_table_container::script_info &info, int dis
 
 void populate_missions_menu(debug_menu_entry *entry)
 {
-    menu_missions = {};
-    if ( resource_manager_can_reload_amalgapak() )
+    if (entry == nullptr)
     {
-        resource_manager_can_reload_amalgapak();
+        return;
+    }
+
+    menu_missions = {};
+    if ( resource_manager::can_reload_amalgapak() )
+    {
+        resource_manager::reload_amalgapak();
     }
     auto *head_menu = create_menu("Missions", debug_menu::sort_mode_t::ascending);
     entry->set_submenu(head_menu);
@@ -4264,6 +4289,11 @@ void populate_missions_menu(debug_menu_entry *entry)
     head_menu->add_entry(mission_unload_entry);
     
     auto *v2 = mission_manager::s_inst;
+    if (v2 == nullptr)
+    {
+        return;
+    }
+
     auto v58 = v2->get_district_table_count();
     
     for ( auto i = -1; i < v58; ++i )
@@ -4283,7 +4313,17 @@ void populate_missions_menu(debug_menu_entry *entry)
         else
         {
             table = v2->get_district_table(i);
+            if (table == nullptr)
+            {
+                continue;
+            }
+
             auto *reg = table->get_region();
+            if (reg == nullptr)
+            {
+                continue;
+            }
+
             v53 = reg->get_name();
             district_id = reg->get_district_id();
             
@@ -4311,6 +4351,11 @@ void populate_missions_menu(debug_menu_entry *entry)
         
         for ( auto &info : script_infos)
         {
+            if (info.field_0 == nullptr || info.field_4 == nullptr)
+            {
+                continue;
+            }
+
             std::string mission_name = info.field_0;
             
             // Check if it's a venom trick race (check for "venom" first since it might also contain "trick")
@@ -6742,14 +6787,15 @@ void custom()
 #include "fe_health_widget.h"
 
 
-constexpr auto NUM_HEROES = 5u;
+constexpr auto NUM_HEROES = 6u;
 
 const char* hero_list[NUM_HEROES] = {
     "ultimate_spiderman",
 	"venom",
 	"peter_parker",
 	"peter_hooded",
-    "venom_eddie"
+    "venom_eddie",
+	"carnage",
 	
 
 };
@@ -7210,6 +7256,20 @@ void level_select_handler(debug_menu_entry* entry)
     // entry->m_id was set to the index when you built the menu
     const std::size_t idx = static_cast<std::size_t>(entry->m_id);
 
+#ifdef OPENUSM_XBPACK_MODE
+    int descriptor_count = 0;
+    auto* level_descriptors = get_level_descriptors(&descriptor_count);
+    if (level_descriptors == nullptr ||
+        idx >= static_cast<std::size_t>(descriptor_count))
+        return;
+
+    const std::string scene_name{ level_descriptors[idx].field_0.to_string() };
+    if (scene_name.empty())
+        return;
+
+	PollReboot();
+	RestartWithScene(scene_name, std::string{ "runlevel " } + scene_name);
+#else
     // Safety net – in case someone hand‑edits game.ini
     if (idx >= std::size(kLevelList))
         return;      
@@ -7217,6 +7277,7 @@ void level_select_handler(debug_menu_entry* entry)
 
 	PollReboot();
 	RestartWithScene(kLevelList[idx]);
+#endif
 }
 
 
@@ -7291,13 +7352,23 @@ void create_level_select_menu(debug_menu* level_select_menu)
 
 
 
-   void remove_player(int player_num)
+   bool remove_player(int player_num)
     {
-resource_manager::set_active_district(false);
+        if (g_world_ptr == nullptr || g_game_ptr == nullptr ||
+            player_num < 0 || player_num >= static_cast<int>(MAX_GAME_PLAYERS) ||
+            player_num != g_world_ptr->num_players - 1 ||
+            g_world_ptr->get_hero_ptr(player_num) == nullptr ||
+            g_world_ptr->get_chase_cam_ptr(player_num) == nullptr)
+        {
+            return false;
+        }
+
+        resource_manager::set_active_district(false);
     
         void (__fastcall *func)(void *, void *, int) = bit_cast<decltype(func)>(0x00558550);
 
         func(g_world_ptr, nullptr, player_num);
+        return true;
     }
 
 
@@ -7332,12 +7403,23 @@ void hero_entry_callback(debug_menu_entry*)
 {
     printf("hero_entry_callback: hero_status = %d\n", hero_status);
 
+    if (g_world_ptr == nullptr || g_game_ptr == nullptr)
+    {
+        hero_status = hero_status_e::UNDEFINED;
+        return;
+    }
+
     auto v18 = g_world_ptr->num_players;
     switch (hero_status)
     {
     case hero_status_e::REMOVE_PLAYER:
     {
-        remove_player(v18 - 1);
+        if (!remove_player(v18 - 1))
+        {
+            hero_status = hero_status_e::UNDEFINED;
+            break;
+        }
+
         hero_status = hero_status_e::ADD_PLAYER;
         frames_to_skip = 2;
         g_game_ptr->enable_marky_cam(true, true, -1000.0, 0.0);
@@ -7370,6 +7452,13 @@ void hero_entry_callback(debug_menu_entry*)
         {
             auto v17 = 0;
             auto* v5 = (actor*)g_world_ptr->get_hero_ptr(0);
+            if (v5 == nullptr || v5->get_player_controller() == nullptr ||
+                g_femanager.IGO == nullptr || g_femanager.IGO->hero_health == nullptr)
+            {
+                hero_status = hero_status_e::UNDEFINED;
+                break;
+            }
+
             auto* v6 = v5->get_player_controller();
             auto v9 = v6->m_hero_type;
             switch (v9)
@@ -7406,6 +7495,8 @@ debug_menu_root *& menu_ptr = var<debug_menu_root*>(0);
 
 
 void menu_setup(int game_state, int keyboard) {
+	bool opened_debug_menu = false;
+
 	if (is_menu_key_pressed(MENU_START, keyboard) && (game_state == 6)) {
 
     //debug menu stuff
@@ -7414,8 +7505,7 @@ void menu_setup(int game_state, int keyboard) {
                 debug_enabled = !debug_enabled;
                 current_menu = debug_menu::root_menu;
                 custom();
-										                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
-                sounds_paused3() = true;
+				opened_debug_menu = true;
 				
             }
 
@@ -7431,18 +7521,15 @@ void menu_setup(int game_state, int keyboard) {
 
 
                 custom();
+				opened_debug_menu = true;
 
             }
 
- 
+    }
 
-
-        if (level_select_menu->used_slots == 0)
-        {
-            create_level_select_menu(level_select_menu);
-        }
-
-
+    if (opened_debug_menu && level_select_menu != nullptr && level_select_menu->used_slots == 0)
+    {
+        create_level_select_menu(level_select_menu);
     }
 }
 
@@ -7455,6 +7542,7 @@ void menu_setup(int game_state, int keyboard) {
 void init_shadow_targets2()
 {
     debug_menu::init();
+	       
 	
 
     CDECL_CALL(0x00592E80);
@@ -7471,10 +7559,21 @@ uint8_t __stdcall slf__debug_menu_entry__set_handler__str(vm_stack* stack, void*
     debug_menu_entry* entry = static_cast<decltype(entry)>(params[0]);
     const char* scrpttext = static_cast<char*>(params[1]);
 
+    // A failed script-side create must not turn a debug-only menu binding into
+    // a fatal boot crash.  The Xbox character-list producer is restored in
+    // slc_manager; retain this boundary check for malformed/custom scripts.
+    if (entry == nullptr) {
+        sp_log("Ignoring set_handler on a null debug_menu_entry (%s)",
+               scrpttext != nullptr ? scrpttext : "<null>");
+        return true;
+    }
+
     string_hash strhash{ scrpttext };
 
-    script_instance* instance = stack->my_thread->inst;
-    entry->set_script_handler(instance, mString{ scrpttext });
+    if (!install_native_debug_menu_handler(entry, scrpttext)) {
+        script_instance* instance = stack->my_thread->inst;
+        entry->set_script_handler(instance, mString{ scrpttext });
+    }
 
     return true;
 }
@@ -7522,7 +7621,9 @@ uint8_t __fastcall slf__create_progression_menu_entry(script_library_class::func
     script_instance* instance = stack->my_thread->inst;
 
     debug_menu_entry entry{ strs[0] };
-    entry.set_script_handler(instance, { strs[1] });
+    if (!install_native_debug_menu_handler(&entry, strs[1])) {
+        entry.set_script_handler(instance, { strs[1] });
+    }
 
     progression_menu->add_entry(&entry);
 
@@ -7717,6 +7818,9 @@ BOOL install_redirects()
 	
 	FEMultiLineText_patch();
 	
+    install_optional_venom_patches();
+	
+	
 	    main_menu_start_build_patch();
 		
 		        nalStreamInstance_patch();
@@ -7726,7 +7830,9 @@ BOOL install_redirects()
 				
 				mission_manager_patch2();
 		
-					main_menu_start_prelib_patch();
+
+
+                    scnanims_patch();
 	
 	resource_amalgapak_header_patch();
 	
@@ -7762,6 +7868,10 @@ BOOL install_redirects()
 		    pause_menu_message_log_patch();
 			
 		        resource_manager2_patch();
+				
+				ai_player_controller_patch();
+				
+				//hero_inode_patch();
 
         // Required by external .ENT overrides before the early return below.
         // Retail PC entities use the normal size table; PS2 beta-preview
@@ -7826,6 +7936,17 @@ BOOL install_redirects()
         game_patch();
     }
 
+#ifdef OPENUSM_XBPACK_V10
+    game_v10_patch();
+    fe_mission_text_v10_patch();
+    fe_dialog_text_patch();
+#endif
+
+#ifdef OPENUSM_XBPACK_MODE
+    REDIRECT(0x00557EC1, xbpack_destroy_all_entities);
+    REDIRECT(0x0051D2F0, xbpack_load_frontend);
+#endif
+
 
     // @todo: windowed
     REDIRECT(0x005AC4A9, register_class_and_create_window);
@@ -7853,8 +7974,25 @@ BOOL install_redirects()
     }
 	
 
-    SET_JUMP(0x0077A870, nglLoadTextureTM2);
+    // Preserve the stock multipalette decoder used by Xbox DDSM/DSM city and
+    // character textures; intercept only the nglConstructTexture call so the
+    // wrapper can handle explicit loose texture Mods.
+    REDIRECT(0x0077ABBF, nglLoadTextureTM2);
+	
+	
+	        
 
+
+#ifdef OPENUSM_XBPACK_MODE
+    // Install the v10 Xbox pack/data-layout bridge before the existing early
+    // return. This keeps the normal PC path unchanged when xbpack mode is off.
+    localized_string_table_patch();
+    if (!install_xbpack_support()) {
+        return false;
+    }
+    path_resource_handler_patch();
+    state_graph_patch();
+#endif
 
     tlresource_directory2_patch();		
 
@@ -7863,6 +8001,11 @@ BOOL install_redirects()
     // Hook that CALL before this function's early return so the 50% health
     // transformation runs on the gameplay thread every frame.
     REDIRECT(0x00558500, frame_advance_damage_with_auto_blacksuit);
+
+    // Keep the explicit HERO_NAME choice when Continue/Load Game finishes
+    // loading its saved game_data_meat.  This narrow hook replaces the stock
+    // frame-advance call only; the first-stage save request remains stock.
+    game_settings_continue_hero_patch();
 
     return true;
 
@@ -8597,9 +8740,27 @@ void enumerate_mods() {
     Mods.clear();
     nflSystem::ModFileOverrides.clear();
 
-    fs::path modsDir = fs::current_path() / "extra";
-    if (!fs::is_directory(modsDir))
-        return;
+
+    // Enumerate the same roots used by texture, PCMESH and animation lookup.
+    // Keep one file list so every root is walked once and all name sidecars
+    // are available before any resource is registered.
+    std::vector<std::pair<fs::path, fs::path>> modFiles;
+    std::set<std::string> seenFiles;
+    for (const auto &root : modRootDirs()) {
+        std::error_code ec;
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+        while (!ec && it != end) {
+            const auto entry = *it;
+            if (entry.is_regular_file(ec) && !ec) {
+                auto resolved = fs::weakly_canonical(entry.path(), ec);
+                if (ec) { ec.clear(); resolved = entry.path().lexically_normal(); }
+                if (seenFiles.insert(transformToLower(resolved.generic_string())).second)
+                    modFiles.emplace_back(entry.path(), root);
+            }
+            ec.clear();
+            it.increment(ec);
+        }
+    }
 
     auto normalize_rel = [](std::string s) {
         std::transform(s.begin(), s.end(), s.begin(),
@@ -8615,24 +8776,26 @@ void enumerate_mods() {
     ModWavHashNames.clear();
     ModWavNameHashes.clear();
     ModWavHashAliases.clear();
-    for (const auto& entry : fs::recursive_directory_iterator(modsDir)) {
-        if (!entry.is_regular_file())
-            continue;
-        const fs::path& path = entry.path();
+    for (const auto &file : modFiles) {
+        const fs::path &path = file.first;
         const std::string fname = transformToLower(path.filename().string());
         if (transformToLower(path.extension().string()) == ".txt"
             && fname.find("hash") != std::string::npos)
             modWavLoadHashNames(path);
     }
 
-    for (const auto& entry : fs::recursive_directory_iterator(modsDir)) {
-        if (!entry.is_regular_file())
-            continue;
-
-        const fs::path& path = entry.path();
+    for (const auto &file : modFiles) {
+        const fs::path &path = file.first;
+        const fs::path &modsDir = file.second;
         std::string ext = transformToLower(path.extension().string());
-        const std::string stem = path.stem().string();
+        const std::string stem = transformToLower(path.stem().string());
         const uint32_t hash = to_hash(stem.c_str());
+
+        // The music stream bank has a validated native NSL loader. Do not
+        // duplicate its whole payload in Mods or let an unvalidated NFL
+        // alias bypass validation when the external attempt falls back.
+        if (ext == ".wbk" && stem == "streams_music")
+            continue;
 
         // Generic direct-file overrides are safe for ordinary resources, but
         // NEVER for PCANIM/PCSANIM, raw PCMESH, ALS/BAI/ASG, MSN/PANEL,
@@ -8659,8 +8822,6 @@ void enumerate_mods() {
             // PCM/float WAV (mono or stereo) -> PCM16 DirectSound override,
             // keyed by stem in the engine sound-hash space (see mod.h)
             modWavRegister(path, read_file(path));
-								                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
-                sounds_paused3() = true;
             continue;
         }
 
@@ -9019,7 +9180,7 @@ void enumerate_mods() {
         tlresource_type resType = TLRESOURCE_TYPE_NONE;
         if (ext == ".dds" || ext == ".tga")
             resType = TLRESOURCE_TYPE_TEXTURE;
-        else if (ext == ".obj" || ext == ".fbx" || ext == ".dae" || ext == ".gltf" || ext == ".glb")
+        else if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb")
             resType = TLRESOURCE_TYPE_MESH;
         // @todo platform
 		        else if (ext == ".pcskel")
@@ -9028,6 +9189,13 @@ void enumerate_mods() {
         // resource_directory's generic override path resolves them by stem
 
         Mods.emplace(hash, Mod{path, resType, read_file(path)});
+        if (ext == ".obj" || ext == ".fbx" || ext == ".glb" || ext == ".gltf") {
+            bool objectTarget = false;
+            const bool knownTarget = modmesh::isKnownFbxTarget(stem, &objectTarget);
+            sp_log("[modmesh] mesh registered: %s -> %s target '%s' (0x%08X)",
+                   path.string().c_str(), knownTarget ? (objectTarget ? "object" : "character") : "custom",
+                   stem.c_str(), hash);
+        }
         printf("name = %s\nhash = 0x%08X\n", stem.c_str(), hash);
     }
 
