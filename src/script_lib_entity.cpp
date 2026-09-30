@@ -7,9 +7,11 @@
 #include "entity_handle_manager.h"
 #include "memory.h"
 #include "osassert.h"
+#include "slc_manager.h"
 #include "trace.h"
 #include "utility.h"
 #include "vm_stack.h"
+#include "xbpack.h"
 
 ai::ai_core *get_ai_core_from_vhandle(entity_base_vhandle a1)
 {
@@ -1587,6 +1589,36 @@ struct slf__entity__remove_vehicle_from_traffic_system__t : script_library_class
     bool operator()(vm_stack &, script_library_class::function::entry_t) const { return true;}
 };
 
+struct slf__entity__render_name__num__t : script_library_class::function {
+    slf__entity__render_name__num__t(script_library_class *slc, const char *name) :
+            function(slc, name)
+    {
+        m_vtbl = CAST(m_vtbl, 0x0089B47C);
+        auto local_vtbl = CAST(m_vtbl, mem_alloc(sizeof(*m_vtbl)));
+        *local_vtbl = *m_vtbl;
+        FUNC_ADDRESS(address, &slf__entity__render_name__num__t::operator());
+        local_vtbl->__cl = CAST(local_vtbl->__cl, address);
+        m_vtbl = local_vtbl;
+    }
+
+    struct parms_t {
+        entity_base_vhandle me;
+        vm_num_t enabled;
+    };
+
+    bool operator()(vm_stack &stack, entry_t) const
+    {
+        SLF_PARMS;
+
+        auto *entity = parms->me.get_volatile_ptr();
+        if (entity != nullptr && parms->enabled != 0.0f) {
+            (void)entity->get_id().to_string();
+        }
+
+        return true;
+    }
+};
+
 struct slf__entity__reset_ai__t : script_library_class::function {
     slf__entity__reset_ai__t (script_library_class *slc, const char *a3) : function(slc, a3)  {
         m_vtbl = (decltype(m_vtbl))0x0089B06C;
@@ -2469,7 +2501,9 @@ void register_entity_lib()
     CREATE_SLF(entity, apply_directed_damage__num__vector3d, "apply_directed_damage(num,vector3d)");
     CREATE_SLF(entity, apply_directed_damage_cat__num__vector3d__str__num, "apply_directed_damage_cat(num,vector3d,str,num)");
     CREATE_SLF(entity, apply_explosive_damage__num__vector3d, "apply_explosive_damage(num,vector3d)");
-    CREATE_SLF(entity, apply_explosive_damage__num__vector3d__vector3d, "apply_explosive_damage(num,vector3d,vector3d)");
+    if constexpr (!xbpack::v10) {
+        CREATE_SLF(entity, apply_explosive_damage__num__vector3d__vector3d, "apply_explosive_damage(num,vector3d,vector3d)");
+    }
     CREATE_SLF(entity, apply_subdue__num, "apply_subdue(num)");
     CREATE_SLF(entity, camera_get_target, "camera_get_target()");
     CREATE_SLF(entity, camera_orbit__vector3d__num__num__num, "camera_orbit(vector3d,num,num,num)");
@@ -2513,12 +2547,16 @@ void register_entity_lib()
     CREATE_SLF(entity, get_current_animation_name, "get_current_animation_name()");
     CREATE_SLF(entity, get_damage_force, "get_damage_force()");
     CREATE_SLF(entity, get_debug_name, "get_debug_name()");
-    CREATE_SLF(entity, get_detonate_position, "get_detonate_position()");
+    if constexpr (!xbpack::v10) {
+        CREATE_SLF(entity, get_detonate_position, "get_detonate_position()");
+    }
     CREATE_SLF(entity, get_district, "get_district()");
     CREATE_SLF(entity, get_facing, "get_facing()");
     CREATE_SLF(entity, get_fade_timer, "get_fade_timer()");
     CREATE_SLF(entity, get_first_child, "get_first_child()");
-    CREATE_SLF(entity, get_hash_name, "get_hash_name()");
+    if constexpr (!xbpack::v10) {
+        CREATE_SLF(entity, get_hash_name, "get_hash_name()");
+    }
     CREATE_SLF(entity, get_hidey_pos__vector3d__num, "get_hidey_pos(vector3d,num)");
     CREATE_SLF(entity, get_ifc_num__str, "get_ifc_num(str)");
     CREATE_SLF(entity, get_ifc_str__str, "get_ifc_str(str)");
@@ -2537,6 +2575,9 @@ void register_entity_lib()
     CREATE_SLF(entity, get_last_attacker, "get_last_attacker()");
     CREATE_SLF(entity, get_last_item_used, "get_last_item_used()");
     CREATE_SLF(entity, get_member__str, "get_member(str)");
+    if constexpr (xbpack::v10) {
+        CREATE_SLF(entity, get_debug_name, "get_name()");
+    }
     CREATE_SLF(entity, get_next_sibling, "get_next_sibling()");
     CREATE_SLF(entity, get_num_items, "get_num_items()");
     CREATE_SLF(entity, get_parent, "get_parent()");
@@ -2609,12 +2650,20 @@ void register_entity_lib()
     CREATE_SLF(entity, push_ai_base_machine__str, "push_ai_base_machine(str)");
     CREATE_SLF(entity, randomize_position__vector3d__num__num__num, "randomize_position(vector3d,num,num,num)");
     CREATE_SLF(entity, regenerate__num__num, "regenerate(num,num)");
+    // Original Xbox V10 slot 175 is rel_angle. These registrations fill
+    // positional SLC slots; omitting it shifts remove_selectable_target
+    // from 178 to 177 and makes the V08 sign callback consume only one of
+    // its two entity handles, eventually hiding the hero.
     CREATE_SLF(entity, rel_angle__vector3d, "rel_angle(vector3d)");
     CREATE_SLF(entity, remove_collision_ignorance__entity, "remove_collision_ignorance(entity)");
     CREATE_SLF(entity, remove_exclusive_interactor__string_hash__interactable_interface, "remove_exclusive_interactor(string_hash,interactable_interface)");
     CREATE_SLF(entity, remove_selectable_target__entity, "remove_selectable_target(entity)");
     CREATE_SLF(entity, remove_vehicle_from_traffic_system, "remove_vehicle_from_traffic_system()");
-    CREATE_SLF(entity, reset_ai, "reset_ai()");
+    if constexpr (!xbpack::v10) {
+        // V10 goes directly from remove_vehicle (179) to restart (180).
+        CREATE_SLF(entity, render_name__num, "render_name(num)");
+        CREATE_SLF(entity, reset_ai, "reset_ai()");
+    }
     CREATE_SLF(entity, restart, "restart()");
     CREATE_SLF(entity, seriously_kill, "seriously_kill()");
     CREATE_SLF(entity, set_abs_xz_facing__vector3d, "set_abs_xz_facing(vector3d)");
@@ -2623,7 +2672,9 @@ void register_entity_lib()
     CREATE_SLF(entity, set_ai_param_float_variance__str__num__num, "set_ai_param_float_variance(str,num,num)");
     CREATE_SLF(entity, set_ai_param_hash__str__num, "set_ai_param_hash(str,num)");
     CREATE_SLF(entity, set_ai_param_hash__str__str, "set_ai_param_hash(str,str)");
-    CREATE_SLF(entity, set_ai_param_hash__str__string_hash, "set_ai_param_hash(str,string_hash)");
+    if constexpr (!xbpack::v10) {
+        CREATE_SLF(entity, set_ai_param_hash__str__string_hash, "set_ai_param_hash(str,string_hash)");
+    }
     CREATE_SLF(entity, set_ai_param_int__str__num, "set_ai_param_int(str,num)");
     CREATE_SLF(entity, set_ai_param_str__str__str, "set_ai_param_str(str,str)");
     CREATE_SLF(entity, set_ai_param_vector3d__str__vector3d, "set_ai_param_vector3d(str,vector3d)");
@@ -2631,7 +2682,9 @@ void register_entity_lib()
     CREATE_SLF(entity, set_anchor_activated__num, "set_anchor_activated(num)");
     CREATE_SLF(entity, set_car_combat_info__num__num__num__num__num__num__num__num, "set_car_combat_info(num,num,num,num,num,num,num,num)");
     CREATE_SLF(entity, set_crawlable__num, "set_crawlable(num)");
-    CREATE_SLF(entity, set_default_variant, "set_default_variant()");
+    if constexpr (!xbpack::v10) {
+        CREATE_SLF(entity, set_default_variant, "set_default_variant()");
+    }
     CREATE_SLF(entity, set_distance_clip__num, "set_distance_clip(num)");
     CREATE_SLF(entity, set_entity_blur__num, "set_entity_blur(num)");
     CREATE_SLF(entity, set_facing__vector3d__vector3d, "set_facing(vector3d,vector3d)");
@@ -2671,7 +2724,9 @@ void register_entity_lib()
     CREATE_SLF(entity, set_special_target__num, "set_special_target(num)");
     CREATE_SLF(entity, set_state__num__num, "set_state(num,num)");
     CREATE_SLF(entity, set_targetting__num, "set_targetting(num)");
-    CREATE_SLF(entity, set_throwable__num, "set_throwable(num)");
+    if constexpr (!xbpack::v10) {
+        CREATE_SLF(entity, set_throwable__num, "set_throwable(num)");
+    }
     CREATE_SLF(entity, set_time_dilation__num, "set_time_dilation(num)");
     CREATE_SLF(entity, set_time_mode__num, "set_time_mode(num)");
     CREATE_SLF(entity, set_variant__string_hash, "set_variant(string_hash)");

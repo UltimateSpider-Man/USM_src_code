@@ -17,6 +17,12 @@
 #include "utility.h"
 #include "wds.h"
 
+#if defined(OPENUSM_XBPACK_MODE) && defined(OPENUSM_XBPACK_V10) && !defined(TARGET_XBOX)
+#include "als_motion_compensator.h"
+#include "vtbl.h"
+#include "xbpack_v10_green_goblin.h"
+#endif
+
 namespace als {
 
 VALIDATE_SIZE(animation_logic_system, 0x80u);
@@ -228,11 +234,6 @@ void animation_logic_system::frame_advance_play_new_animations(Float a2)
 {
     TRACE("animation_logic_system::frame_advance_play_new_animations");
 
-    {
-        state_machine *the_state_machine = &this->field_18;
-        sp_log("is_active = %d, did_do_transition = %d", the_state_machine->is_active(), the_state_machine->did_do_transition());
-    }
-
     if constexpr (1)
     {
         if ( !this->field_7C )
@@ -341,6 +342,18 @@ void animation_logic_system::frame_advance_change_mocomp(Float a2)
 {
     TRACE("animation_logic_system::frame_advance_change_mocomp");
 
+#if defined(OPENUSM_XBPACK_MODE) && defined(OPENUSM_XBPACK_V10) && !defined(TARGET_XBOX)
+    if (!field_7C && field_18.did_do_transition() && field_74 != nullptr) {
+        auto *state = field_18.get_curr_state();
+        if (state != nullptr) {
+            using type_fn = std::uint32_t (__fastcall *)(const void *, void *);
+            const auto get_type = reinterpret_cast<type_fn>(get_vfunc(state->m_vtbl, 0x18));
+            if (xbpack_v10_green_goblin_keep_mocomp(field_6C, field_74->m_vtbl,
+                                                    get_type(state, nullptr), state->field_C))
+                return;
+        }
+    }
+#endif
     THISCALL(0x00498DB0, this, a2);
 }
 
@@ -443,8 +456,6 @@ void animation_logic_system::frame_advance_main_als_advance(Float a2)
             if ( this->field_6C->has_time_ifc() ) {
                 this->field_6C->time_ifc();
             }
-
-            sp_log("%d", this->field_8.size());
 
             const int num_layers = static_cast<int>(this->field_8.size());
             for ( int i = -1; i < num_layers; ++i )

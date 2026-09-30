@@ -210,38 +210,6 @@ void region_array::push_back(region *a2)
     }
 }
 
-entity* world_dynamics_system::create_and_add_entity(
-    const string_hash& type_hash,
-    const string_hash& id_hash,
-    const vector3d& pos,
-    const po* orientation,
-    int flags)
-{
-    // Step 1: Acquire entity from entity manager
-    entity* ent = this->ent_mgr.acquire_entity(type_hash, id_hash, flags);
-    
-    if (ent == nullptr) {
-        return nullptr;
-    }
-    
-    // Step 2: Set position
-    ent->set_abs_position(pos);
-    
-    // Step 3: Set orientation if provided
-    if (orientation != nullptr) {
-        ent->set_abs_po(*orientation);
-    }
-    
-    // Step 4: Make visible and add to world
-    ent->set_visible(true, false);
-    
-    // If there's an add_to_world or register function, call it here:
-    // this->add_entity(ent);
-    
-    return ent;
-}
-
-
 void build_region_list_radius(region_array *arr, region *reg, const vector3d &a3, Float a4, bool a5)
 {
     if ( reg != nullptr && arr != nullptr && !arr->contains(reg) )
@@ -278,7 +246,7 @@ int world_dynamics_system::add_generator(force_generator *generator) {
 void world_dynamics_system::advance_entity_animations(Float a3) {
     TRACE("world_dynamics_system::advance_entity_animations");
 
-    if constexpr (0)
+    if constexpr (1)
     {}
     else
     {
@@ -404,6 +372,9 @@ void world_dynamics_system::frame_advance(Float a2)
 {
     TRACE("world_dynamics_system::frame_advance");
 
+    // The native path is retained for continued reverse engineering, but it
+    // currently corrupts entity-tracker heap state in the prerelease runtime.
+    // Delegate to the complete stock implementation for production loaders.
     if constexpr (0)
     {
         this->field_158.frame_advance(a2);
@@ -903,6 +874,32 @@ bool world_dynamics_system::un_mash_scene_entities(const resource_key &a2, regio
     }
     else
     {
+#ifdef OPENUSM_XBPACK_V10
+        if (brew.field_0.is_done()) {
+            return false;
+        }
+
+        if (!brew.field_0.is_started()) {
+            brew.field_0.start();
+            brew.field_8 = slot_ptr;
+            brew.field_C = 0;
+            brew.field_10 = nullptr;
+            brew.buffer_index = 0;
+            brew.field_1C = 0;
+            if (!resource_manager::get_resource_if_exists(
+                    a2, reg, &brew.field_10, brew.field_8, &brew.field_C)) {
+                brew.field_0.done();
+                return false;
+            }
+
+            brew.parse_code = *reinterpret_cast<int *>(brew.field_10);
+            assert(brew.parse_code == ENTITIES_TAG);
+            brew.field_3C = *reinterpret_cast<int *>(brew.field_10 + 4);
+            brew.field_24 = *reinterpret_cast<int *>(brew.field_10 + 8);
+            brew.buffer_index = 12;
+        }
+#endif
+
         bool (__fastcall *func)(void *, void *, const resource_key *, region *, worldly_pack_slot *, bool , scene_entity_brew *) = CAST(func, 0x0055A680);
         return func(this, nullptr, &a2, reg, slot_ptr, a5, &brew);
     }
@@ -1516,8 +1513,17 @@ int world_dynamics_system::add_player(const mString &a2)
             }
 
             {
-                auto *v40 = bit_cast<actor *>(this->field_230[this->num_players]);
-                v40->create_player_controller(this->num_players);
+                auto *player = bit_cast<actor *>(this->field_230[this->num_players]);
+
+                // A freshly created player can arrive with zero current health
+                // even though its resource contains a nonzero maximum. Start it
+                // at that maximum before the controller begins advancing it.
+                if (player->has_damage_ifc()) {
+                    auto *damage = player->damage_ifc();
+                    damage->field_1FC.sub_48BFB0(damage->field_1FC.field_0[2]);
+                }
+
+                player->create_player_controller(this->num_players);
             }
 
             this->field_3E0 = a2;
@@ -1549,7 +1555,7 @@ void world_dynamics_system::deactivate_corner_web_splats()
         if (!v5.field_7)
         {
             if (v5.m_data != nullptr) {
-                operator delete[](v5.m_data);
+                CDECL_CALL(0x0082209A, v5.m_data);
             }
         }
 
@@ -1657,7 +1663,7 @@ void world_dynamics_system::deactivate_web_splats()
         if (!v5->field_7)
         {
             if (v5->m_data != nullptr) {
-                operator delete[](v5->m_data);
+                CDECL_CALL(0x0082209A, v5->m_data);
             }
         }
 
@@ -1672,7 +1678,21 @@ bool world_dynamics_system::is_loading_from_scn_file() {
 
 int world_dynamics_system::remove_player(int player_num)
 {
-    assert(player_num == this->num_players - 1);
+    // Some menu/mission teardown paths can request a removal after the last
+    // player has already gone away.  The stock routine decrements zero to -1
+    // and then indexes field_234[-1] (which aliases the hero slot), eventually
+    // calling destroy_entity(nullptr).  Treat that duplicate removal as the
+    // no-op it was intended to be and keep the player count normalized.
+    if (this->num_players <= 0) {
+        this->num_players = 0;
+        return 0;
+    }
+
+    // The game supports removal only from the end of this fixed-size player
+    // array.  Ignore a stale callback rather than indexing a different slot.
+    if (player_num != this->num_players - 1) {
+        return this->num_players;
+    }
 
     cut_scene_player *v3 = g_cut_scene_player();
     v3->stop(nullptr);
@@ -2014,8 +2034,16 @@ int get_hero_type_helper()
     return 0;
 }
 
+void world_dynamics_system_remove_player_patch()
+{
+    FUNC_ADDRESS(address, &world_dynamics_system::remove_player);
+    SET_JUMP(0x00558550, address);
+}
+
 void world_dynamics_system_patch()
 {
+    world_dynamics_system_remove_player_patch();
+
     REDIRECT(0x005584BD, zero_xz_velocity_for_effectively_standing_physical_interfaces);
 
     {
@@ -2105,4 +2133,35 @@ void world_dynamics_system_patch()
         REDIRECT(0x0047DB5F, address);
     }
 
+}
+
+bool wds_xbpack_patch()
+{
+#ifdef OPENUSM_XBPACK_V10
+    // V10 empty scene resources contain END=13, while PC uses END=18.
+    // FL_INT_A's audio resource is exactly four bytes. Without this check,
+    // native 0x0053CB50 advances past it and 0x00520600 rebases the following
+    // light entity as an audio rtree; traversal then crashes at 0x00521408.
+    // Validate both END consumers before changing either one. Accepting 13
+    // also makes repeated installation harmless.
+    const auto *entity_end = bit_cast<const uint8_t *>(0x0055AD64);
+    const auto *audio_end = bit_cast<const uint8_t *>(0x0053CBAF);
+    if (entity_end[0] != 0x83 || entity_end[1] != 0xF9
+        || (entity_end[2] != 18 && entity_end[2] != 13)
+        || entity_end[3] != 0x0F || entity_end[4] != 0x84
+        || audio_end[0] != 0x83 || audio_end[1] != 0x3F
+        || (audio_end[2] != 18 && audio_end[2] != 13)
+        || audio_end[3] != 0x74 || audio_end[4] != 0x34) {
+        sp_log("[xbpack] V10 scene END patch rejected: native comparison changed");
+        return false;
+    }
+
+    *bit_cast<uint8_t *>(0x0055AD66) = 13u;
+    *bit_cast<uint8_t *>(0x0053CBB1) = 13u;
+    *bit_cast<uint8_t *>(0x00558793) = 0x3Cu;
+
+    FUNC_ADDRESS(address, &world_dynamics_system::un_mash_scene_entities);
+    REDIRECT(0x0055B268, address);
+#endif
+    return true;
 }

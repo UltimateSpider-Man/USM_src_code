@@ -17,7 +17,6 @@
 #include "wds_script_manager.h"
 #include "wds_time_manager.h"
 #include "wds_token_manager.h"
-#include "resource_manager.h"
 
 #include <vector.hpp>
 
@@ -89,19 +88,8 @@ public:
     //0x005554D0
     world_dynamics_system();
 
-
-
-
     //0x00555750
     ~world_dynamics_system();
-
-entity* create_and_add_entity(
-    const string_hash& type_hash,
-    const string_hash& id_hash,
-    const vector3d& pos,
-    const po* orientation,
-    int flags);
-
 
     //0x00530460
     void malor_point(const vector3d &a2, int a3, bool a4);
@@ -163,27 +151,6 @@ entity* create_and_add_entity(
 
     int get_num_players() {
         return this->num_players;
-    }
-	
-	   void remove_player2(int player_num)
-    {
-resource_manager::set_active_district(false);
-    
-        void (__fastcall *func)(void *, void *, int) = bit_cast<decltype(func)>(0x00558550);
-
-        func(this, nullptr, player_num);
-    }
-
-
-    
-    int add_player2(const mString &a2)
-    {
-
-            resource_manager::set_active_district(true);
-
-        int (__fastcall *func)(void *, void *, const mString *) = bit_cast<decltype(func)>(0x0055B400);
-
-        return func(this, nullptr, &a2);
     }
 
     bool is_entity_in_water(vhandle_type<entity> a1);
@@ -280,4 +247,9 @@ extern void cleanup_actor_scene_anim_state_hash();
 
 extern world_dynamics_system *& g_world_ptr;
 
+extern bool wds_xbpack_patch();
 extern void world_dynamics_system_patch();
+
+// Install only the duplicate/invalid player-removal guard.  The complete WDS
+// patch set remains optional because it replaces several unrelated systems.
+extern void world_dynamics_system_remove_player_patch();

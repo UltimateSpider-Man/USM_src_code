@@ -190,3 +190,7 @@ struct mission_manager {
 extern void mission_manager_patch();
 
 extern void mission_manager_patch2();
+
+#ifdef OPENUSM_XBPACK_V10
+extern bool mission_manager_v10_patch();
+#endif

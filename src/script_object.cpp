@@ -7,6 +7,7 @@
 #include "parse_generic_mash.h"
 #include "script_executable.h"
 #include "script_executable_entry.h"
+#include "script_lib_debug_menu.h"
 #include "script_manager.h"
 #include "vm_executable.h"
 #include "vm_thread.h"
@@ -518,7 +519,14 @@ void script_object::un_mash(generic_mash_header *header, void *a3, void *a4, gen
         {
             rebase(a5->field_0, 4u);
 
-            this->funcs[i] = a5->get<vm_executable>();
+            this->funcs[i] = bit_cast<vm_executable *>(a5->field_0);
+#ifdef OPENUSM_XBPACK_V10
+            // Retail Xbox v10 serializes an additional 32-bit word after the
+            // common vm_executable fields (0x28 bytes rather than PC's 0x24).
+            a5->field_0 += sizeof(vm_executable) + sizeof(uint32_t);
+#else
+            a5->field_0 += sizeof(vm_executable);
+#endif
 
             assert(((int)header) % 4 == 0);
             this->funcs[i]->un_mash(header, this, this->funcs[i], a5);
@@ -535,7 +543,9 @@ void script_object::un_mash(generic_mash_header *header, void *a3, void *a4, gen
         THISCALL(0x005AB350, this, header, a3, a4, a5);
     }
 
+#ifndef OPENUSM_XBPACK_V10
     sp_log("flags = 0x%08X", this->flags);
+#endif
     //assert(this->debug_info == nullptr);
 }
 
@@ -886,6 +896,13 @@ script_instance::~script_instance()
 
     this->run_callbacks(static_cast<script_instance_callback_reason_t>(0), nullptr);
 
+#if defined(OPENUSM_XBPACK_MODE)
+    // Destruction callbacks can still reference entries created by this
+    // instance. Remove the persistent menu copies after callbacks return and
+    // before their VM threads are released.
+    invalidate_v14_script_debug_menu_entries(this);
+#endif
+
     while ( !this->threads.empty() )
     {
         auto *t = &(*this->threads.begin());
@@ -1133,6 +1150,11 @@ vm_thread *script_instance::add_thread(const vm_executable *a2)
 {
     TRACE("script_instance::add_thread");
 
+#ifdef OPENUSM_XBPACK_V10
+    vm_thread * (__fastcall *func)(void *, void *, const vm_executable *) =
+        CAST(func, 0x005AAC20);
+    return func(this, nullptr, a2);
+#else
     if constexpr (1)
     {
         auto *nt = new vm_thread {this, a2};
@@ -1151,6 +1173,7 @@ vm_thread *script_instance::add_thread(const vm_executable *a2)
         vm_thread * (__fastcall *func)(void *, void *edx, const vm_executable *a2) = CAST(func, 0x005AAC20);
         return func(this, nullptr, a2);
     }
+#endif
 }
 
 vm_thread *script_object::add_thread(script_instance *a2, int fidx)

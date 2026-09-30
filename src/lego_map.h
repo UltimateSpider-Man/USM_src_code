@@ -23,3 +23,7 @@ struct lego_map_root_node {
     //0x0054E5A0
     void un_mash(char *image, int *a3, region *reg);
 };
+
+#ifdef OPENUSM_XBPACK_V10
+bool lego_map_xbpack_v10_patch();
+#endif

@@ -9,6 +9,7 @@
 #include "utility.h"
 
 #include "movie_manager.h"
+#include "xbpack_v10_frontend_throb.h"
 
 VALIDATE_SIZE(main_menu_start_prelib, 0x130);
 
@@ -80,11 +81,17 @@ void main_menu_start_prelib::Update(Float a2)
                 this->field_128 = false;
             } else {
                 this->field_124 = 0.0f;
+                xbpack::v10_frontend_throb::stop();
                 movie_manager::load_and_play_movie("attract", "attract", true);
                 this->field_128 = true;
             }
         }
  
+        // Begin the asynchronous bank lookup while the Press Start panels
+        // open; play only once their looping pulse reaches visual state 7.
+        xbpack::v10_frontend_throb::update(
+            fe_state == 4 && !this->field_128, state == 7);
+
         // --- visual-state sequencer (each transition returns) ---
         if (state == 0 && fe_state == 3 && !group_is_active(this->field_C8)) {   // group[0]
             this->pq_bkg_grey_a05->TurnOn(false);
@@ -133,10 +140,14 @@ void main_menu_start_prelib::Update(Float a2)
         if (state == 6 && fe_state == 4 && !group_is_active(this->field_D4)) {   // group[3]
             rearm_anim_group(this->field_D8, 0, 1);                              // group[4], looping
             state = 7;
-            // FE_MM_Throb. PC fires fire-and-forget (id discarded), matching every
-            // other FE sound; PS2 stored the id at a1+0x12C to stop it later.
+#if defined(OPENUSM_XBPACK_MODE) && defined(OPENUSM_XBPACK_V10) && !defined(TARGET_XBOX)
+            // FE_MM_THROB from CITY_ARENA, with an owned voice and native
+            // WBK flags. Do not discard a looping voice's sound_instance_id.
+            xbpack::v10_frontend_throb::update(!this->field_128, true);
+#else
             string_hash throb_hash{"FE_PW_OUT"};
             [[maybe_unused]] sound_instance_id id = sub_60B960(throb_hash, 1.0, 1.0);
+#endif
             return;
         }
     }
@@ -177,11 +188,17 @@ void main_menu_start_prelib::Update_build(Float a2)
                 this->field_128 = false;
             } else {
                 this->field_124 = 0.0f;
+                xbpack::v10_frontend_throb::stop();
                 movie_manager::load_and_play_movie("attract", "attract", true);
                 this->field_128 = true;
             }
         }
  
+        // Begin the asynchronous bank lookup while the Press Start panels
+        // open; play only once their looping pulse reaches visual state 7.
+        xbpack::v10_frontend_throb::update(
+            fe_state == 4 && !this->field_128, state == 7);
+
         // --- visual-state sequencer (each transition returns) ---
         if (state == 0 && fe_state == 3 && !group_is_active(this->field_C8)) {   // group[0]
             this->pq_bkg_grey_a05->TurnOn(false);
@@ -230,10 +247,14 @@ void main_menu_start_prelib::Update_build(Float a2)
         if (state == 6 && fe_state == 4 && !group_is_active(this->field_D4)) {   // group[3]
             rearm_anim_group(this->field_D8, 0, 1);                              // group[4], looping
             state = 7;
-            // FE_MM_Throb. PC fires fire-and-forget (id discarded), matching every
-            // other FE sound; PS2 stored the id at a1+0x12C to stop it later.
+#if defined(OPENUSM_XBPACK_MODE) && defined(OPENUSM_XBPACK_V10) && !defined(TARGET_XBOX)
+            // FE_MM_THROB from CITY_ARENA, with an owned voice and native
+            // WBK flags. Do not discard a looping voice's sound_instance_id.
+            xbpack::v10_frontend_throb::update(!this->field_128, true);
+#else
             string_hash throb_hash{"FE_PW_OUT"};
             [[maybe_unused]] sound_instance_id id = sub_60B960(throb_hash, 1.0, 1.0);
+#endif
             return;
         }
     }

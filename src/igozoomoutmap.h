@@ -35,6 +35,17 @@ struct zoom_map_ui {
 
     //0x003D2194 (PS2) — ported below
     void UpdateSpideyLegend();
+
+    // PC prerelease object layout with the Xbox v10 free-roam legend data.
+    void UpdateXboxV10Legend();
+
+    // Per-frame stock visibility pass followed by the Xbox v10 fixed legend.
+    void UpdateXboxV10LegendVisibility(Float a2);
+
+    // Bound the native hit test to the v10 rows with supported PC filters.
+    // The removed taxi category remains an informational row.
+    int UpdateXboxV10MouseSelection();
+    int UpdateXboxV10MouseClick();
 	
 	void UpdateSpideyLegend_build();
 

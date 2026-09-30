@@ -26,6 +26,11 @@ struct sound_instance_id {
 
 [[nodiscard]] extern sound_instance_id sub_60B960(string_hash a2, Float a3, Float a4);
 
+// Native-only path for an owned/looping frontend voice. Unlike the WAV-mod
+// override, this returns a native ID that can be stopped on menu exit.
+[[nodiscard]] extern sound_instance_id sub_60B960_native(string_hash hash, Float volume, Float pitch);
+
+
 extern Var<sound_instance_slot *> s_sound_instance_slots;
 
 

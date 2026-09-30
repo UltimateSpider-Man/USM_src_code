@@ -8,6 +8,7 @@
 #include "debugutil.h"
 #include "func_wrapper.h"
 #include "game.h"
+#include "hero_type_lookup.h"
 #include "osassert.h"
 #include "pole_swing_inode.h"
 #include "spiderman_camera.h"
@@ -69,7 +70,7 @@ ai_player_controller::ai_player_controller(actor *a2)
         this->field_3FC = 0.0;
 
         this->field_400 = YVEC;
-        this->m_hero_type = this->find_hero_type();
+        this->m_hero_type = this->find_native_hero_type();
 
         this->unlock_controls(false);
 
@@ -129,29 +130,31 @@ void ai_player_controller::set_spidey_loco_mode(eHeroLocoMode a2)
 
 hero_type_enum ai_player_controller::find_hero_type() const
 {
-    if constexpr (0) {
-        auto *v2 = this->field_4[1]->get_ai_core();
-        if (v2 == nullptr ) {
-            return hero_type_enum::UNDEFINED;
-        }
-
-        static constexpr const char *str[] = {"SPIDEY", "VENOM", "PARKER"};
-
-        int i = 1;
-        for (auto s : str) {
-            resource_key v3 {string_hash {s}, RESOURCE_KEY_TYPE_AI_STATE_GRAPH};
-            if ( v2->find_machine(v3) != nullptr )
-            {
-                return static_cast<hero_type_enum>(i);
-            }
-
-            ++i;
-        }
-    
+    auto *controller = this->field_4[1];
+    if (controller == nullptr) {
         return hero_type_enum::UNDEFINED;
-    } else {
-        return (hero_type_enum) THISCALL(0x00449390, this);
     }
+
+    auto *ai_core = controller->get_ai_core();
+    if (ai_core == nullptr) {
+        return hero_type_enum::UNDEFINED;
+    }
+
+    return find_hero_type_from_graphs([ai_core](const char *name) {
+        const resource_key key{
+            string_hash{name},
+            RESOURCE_KEY_TYPE_AI_STATE_GRAPH
+        };
+        return ai_core->find_machine(key) != nullptr;
+    });
+}
+
+hero_type_enum ai_player_controller::find_native_hero_type() const
+{
+    // The original constructor stores this result at +0x420. Native mission
+    // scripts, map/token filters and movement read that field directly, so a
+    // new value of 4 must not escape into the retail gameplay code.
+    return native_hero_type(this->find_hero_type());
 }
 
 anchor_storage_class ai_player_controller::get_poleswing_anchor() const
@@ -415,4 +418,11 @@ void ai_player_controller_patch()
         FUNC_ADDRESS(address, &ai_player_controller::lock_controls);
         REDIRECT(0x00741839, address);
     }
+	
+	{
+        FUNC_ADDRESS(address, &ai_player_controller::find_native_hero_type);
+        REDIRECT(0x0047357E, address);
+    }
+	
+	
 }

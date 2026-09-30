@@ -1,7 +1,8 @@
-#include "igozoomoutmap.h"
+﻿#include "igozoomoutmap.h"
 
 #include "panelquad.h"
 #include "fe_menu_nav_bar.h"
+#include "femultilinetext.h"
 #include "mission_manager.h"
 
 #include "actor.h"
@@ -22,6 +23,7 @@
 #include "os_developer_options.h"
 
 #include "cut_scene_player.h"
+#include "cursor.h"
 
 #include "pausemenusystem.h"
 
@@ -32,7 +34,11 @@
 #include <utility.h>
 
 #include <cstdint>
+#include <cstring>
 #include <iterator>
+
+extern int debug_enabled;
+extern int debug_disabled;
 
 // ---------------------------------------------------------------------------
 // Helpers referenced by the two icon-setter ports (sub_621410 / sub_621860).
@@ -388,6 +394,677 @@ void zoom_map_ui::UpdateSpideyLegend()
 
         reinterpret_cast<void(__thiscall *)(uint32_t, float, float)>(VF(icon, 0x98))(icon, x, y);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Xbox v10 free-roam legend compatibility.
+//
+// The prerelease executable owns the later PC zoom_map_ui layout, but the v10
+// amalga supplies the earlier Xbox zoom_map.FDF.  The stock PC builders only
+// populate five Spider-Man rows (hero/mission/race/TAM/storm) and a still
+// smaller Venom subset.  The old panel and localization table instead define:
+//
+//   ALL ICONS, HERO, CITIZEN, ENEMY, ACTIONABLE, TAM, MINIGAME,
+//   MISSION, RACE, TAXI PICK-UP, TAXI DROP-OFF, JOHNNY STORM RACE
+//   ids 412..423 respectively.
+//
+// Keep the stock dispatcher for its PC-layout state initialization, then
+// replace only the free-roam presentation when the loaded panel has the Xbox
+// schema marker.  Normal PC/build targets never install this wrapper.
+// ---------------------------------------------------------------------------
+namespace {
+
+PanelQuad *find_legend_quad(PanelFile *panel, const char *name)
+{
+    if (panel == nullptr) {
+        return nullptr;
+    }
+
+    for (uint16_t i = 0; i < panel->pquads.size(); ++i) {
+        auto *quad = panel->pquads.m_data[i];
+        if (quad != nullptr && std::strcmp(quad->field_3C.c_str(), name) == 0) {
+            return quad;
+        }
+    }
+
+    return nullptr;
+}
+
+bool legend_text_name_equals(FEText *text, const char *name)
+{
+    if (text == nullptr) {
+        return false;
+    }
+
+    // FEText subclasses override GetName, so use the same return-by-value ABI
+    // as PanelFile::GetTextPointer instead of reading FEText::field_50.  The
+    // third argument is the hidden return slot: GetName constructs the
+    // mString there, so it must not already contain a live mString.
+    struct text_vtbl {
+        uintptr_t functions[44];
+        mString *(__fastcall *GetName)(void *, int, mString *);
+    };
+
+    auto *vtbl = reinterpret_cast<text_vtbl *>(text->m_vtbl);
+    if (vtbl == nullptr || vtbl->GetName == nullptr) {
+        return false;
+    }
+
+    alignas(mString) unsigned char object_name_storage[sizeof(mString)];
+    auto *object_name = reinterpret_cast<mString *>(object_name_storage);
+    auto *result = vtbl->GetName(text, 0, object_name);
+    if (result == nullptr) {
+        return false;
+    }
+
+    const bool matches = std::strcmp(result->c_str(), name) == 0;
+    result->~mString();
+    return matches;
+}
+
+FEText *find_legend_text(PanelFile *panel, const char *name)
+{
+    if (panel == nullptr) {
+        return nullptr;
+    }
+
+    for (uint16_t i = 0; i < panel->ptext.size(); ++i) {
+        auto *text = panel->ptext.m_data[i];
+        if (legend_text_name_equals(text, name)) {
+            return text;
+        }
+    }
+
+    return nullptr;
+}
+
+struct xbox_v10_legend_view {
+    PanelFile *panel = nullptr;
+    bool valid = false;
+    PanelQuad *icons[10]{};
+    FEText *lines[11]{};
+    FEText *alternate_lines[4]{};
+};
+
+xbox_v10_legend_view find_xbox_v10_legend(zoom_map_ui *owner)
+{
+    xbox_v10_legend_view legend{};
+    auto *self = reinterpret_cast<char *>(owner);
+    auto DW = [self](int i) -> uint32_t & {
+        return *reinterpret_cast<uint32_t *>(self + 4 * i);
+    };
+    legend.panel = reinterpret_cast<PanelFile *>(DW(3));
+
+    // This object exists in the Xbox v10 panel but not in the PC-final schema.
+    if (find_legend_quad(legend.panel, "zm_icon_0500_actionable") == nullptr) {
+        return legend;
+    }
+
+    static const char *const icon_names[] = {
+        "zm_icon_0500_hero",
+        "zm_icon_0500_citizen",
+        "zm_icon_0500_enemy",
+        "zm_icon_0500_actionable",
+        "zm_icon_0500_TAM",
+        "zm_icon_0500_minigame",
+        "zm_icon_0500_mission_start",
+        "zm_icon_0500_race_start",
+        "zm_icon_0500_taxi_start",
+        "zm_icon_0500_storm_start",
+    };
+    static const char *const line_names[] = {
+        "zm_legend_text_line_01",
+        "zm_legend_text_line_02",
+        "zm_legend_text_line_03",
+        "zm_legend_text_line_04",
+        "zm_legend_text_line_05",
+        "zm_legend_text_line_06",
+        "zm_legend_text_line_07",
+        "zm_legend_text_line_08",
+        "zm_legend_text_line_09",
+        "zm_legend_text_line_10",
+        "zm_legend_text_line_11",
+    };
+
+    for (int i = 0; i < 10; ++i) {
+        legend.icons[i] = find_legend_quad(legend.panel, icon_names[i]);
+        if (legend.icons[i] == nullptr) {
+            return legend;
+        }
+    }
+    for (int i = 0; i < 11; ++i) {
+        legend.lines[i] = find_legend_text(legend.panel, line_names[i]);
+        if (legend.lines[i] == nullptr) {
+            return legend;
+        }
+    }
+
+    static const char *const alternate_names[] = {
+        "zm_legend_text_line_08b",
+        "zm_legend_text_line_09b",
+        "zm_legend_text_line_10b",
+        "zm_legend_text_line_11b",
+    };
+    for (int i = 0; i < 4; ++i) {
+        legend.alternate_lines[i] =
+            find_legend_text(legend.panel, alternate_names[i]);
+        if (legend.alternate_lines[i] == nullptr) {
+            return legend;
+        }
+    }
+
+    legend.valid = true;
+    return legend;
+}
+
+struct xbox_v10_legend_snapshot {
+    zoom_map_ui *owner = nullptr;
+    PanelFile *panel = nullptr;
+    bool valid = false;
+    PanelQuad *icons[10]{};
+    FEText *lines[11]{};
+    FEText *alternate_lines[4]{};
+    vector2d icon_positions[10]{};
+    float icon_scale[10]{};
+    vector2d line_positions[11]{};
+    vector2d alternate_line_positions[4]{};
+    uint32_t native_lines[10]{};
+    uint32_t native_icons[9]{};
+    uint32_t native_flags[10]{};
+    uint32_t native_count = 0;
+    hero_type_enum hero = UNDEFINED;
+    bool bound = false;
+};
+
+xbox_v10_legend_snapshot &xbox_v10_snapshot()
+{
+    // Only one zoom-map UI can be active. The snapshot is refreshed at the
+    // dispatcher hook and every pointer is revalidated before it is reused.
+    static xbox_v10_legend_snapshot snapshot{};
+    return snapshot;
+}
+
+void move_legend_icon(PanelQuad *icon, float x, float y)
+{
+    if (icon == nullptr) {
+        return;
+    }
+
+    auto vfunc = [](PanelQuad *object, int offset) -> uintptr_t {
+        return *reinterpret_cast<uintptr_t *>(
+            static_cast<uintptr_t>(object->m_vtbl) + offset);
+    };
+
+    reinterpret_cast<void(__thiscall *)(PanelQuad *, float, float)>(
+        vfunc(icon, 0x98))(icon, x, y);
+}
+
+void set_legend_icon_scale(PanelQuad *icon, float scale)
+{
+    if (icon == nullptr) {
+        return;
+    }
+
+    const auto vtbl = static_cast<uintptr_t>(icon->m_vtbl);
+    const auto function = *reinterpret_cast<uintptr_t *>(vtbl + 0x6Cu);
+    reinterpret_cast<void(__thiscall *)(PanelQuad *, float, int)>(function)(
+        icon, scale, 1);
+}
+
+void capture_xbox_v10_legend(zoom_map_ui *owner,
+                             const xbox_v10_legend_view &legend)
+{
+    auto &snapshot = xbox_v10_snapshot();
+    snapshot = {};
+    if (!legend.valid) {
+        return;
+    }
+
+    snapshot.owner = owner;
+    snapshot.panel = legend.panel;
+    for (int i = 0; i < 10; ++i) {
+        snapshot.icons[i] = legend.icons[i];
+        snapshot.icon_positions[i] = legend.icons[i]->field_14;
+        snapshot.icon_scale[i] = legend.icons[i]->field_38;
+    }
+    for (int i = 0; i < 11; ++i) {
+        snapshot.lines[i] = legend.lines[i];
+        snapshot.line_positions[i] = legend.lines[i]->field_34;
+    }
+    for (int i = 0; i < 4; ++i) {
+        snapshot.alternate_lines[i] = legend.alternate_lines[i];
+        snapshot.alternate_line_positions[i] =
+            legend.alternate_lines[i]->field_34;
+    }
+    snapshot.valid = true;
+}
+
+bool snapshot_matches(zoom_map_ui *owner,
+                      const xbox_v10_legend_view &legend)
+{
+    const auto &snapshot = xbox_v10_snapshot();
+    if (!snapshot.valid || snapshot.owner != owner ||
+        snapshot.panel != legend.panel) {
+        return false;
+    }
+    for (int i = 0; i < 10; ++i) {
+        if (snapshot.icons[i] != legend.icons[i]) {
+            return false;
+        }
+    }
+    for (int i = 0; i < 11; ++i) {
+        if (snapshot.lines[i] != legend.lines[i]) {
+            return false;
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (snapshot.alternate_lines[i] != legend.alternate_lines[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void restore_xbox_v10_native_slots(zoom_map_ui *owner,
+                                   const xbox_v10_legend_view &legend)
+{
+    auto &snapshot = xbox_v10_snapshot();
+    if (!snapshot.bound || !snapshot_matches(owner, legend)) {
+        return;
+    }
+
+    auto *self = reinterpret_cast<uint32_t *>(owner);
+    for (int row = 0; row < 10; ++row) {
+        self[99 + row] = snapshot.native_lines[row];
+        self[124 + row] = snapshot.native_flags[row];
+    }
+    for (int row = 0; row < 9; ++row) {
+        self[110 + row] = snapshot.native_icons[row];
+    }
+    self[120] = snapshot.native_count;
+    snapshot.bound = false;
+}
+
+void bind_xbox_v10_native_slots(zoom_map_ui *owner,
+                                const xbox_v10_legend_view &legend,
+                                hero_type_enum hero)
+{
+    auto &snapshot = xbox_v10_snapshot();
+    auto *self = reinterpret_cast<uint32_t *>(owner);
+    auto *bytes = reinterpret_cast<uint8_t *>(owner);
+    for (int row = 0; row < 10; ++row) {
+        snapshot.native_lines[row] = self[99 + row];
+        snapshot.native_flags[row] = self[124 + row];
+    }
+    for (int row = 0; row < 9; ++row) {
+        snapshot.native_icons[row] = self[110 + row];
+    }
+    snapshot.native_count = self[120];
+    snapshot.hero = hero;
+
+    // The PC object has ten selector slots. Its byte flags at +0x1E4..1ED
+    // are ALL, HERO, CITIZEN, ENEMY, MISSION, RACE, STORM, ACTIONABLE,
+    // MINIGAME and TAM. TAXI has no PC filter and stays informational.
+    struct row_binding { int line; int flag; };
+    static constexpr row_binding spidey[] = {
+        {0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 7},
+        {5, 9}, {6, 8}, {7, 4}, {8, 5}, {10, 6},
+    };
+    static constexpr row_binding venom[] = {
+        {0, 0}, {1, 1}, {3, 3}, {6, 8}, {8, 5},
+    };
+    static_assert(std::size(spidey) == 10 && std::size(venom) <= 10);
+    const auto *rows = hero == VENOM ? venom : spidey;
+    const uint32_t count = hero == VENOM ? std::size(venom) : std::size(spidey);
+    for (uint32_t row = 0; row < count; ++row) {
+        self[99 + row] = reinterpret_cast<uint32_t>(legend.lines[rows[row].line]);
+        self[124 + row] = reinterpret_cast<uint32_t>(bytes + 0x1E4 + rows[row].flag);
+        if (row != 0) {
+            self[109 + row] = reinterpret_cast<uint32_t>(legend.icons[rows[row].line - 1]);
+        }
+    }
+    self[119] = 0;
+    self[120] = count;
+    snapshot.bound = true;
+}
+
+bool restore_xbox_v10_legend(zoom_map_ui *owner,
+                             const xbox_v10_legend_view &legend)
+{
+    if (!legend.valid || !snapshot_matches(owner, legend)) {
+        return false;
+    }
+
+    const auto &snapshot = xbox_v10_snapshot();
+    for (int i = 0; i < 10; ++i) {
+        move_legend_icon(legend.icons[i], snapshot.icon_positions[i][0],
+                         snapshot.icon_positions[i][1]);
+        set_legend_icon_scale(legend.icons[i], snapshot.icon_scale[i]);
+    }
+    for (int i = 0; i < 11; ++i) {
+        legend.lines[i]->field_34 = snapshot.line_positions[i];
+    }
+    for (int i = 0; i < 4; ++i) {
+        legend.alternate_lines[i]->field_34 =
+            snapshot.alternate_line_positions[i];
+    }
+    return true;
+}
+
+void hide_xbox_v10_fixed_legend(const xbox_v10_legend_view &legend)
+{
+    if (!legend.valid) {
+        return;
+    }
+    for (auto *icon : legend.icons) {
+        icon->TurnOn(false);
+    }
+    for (auto *line : legend.lines) {
+        line->SetShown(false);
+    }
+    for (auto *line : legend.alternate_lines) {
+        line->SetShown(false);
+    }
+}
+
+void hide_native_dynamic_legend(zoom_map_ui *owner)
+{
+    auto *self = reinterpret_cast<char *>(owner);
+    auto DW = [self](int i) -> uint32_t & {
+        return *reinterpret_cast<uint32_t *>(self + 4 * i);
+    };
+
+    // Stock storage has ten text rows and nine category-icon entries. Keep
+    // its count and selection state intact; only suppress its drawn objects.
+    const uint32_t count = DW(120) < 10u ? DW(120) : 10u;
+    for (uint32_t row = 1; row < count; ++row) {
+        auto *icon = reinterpret_cast<PanelQuad *>(DW(109 + row));
+        if (icon != nullptr) {
+            icon->TurnOn(false);
+        }
+    }
+    for (uint32_t row = 0; row < count; ++row) {
+        auto *line = reinterpret_cast<FEText *>(DW(99 + row));
+        if (line != nullptr) {
+            line->SetShown(false);
+        }
+    }
+}
+
+hero_type_enum xbox_v10_live_hero_type(zoom_map_ui *owner)
+{
+    if (g_world_ptr != nullptr) {
+        if (auto *hero = g_world_ptr->get_hero_ptr(0)) {
+            if (auto *controller = static_cast<actor *>(hero)->m_player_controller) {
+                return controller->m_hero_type;
+            }
+        }
+    }
+
+    // The controller can be absent while the map is being created. Preserve
+    // the native dispatcher's cached value only as a startup fallback.
+    const auto *self = reinterpret_cast<const uint32_t *>(owner);
+    return static_cast<hero_type_enum>(self[2]);
+}
+
+void style_xbox_v10_legend_row(zoom_map_ui *owner, FEText *line, PanelQuad *icon)
+{
+    const auto *self = reinterpret_cast<const uint32_t *>(owner);
+    bool selected = false;
+    bool enabled = true;
+    for (uint32_t row = 0; row < self[120] && row < 10; ++row) {
+        if (self[99 + row] == reinterpret_cast<uint32_t>(line)) {
+            selected = self[119] == row;
+            enabled = *reinterpret_cast<const uint8_t *>(self[124 + row]) != 0;
+            break;
+        }
+    }
+    line->SetNoFlash(color32{selected ? 0xFFE6D03Fu : 0xFFE6823Fu});
+    line->field_4 = enabled ? 1.0f : 0.6f;
+    const float scale = selected ? 1.0f : 0.8f;
+    line->SetScale(scale, scale);
+    if (icon != nullptr) {
+        set_legend_icon_scale(icon, selected ? 1.0f : 0.75f);
+        const auto function = *reinterpret_cast<uintptr_t *>(
+            static_cast<uintptr_t>(icon->m_vtbl) + 0x84u);
+        reinterpret_cast<void(__thiscall *)(PanelQuad *, float)>(function)(
+            icon, enabled ? 1.0f : 0.6f);
+    }
+}
+
+void set_xbox_v10_taxi_text(FEText *line)
+{
+    // Xbox global text 421 has no one-to-one PC-final enum. The v10 localizer
+    // converter deliberately leaves that removed PC slot empty, so use the
+    // exact Xbox English label instead of resolving raw Xbox id 421 as a PC id.
+    // These authored legend rows are FEMultiLineText objects. Assigning only
+    // FEText::field_1C leaves their rendered lines[] empty, while the by-value
+    // SetTextNoLocalize ABI would consume a shallow mString copy. The stock
+    // raw-character allocator owns neither caller storage nor a by-value
+    // mString and rebuilds both the base text and multiline draw state.
+    static_cast<FEMultiLineText *>(line)->SetTextAllocNoLocalize(
+        "TAXI PICK-UP", 0);
+}
+
+void show_xbox_v10_free_roam_legend(zoom_map_ui *owner,
+                                    const xbox_v10_legend_view &legend,
+                                    bool shown)
+{
+    hide_xbox_v10_fixed_legend(legend);
+    if (!shown || !restore_xbox_v10_legend(owner, legend)) {
+        return;
+    }
+
+    // localized_string_table converts the 446-entry Xbox table to the later
+    // PC enum layout. These are PC indices whose converter sources are Xbox
+    // strings 412..420 and 423; using the raw Xbox numbers here produced the
+    // unrelated AMAZING/SPECTACULAR difficulty strings seen at runtime.
+    legend.lines[0]->SetText(static_cast<global_text_enum>(426)); // ALL ICONS
+    style_xbox_v10_legend_row(owner, legend.lines[0], nullptr);
+    legend.lines[0]->SetShown(true);
+
+    static const int spidey_pc_text_ids[] = {
+        427, 429, 430, 431, 432, 433, 434, 435, -1, 436,
+    };
+    if (xbox_v10_live_hero_type(owner) != VENOM) {
+        for (int row = 0; row < 10; ++row) {
+            legend.icons[row]->TurnOn(true);
+            if (spidey_pc_text_ids[row] >= 0) {
+                legend.lines[row + 1]->SetText(
+                    static_cast<global_text_enum>(spidey_pc_text_ids[row]));
+            } else {
+                set_xbox_v10_taxi_text(legend.lines[row + 1]);
+            }
+            // Match the old V10 initializer for every category row. In the
+            // PC object graph the Xbox-only final row otherwise retains a
+            // transparent color and JOHNNY STORM RACE never draws.
+            style_xbox_v10_legend_row(owner, legend.lines[row + 1], legend.icons[row]);
+            legend.lines[row + 1]->SetShown(true);
+        }
+        return;
+    }
+
+    // Exact old Venom order: Hero, Enemy, Minigame, Race. The source objects
+    // are moved onto the first four authored category rows.
+    static const int venom_icon_indices[] = {0, 2, 5, 7};
+    static const int venom_line_indices[] = {1, 3, 6, 8};
+    static const int venom_pc_text_ids[] = {427, 430, 433, 435};
+    const auto &snapshot = xbox_v10_snapshot();
+    for (int row = 0; row < 4; ++row) {
+        auto *icon = legend.icons[venom_icon_indices[row]];
+        move_legend_icon(icon, snapshot.icon_positions[row][0],
+                         snapshot.icon_positions[row][1]);
+        icon->TurnOn(true);
+
+        auto *line = legend.lines[venom_line_indices[row]];
+        line->field_34 = snapshot.line_positions[row + 1];
+        line->SetText(static_cast<global_text_enum>(venom_pc_text_ids[row]));
+        style_xbox_v10_legend_row(owner, line, icon);
+        line->SetShown(true);
+    }
+
+    // The old routine moves every alternate object sharing these compacted
+    // rows even though only the primary RACE line is drawn in free roam.
+    legend.alternate_lines[0]->field_34 = snapshot.line_positions[4]; // 08b
+    legend.alternate_lines[1]->field_34 = snapshot.line_positions[4]; // 09b
+}
+
+} // namespace
+
+void zoom_map_ui::UpdateXboxV10Legend()
+{
+    auto *self = reinterpret_cast<char *>(this);
+
+    auto legend = find_xbox_v10_legend(this);
+    if (legend.valid) {
+        restore_xbox_v10_native_slots(this, legend);
+        // Restore the previous capture before refreshing it. This prevents a
+        // Venom-compacted reopen from becoming the next "original" layout.
+        restore_xbox_v10_legend(this, legend);
+        capture_xbox_v10_legend(this, legend);
+        hide_xbox_v10_fixed_legend(legend);
+    }
+
+    // Rebuild native mission state using its original pointer arrays.
+    THISCALL(0x0062CC00, this);
+
+    if (!legend.valid) {
+        return;
+    }
+    auto *mm = mission_manager::s_inst;
+    if (mm != nullptr && mm->is_mission_active()) {
+        return;
+    }
+
+    hide_native_dynamic_legend(this);
+    bind_xbox_v10_native_slots(this, legend, xbox_v10_live_hero_type(this));
+    show_xbox_v10_free_roam_legend(this, legend, self[0x230] != 0);
+}
+
+void zoom_map_ui::UpdateXboxV10LegendVisibility(Float a2)
+{
+    auto legend = find_xbox_v10_legend(this);
+    auto *mm = mission_manager::s_inst;
+    const bool mission_active = mm != nullptr && mm->is_mission_active();
+    const auto &snapshot = xbox_v10_snapshot();
+    if (legend.valid && (!snapshot_matches(this, legend) ||
+        snapshot.bound == mission_active ||
+        (snapshot.bound && snapshot.hero != xbox_v10_live_hero_type(this)))) {
+        // A character or mission can change while the same panel remains
+        // loaded. Rebuild from the saved PC arrays before binding a new view.
+        UpdateXboxV10Legend();
+    }
+    if (legend.valid) {
+        restore_xbox_v10_legend(this, legend);
+        hide_xbox_v10_fixed_legend(legend);
+    }
+
+    // The original pass owns page visibility and all input selection state.
+    THISCALL(0x00612510, this, a2);
+
+    if (!legend.valid) {
+        return;
+    }
+    if (mission_active) {
+        return;
+    }
+
+    hide_native_dynamic_legend(this);
+    const auto *self = reinterpret_cast<const char *>(this);
+    show_xbox_v10_free_roam_legend(this, legend, self[0x230] != 0);
+}
+
+int zoom_map_ui::UpdateXboxV10MouseSelection()
+{
+    auto legend = find_xbox_v10_legend(this);
+    auto *mm = mission_manager::s_inst;
+    if (!legend.valid || (mm != nullptr && mm->is_mission_active())) {
+        return THISCALL(0x006222A0, this);
+    }
+
+    // The debug menu can be displayed while the zoom-map controller remains
+    // active in the background. Never let its hidden hover pass consume mouse
+    // input or mutate the map selection.
+    if (debug_enabled || debug_disabled) {
+        return -1;
+    }
+
+    auto *self = reinterpret_cast<uint32_t *>(this);
+    uint32_t &selected = self[119]; // +0x1DC
+    const uint32_t native_count = self[120]; // +0x1E0
+    if (!snapshot_matches(this, legend) || !xbox_v10_snapshot().bound ||
+        reinterpret_cast<const uint8_t *>(this)[0x230] == 0 ||
+        g_cursor() == nullptr) {
+        return -1;
+    }
+    if (native_count == 0 || native_count > 10) {
+        selected = 0;
+        return -1;
+    }
+    if (selected >= native_count) {
+        selected = 0;
+    }
+
+    // The stock hover routine always probes ten entries, even for Venom.
+    // Use its text hit test with the actual bound count, then its existing
+    // navigation routine for highlight animation and selection styling.
+    const int hovered = THISCALL(0x00581DB0, g_cursor(), self + 99,
+                                 native_count, 200, 0, 50);
+    if (hovered < 0 || static_cast<uint32_t>(hovered) >= native_count ||
+        static_cast<uint32_t>(hovered) == selected) {
+        return -1;
+    }
+    const bool down = static_cast<uint32_t>(hovered) > selected;
+    selected = down ? hovered - 1 : hovered + 1;
+    // A mouse target is immediate; a keyboard repeat delay must not suppress
+    // the native step after we position selection beside that target.
+    self[0x238 / sizeof(uint32_t)] = 0;
+    // THISCALL is variadic: plain floats would become doubles, corrupting
+    // the stack when the native routine returns after popping eight bytes.
+    THISCALL(0x00621A80, this, Float{down ? 1.0f : -1.0f}, Float{10.0f});
+    return hovered;
+}
+
+int zoom_map_ui::UpdateXboxV10MouseClick()
+{
+    auto legend = find_xbox_v10_legend(this);
+    auto *mm = mission_manager::s_inst;
+    if (!legend.valid || (mm != nullptr && mm->is_mission_active())) {
+        return THISCALL(0x00612820, this);
+    }
+
+    auto *self = reinterpret_cast<uint32_t *>(this);
+    const uint32_t count = self[120];
+    if (debug_enabled || debug_disabled || !snapshot_matches(this, legend) ||
+        !xbox_v10_snapshot().bound ||
+        reinterpret_cast<const uint8_t *>(this)[0x230] == 0 ||
+        g_cursor() == nullptr || count == 0 || count > 10) {
+        return -1;
+    }
+
+    // Native 0x612820 probes ten slots even for Venom, then toggles the old
+    // selection regardless of the hit row. Match the visible bound rows and
+    // select the actual click before invoking the native filter rules.
+    const int clicked = THISCALL(0x00581DB0, g_cursor(), self + 99,
+                                 count, 200, 0, 50);
+    if (clicked < 0 || static_cast<uint32_t>(clicked) >= count) {
+        return -1;
+    }
+    uint32_t &selected = self[119];
+    if (selected >= count) {
+        selected = 0;
+    }
+    if (static_cast<uint32_t>(clicked) != selected) {
+        const bool down = static_cast<uint32_t>(clicked) > selected;
+        selected = down ? clicked - 1 : clicked + 1;
+        self[0x238 / sizeof(uint32_t)] = 0;
+        THISCALL(0x00621A80, this, Float{down ? 1.0f : -1.0f}, Float{10.0f});
+    }
+    THISCALL(0x006125E0, this);
+
+    // The caller toggles again for any other return value. Keep the native
+    // sentinel so each click toggles exactly once, including ALL ICONS.
+    return -1;
 }
 
 // The build variant shares the retail layout and addresses, so it delegates to
@@ -921,40 +1598,51 @@ void IGOZoomOutMap::OnSelectPress() {
 	
 }
 
+namespace {
+
+// The redirected PC call sites pass the receiver in ECX.  Keep the null check
+// in a free-function boundary: GCC is allowed to assume that `this` is never
+// null inside a C++ member function and removed the previous source-level
+// check at -Os.  Stock 0x00638570 immediately reads self+0x5C6.
+__attribute__((noinline, used))
+void __fastcall IGOZoomOutMapOnSelectPressSafe(IGOZoomOutMap *self, void *)
+{
+    if (self != nullptr) {
+        self->OnSelectPress();
+    }
+}
+
+} // namespace
+
 
 void IGOZoomOutMap_patch() {
+    // The PC prerelease already has the complete zoom implementation and its
+    // hero dispatcher: Spider-Man uses 0x00621410 and Venom uses 0x00621860.
+    // Keep that object layout, but translate the old Xbox v10 free-roam legend
+    // after the native dispatcher has initialized its PC-only state.
+#ifdef OPENUSM_XBPACK_V10
     {
-        FUNC_ADDRESS(address, &IGOZoomOutMap::SetZoomLevel);
-        SET_JUMP(0x00619550, address);
-    }
-	
-	{
-        FUNC_ADDRESS(address, &IGOZoomOutMap::OnSelectPress);
-       REDIRECT(0x00638714, address);
-		REDIRECT(0x00638A29, address);
-		REDIRECT(0x00638B39, address);
-    }
-    {
-        FUNC_ADDRESS(address, &zoom_map_ui::Init);
-        REDIRECT(0x00648A81, address);
-    }
-    {
-        // 0x006363A9 is the only call site of the dispatcher 0x0062CC00.
-        // The old hook at 0x0062CC74 was the internal `call sub_621410`, i.e.
-        // the Spider-Man branch only.
-        FUNC_ADDRESS(address, &zoom_map_ui::UpdateSpideyLegend);
+        FUNC_ADDRESS(address, &zoom_map_ui::UpdateXboxV10Legend);
         REDIRECT(0x006363A9, address);
     }
-
-	{
-        FUNC_ADDRESS(address, &zoom_map_ui::sub_621410);
-        SET_JUMP(0x00621410, address);
+    {
+        FUNC_ADDRESS(address, &zoom_map_ui::UpdateXboxV10LegendVisibility);
+        REDIRECT(0x00632050, address);
+    }
+    {
+        FUNC_ADDRESS(address, &zoom_map_ui::UpdateXboxV10MouseSelection);
+        REDIRECT(0x00638BC3, address);
+    }
+    {
+        FUNC_ADDRESS(address, &zoom_map_ui::UpdateXboxV10MouseClick);
+        REDIRECT(0x00638B55, address);
     }
 	{
-        FUNC_ADDRESS(address, &zoom_map_ui::sub_621860);
-        SET_JUMP(0x00621860, address);
+        REDIRECT(0x00638714, IGOZoomOutMapOnSelectPressSafe);
+		REDIRECT(0x00638A29, IGOZoomOutMapOnSelectPressSafe);
+		REDIRECT(0x00638B39, IGOZoomOutMapOnSelectPressSafe);
     }
-	
+#endif
 }
 
 
@@ -965,10 +1653,9 @@ void IGOZoomOutMap_beta_patch() {
     }
 	
 	{
-        FUNC_ADDRESS(address, &IGOZoomOutMap::OnSelectPress);
-       REDIRECT(0x00638714, address);
-		REDIRECT(0x00638A29, address);
-		REDIRECT(0x00638B39, address);
+        REDIRECT(0x00638714, IGOZoomOutMapOnSelectPressSafe);
+		REDIRECT(0x00638A29, IGOZoomOutMapOnSelectPressSafe);
+		REDIRECT(0x00638B39, IGOZoomOutMapOnSelectPressSafe);
     }
     {
         FUNC_ADDRESS(address, &zoom_map_ui::Init_beta);
@@ -998,10 +1685,9 @@ void IGOZoomOutMap_build_patch() {
     }
 	
 	{
-        FUNC_ADDRESS(address, &IGOZoomOutMap::OnSelectPress);
-       REDIRECT(0x00638714, address);
-		REDIRECT(0x00638A29, address);
-		REDIRECT(0x00638B39, address);
+        REDIRECT(0x00638714, IGOZoomOutMapOnSelectPressSafe);
+		REDIRECT(0x00638A29, IGOZoomOutMapOnSelectPressSafe);
+		REDIRECT(0x00638B39, IGOZoomOutMapOnSelectPressSafe);
     }
     {
         FUNC_ADDRESS(address, &zoom_map_ui::Init_build);
@@ -1019,6 +1705,12 @@ void IGOZoomOutMap_build_patch() {
 	{
         FUNC_ADDRESS(address, &zoom_map_ui::sub_621860);
         SET_JUMP(0x00621860, address);
+    }
+
+	{
+        REDIRECT(0x00638714, IGOZoomOutMapOnSelectPressSafe);
+		REDIRECT(0x00638A29, IGOZoomOutMapOnSelectPressSafe);
+		REDIRECT(0x00638B39, IGOZoomOutMapOnSelectPressSafe);
     }
 	
 }

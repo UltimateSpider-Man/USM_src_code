@@ -24,6 +24,7 @@
 #include "memoryunitmanager.h"
 
 #include "sound_manager.h"
+#include "xbpack_v10_frontend_throb.h"
 
 #include "game.h"
 
@@ -128,6 +129,9 @@ void FrontEndMenuSystem::sub_619030(bool a2) {
 }
 
 void FrontEndMenuSystem::MakeActive(int a2) {
+    // Stop before OnDeactivate or a new menu can unload its audio banks.
+    if (a2 != 1)
+        xbpack::v10_frontend_throb::stop();
     auto idx = this->m_index;
     this->field_34 = idx;
     if (idx != -1) {
@@ -212,7 +216,12 @@ void FrontEndMenuSystem::GoNextState_beta() {
         case 6: {
             switch (this->field_4[this->m_index][5].field_28) {
             case 0: {
-                g_game_ptr->gamefile->load_most_recent_game();													
+				auto *gamefile = g_game_ptr->gamefile;
+				game_settings_request_continue_hero_override();
+				gamefile->load_most_recent_game();
+				if (!gamefile->field_4C2) {
+					game_settings_cancel_continue_hero_override();
+				}
                 this->BringUpDialogBox(10, fe_state{10}, fe_state{10});
                 goto LABEL_27;
             }
@@ -320,8 +329,12 @@ void FrontEndMenuSystem::GoNextState_beta() {
         case 4:
             if (this->m_index != 1) {
                 this->MakeActive(true);
-				     static string_hash sfx_id_hash{"FE_MM_THROB"};
-				        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
+#if !defined(OPENUSM_XBPACK_MODE) || !defined(OPENUSM_XBPACK_V10) || defined(TARGET_XBOX)
+                     static string_hash sfx_id_hash{"FE_MM_THROB"};
+                     [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
+#endif
+                     // V10 starts its one owned throb at pulse state 7,
+                     // including the normal path where m_index is already 1.
             }
 															   
 
@@ -333,6 +346,11 @@ void FrontEndMenuSystem::GoNextState_beta() {
             this->MakeActive(2);
 			                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
                 sounds_paused2() = true;
+				
+				#if !defined(OPENUSM_XBPACK_MODE) || !defined(OPENUSM_XBPACK_V10) || defined(TARGET_XBOX)
+							                sound_manager::fade_sounds_by_type(127u, 0.0, 0.13333334, 1);
+                sounds_paused2() = true;
+				#endif
             break;
         }
         case 6:
@@ -349,8 +367,7 @@ void FrontEndMenuSystem::GoNextState_beta() {
             break;
         case 10: {
             if (this->m_index != 5) {
-                mission_manager::s_inst->blackscreen_off(1.0);
-				g_game_ptr->freeze_hero(true);
+                mission_manager::s_inst->blackscreen_off(0.0);
             }
 
             this->sub_60C290();
@@ -393,7 +410,12 @@ void FrontEndMenuSystem::GoNextState_build() {
         case 6: {
             switch (this->field_4[this->m_index][5].field_28) {
             case 0: {
-                g_game_ptr->gamefile->load_most_recent_game();													
+				auto *gamefile = g_game_ptr->gamefile;
+				game_settings_request_continue_hero_override();
+				gamefile->load_most_recent_game();
+				if (!gamefile->field_4C2) {
+					game_settings_cancel_continue_hero_override();
+				}
                 this->BringUpDialogBox(10, fe_state{10}, fe_state{10});
                 goto LABEL_27;
             }
@@ -484,8 +506,8 @@ void FrontEndMenuSystem::GoNextState_build() {
 										movie_manager::load_and_play_movie("ATVI spin logo 640 none", nullptr, false);
                                         movie_manager::load_and_play_movie("beenox_short", nullptr, false);
 										
-				     static string_hash sfx_id_hash{"FE_MUSIC_MAINMENU"};
-				        [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
+				     //static string_hash sfx_id_hash{"FE_MUSIC_MAINMENU"};
+				    //    [[maybe_unused]] sound_instance_id id = sub_60B960(sfx_id_hash, 1.0, 1.0);
                 if (this->field_30 != 10) {
                     continue;
 				//	Sleep(10000);
@@ -570,7 +592,12 @@ void FrontEndMenuSystem::GoNextState() {
         case 6: {
             switch (this->field_4[this->m_index][5].field_28) {
             case 0: {
-                g_game_ptr->gamefile->load_most_recent_game();													
+				auto *gamefile = g_game_ptr->gamefile;
+				game_settings_request_continue_hero_override();
+				gamefile->load_most_recent_game();
+				if (!gamefile->field_4C2) {
+					game_settings_cancel_continue_hero_override();
+				}
                 this->BringUpDialogBox(10, fe_state{10}, fe_state{10});
                 goto LABEL_27;
             }

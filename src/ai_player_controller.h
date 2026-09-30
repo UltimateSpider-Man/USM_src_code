@@ -56,6 +56,7 @@ struct ai_player_controller {
     int field_414;
     int field_418;
     int field_41C;
+    // Native gameplay family; use find_hero_type() for the distinct UI identity.
     hero_type_enum m_hero_type;
 
     //0x004728D0
@@ -73,6 +74,10 @@ struct ai_player_controller {
 
     //0x00449390
     hero_type_enum find_hero_type() const;
+	
+    // Constructor hook: preserves retail Venom missions/tokens for Carnage.
+    hero_type_enum find_native_hero_type() const;
+
 
     //0x00449A90
     anchor_storage_class get_poleswing_anchor() const;

@@ -13,3 +13,4 @@ struct ai_interact_resource_handler : base_engine_resource_handler {
 };
 
 extern void ai_interact_resource_handler_patch();
+extern void ai_interact_resource_handler_xbpack_patch();

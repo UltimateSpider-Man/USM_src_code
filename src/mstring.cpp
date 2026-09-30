@@ -6,6 +6,7 @@
 #include "memory.h"
 #include "common.h"
 #include "mash.h"
+#include "mash_config.h"
 #include "trace.h"
 
 #include <cassert>
@@ -224,11 +225,11 @@ void mString::finalize(int) {
 }
 
 mString::mString()
-    : mContainer(), guts(""),
-
-      field_C(nullptr) {
-
-    ++(mString_count());
+    : mContainer()
+{
+    this->field_C = nullptr;
+    this->guts = (char *) mString::null();
+    ++mString_count();
 }
 
 mString::mString([[maybe_unused]] mString::fmtd fmt, const char *Format, ...) {
@@ -384,7 +385,9 @@ void mString::append(const char *from_string, int from_string_length) {
             } else {
                 slab_allocator::slab_t *v12 = nullptr;
 
-                auto *v8 = static_cast<char *>(mem_alloc(v6 + 1));
+                char *v8 = (v6 < 176)
+                    ? static_cast<char *>(slab_allocator::allocate(static_cast<int>(v6 + 1), &v12))
+                    : new char[v6 + 1];
 
                 if (this->size() <= 0) {
                     v8[0] = 0;
@@ -395,6 +398,7 @@ void mString::append(const char *from_string, int from_string_length) {
 
                 strncat(v8, from_string, from_string_length);
 
+                this->destroy_guts();
                 this->guts = v8;
                 this->set_size(v6);
                 this->field_C = v12;
@@ -552,7 +556,7 @@ bool mString::is_equal(const char *a2) const {
 
 void mString::update_guts(const char *from_string, int n) {
     if constexpr (1) {
- //       assert(from_string != nullptr);
+        assert(from_string != nullptr);
 
         if (n == -1) {
             n = strlen(from_string);
@@ -592,7 +596,7 @@ void mString::custom_unmash(mash_info_struct *a1, void *a2)
 {
     TRACE("mString::custom_unmash");
 
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
     assert(guts == (char *)mash::CUSTOM_MASH_SENTRY);
 #endif
 
@@ -603,26 +607,31 @@ void mString::custom_unmash(mash_info_struct *a1, void *a2)
             this->guts = (char *) mString::null();
         } else {
             a1->align_buffer(
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                 mash::NORMAL_BUFFER,
 #endif 
                     1);
 
             this->guts = (char *) a1->read_from_buffer(
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                 mash::NORMAL_BUFFER,
 #endif 
                 this->m_size + 1, 1);
 ;
             a1->align_buffer(
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
                 mash::NORMAL_BUFFER,
 #endif 
                     4);
         }
 
+#if defined(OPENUSM_XBPACK_MODE) && !defined(TARGET_XBOX)
+        this->field_C = nullptr;
+#endif
+
 #ifndef TARGET_XBOX
-        this->field_0 = (int) &a1->mash_image_ptr[a1->buffer_size_used[0] - (uint32_t)this];
+        auto *mash_end = &a1->mash_image_ptr[0][a1->buffer_size_used[0]];
+        this->field_0 = reinterpret_cast<int>(mash_end) - reinterpret_cast<int>(this);
 #endif
     }
     else

@@ -1,5 +1,6 @@
 #include "resource_directory.h"
 
+#include "base_engine_resource_handler.h"
 #include "binary_search_array_cmp.h"
 #include "common.h"
 #include "debugutil.h"
@@ -16,6 +17,18 @@
 #include "resource_partition.h"
 #include "return_address.h"
 #include "utility.h"
+#include "xbpack.h"
+
+#ifdef OPENUSM_XBPACK_V10
+#include "resource_manager.h"
+#include "resource_pack_location.h"
+#include "xbpack_v10_directory_parents.h"
+#endif
+
+#include <array>
+#include <cstddef>
+#include <cstring>
+#include <unordered_map>
 
 #ifdef TARGET_XBOX
 VALIDATE_SIZE(resource_directory, 0x2C4);
@@ -24,6 +37,184 @@ VALIDATE_SIZE(resource_directory, 0x2BC);
 #endif
 
 VALIDATE_OFFSET(resource_directory, pack_slot, 0x78);
+
+namespace
+{
+    constexpr auto PC_RESOURCE_KEY_TYPE_COUNT = static_cast<size_t>(RESOURCE_KEY_TYPE_Z);
+
+    struct resource_type_tables {
+        std::array<int, PC_RESOURCE_KEY_TYPE_COUNT> starts {};
+        std::array<int, PC_RESOURCE_KEY_TYPE_COUNT> counts {};
+    };
+
+    std::unordered_map<const resource_directory *, resource_type_tables> g_xbox_type_tables;
+
+#ifdef OPENUSM_XBPACK_V10
+    xbpack::v10_directory_parents::lifecycle<resource_directory> g_parent_lifecycle;
+#endif
+
+    int xb_to_pc(int type)
+    {
+        assert(type >= 0 && type < xbpack::type_count);
+        return xbpack::pc_type(type);
+    }
+
+    void convert_directory(resource_directory *directory)
+    {
+        assert(directory != nullptr);
+
+#ifdef OPENUSM_XBPACK_V10
+        // A streamed directory may reuse an address from an unloaded pack.
+        // Its freshly unmarshalled prerequisite slots belong to a new lifetime.
+        g_parent_lifecycle.reset(directory);
+#endif
+
+        const auto *base = reinterpret_cast<const uint8_t *>(directory);
+        const auto *raw_starts = reinterpret_cast<const int *>(base + xbpack::starts_offset);
+        const auto *raw_counts = reinterpret_cast<const int *>(base + xbpack::counts_offset);
+
+        resource_type_tables tables {};
+        for (int raw_type = 0; raw_type < xbpack::type_count; ++raw_type) {
+            const auto pc_type = xb_to_pc(raw_type);
+            assert(pc_type >= 0 && pc_type < RESOURCE_KEY_TYPE_Z);
+
+            const auto raw_count = raw_counts[raw_type];
+            if (raw_count == 0) {
+                continue;
+            }
+
+            if (tables.counts[pc_type] == 0) {
+                tables.starts[pc_type] = raw_starts[raw_type];
+            } else {
+                assert(tables.starts[pc_type] + tables.counts[pc_type] ==
+                       raw_starts[raw_type]);
+            }
+            tables.counts[pc_type] += raw_count;
+        }
+
+        for (int i = 0; i < directory->resource_locations.size(); ++i) {
+            auto &location = directory->resource_locations.at(i);
+            const auto raw_type = static_cast<int>(location.field_0.m_type);
+            location.field_0.m_type = static_cast<resource_key_type>(xb_to_pc(raw_type));
+        }
+
+        g_xbox_type_tables[directory] = tables;
+
+        constexpr auto count_capacity =
+            (xbpack::directory_size - offsetof(resource_directory, type_end_idxs)) /
+            sizeof(int);
+        constexpr auto inline_count = count_capacity < PC_RESOURCE_KEY_TYPE_COUNT
+            ? count_capacity
+            : PC_RESOURCE_KEY_TYPE_COUNT;
+
+        for (size_t type = 0; type < PC_RESOURCE_KEY_TYPE_COUNT; ++type) {
+            directory->type_start_idxs[type] = tables.starts[type];
+            if (type < inline_count)
+                directory->type_end_idxs[type] = tables.counts[type];
+        }
+    }
+
+    const resource_type_tables *type_tables_for(const resource_directory *directory)
+    {
+        auto it = g_xbox_type_tables.find(directory);
+        if (it == g_xbox_type_tables.end()) {
+            auto *dir = const_cast<resource_directory *>(directory);
+            sp_log("converting resource directory 0x%08X", dir);
+            convert_directory(dir);
+            it = g_xbox_type_tables.find(directory);
+        }
+
+        assert(it != g_xbox_type_tables.end());
+        return &it->second;
+    }
+
+#ifdef OPENUSM_XBPACK_V10
+    resource_directory *resolve_parent(resource_directory *directory, int index)
+    {
+        assert(directory != nullptr);
+        assert(index >= 0 && index < directory->parents.size());
+
+        auto *&parent = directory->parents.m_data[index];
+        if (parent != nullptr || g_platform != NL_PLATFORM_XBOX
+            || directory->pack_slot == nullptr) {
+            return parent;
+        }
+        if (g_parent_lifecycle.is_removed(directory, static_cast<std::size_t>(index))) {
+            return nullptr;
+        }
+
+        resource_pack_location location;
+        if (!resource_manager::get_pack_file_stats(
+                directory->pack_slot->get_name_key(), &location, nullptr, nullptr)
+            || index >= location.prerequisite_count) {
+            return nullptr;
+        }
+
+        const auto prerequisite = index + location.prerequisite_offset;
+        auto *parent_key = resource_manager::get_prerequisiste(prerequisite);
+        assert(parent_key != nullptr);
+        auto *candidate = resource_manager::get_resource_directory(*parent_key);
+        const bool unloading = candidate != nullptr &&
+            (candidate->pack_slot == nullptr || candidate->pack_slot->is_pack_unloading());
+        if (!xbpack::v10_directory_parents::can_link(
+                directory, candidate, unloading,
+                [](resource_directory *current) {
+                    return xbpack::v10_directory_parents::parent_range<resource_directory>{
+                        current->parents.m_data,
+                        static_cast<std::size_t>(current->parents.size())};
+                })) {
+            return nullptr;
+        }
+        parent = candidate;
+        return parent;
+    }
+
+#if defined(OPENUSM_XBPACK_MODE) && !defined(TARGET_XBOX)
+    // Native methods take the directory in ECX and one pointer on the stack
+    // (ret 4). The unused EDX parameter makes that ABI explicit.
+    using native_parent_fn = void (__fastcall *)(resource_directory *, void *, resource_directory *);
+
+    void __fastcall mission_remove_parent(resource_directory *directory, void *,
+                                           resource_directory *bye)
+    {
+        assert(directory != nullptr && bye != nullptr);
+        resource_pack_location location{};
+        const bool declared = directory->pack_slot != nullptr && bye->pack_slot != nullptr &&
+            resource_manager::get_pack_file_stats(
+                directory->pack_slot->get_name_key(), &location, nullptr, nullptr);
+        g_parent_lifecycle.remove(
+            directory, bye, static_cast<std::size_t>(directory->parents.size()),
+            [directory](std::size_t i) { return directory->parents.m_data[i]; },
+            [&](std::size_t i) {
+                if (!declared || location.prerequisite_count <= 0 ||
+                    location.prerequisite_offset < 0 ||
+                    i >= static_cast<std::size_t>(location.prerequisite_count)) {
+                    return false;
+                }
+                const auto *key = resource_manager::get_prerequisiste(
+                    location.prerequisite_offset + static_cast<int>(i));
+                return key != nullptr && *key == bye->pack_slot->get_name_key();
+            },
+            [&] {
+                reinterpret_cast<native_parent_fn>(0x00537D30)(directory, nullptr, bye);
+            });
+    }
+
+    void __fastcall mission_add_parent(resource_directory *directory, void *,
+                                        resource_directory *parent)
+    {
+        assert(directory != nullptr && parent != nullptr);
+        g_parent_lifecycle.add(
+            directory, parent, static_cast<std::size_t>(directory->parents.size()),
+            [directory](std::size_t i) { return directory->parents.m_data[i]; },
+            [&] {
+                reinterpret_cast<native_parent_fn>(0x00537CC0)(directory, nullptr, parent);
+            });
+    }
+#endif
+#endif
+}
+
 
  
 void resource_directory::un_mash_start(generic_mash_header *header,
@@ -62,6 +253,10 @@ void resource_directory::un_mash_start(generic_mash_header *header,
  
         this->field_68.custom_un_mash(header, &this->field_68, a4, nullptr);
         this->field_70.custom_un_mash(header, &this->field_70, a4, nullptr);
+
+        if (g_platform == NL_PLATFORM_XBOX) {
+            convert_directory(this);
+        }
  
         // The retail PC build (0x0051F6E0) ends here. The per-vector
         // get_type() == TLRESOURCE_TYPE_* checks only exist in debug builds
@@ -74,7 +269,15 @@ void resource_directory::un_mash_start(generic_mash_header *header,
  
 int resource_directory::get_resource_count(resource_key_type type) {
     assert(type > RESOURCE_KEY_TYPE_NONE && type < RESOURCE_KEY_TYPE_Z);
- 
+
+    if (g_platform == NL_PLATFORM_XBOX) {
+        const auto *tables = type_tables_for(this);
+        if (tables == nullptr) {
+            return 0;
+        }
+        return tables->counts[type];
+    }
+
     return this->type_end_idxs[type];
 }
  
@@ -126,7 +329,6 @@ mashable_vector<tlresource_location> *resource_directory::tlresource_type_to_vec
         }
         default:
             assert(0 && "invalid tlresource type");
- 
             result = nullptr;
             break;
         }
@@ -303,7 +505,15 @@ int compare_resource_key_resource_location_just_hash(const resource_key &a1, res
  
 int resource_directory::get_type_start_idxs(resource_key_type type) {
     assert(type > RESOURCE_KEY_TYPE_NONE && type < RESOURCE_KEY_TYPE_Z);
- 
+
+    if (g_platform == NL_PLATFORM_XBOX) {
+        const auto *tables = type_tables_for(this);
+        if (tables == nullptr) {
+            return 0;
+        }
+        return tables->starts[type];
+    }
+
     return this->type_start_idxs[type];
 }
  
@@ -323,8 +533,8 @@ bool resource_directory::find_resource(const resource_key &a2,
         *out_dir = nullptr;
         *out_loc = nullptr;
         auto type = a2.get_type();
-        auto begin_idx = this->type_start_idxs[type];
-        auto end_idx = begin_idx + this->type_end_idxs[type];
+        auto begin_idx = this->get_type_start_idxs(type);
+        auto end_idx = begin_idx + this->get_resource_count(type);
         assert(begin_idx >= 0 && end_idx <= this->resource_locations.size());
  
         auto *v14 = this->resource_locations.m_data;
@@ -364,6 +574,9 @@ bool resource_directory::find_resource(const resource_key &a2,
                 for (auto i = 0u; i < this->parents.size(); ++i)
                 {
                     auto *the_parent = this->parents.at(i);
+#ifdef OPENUSM_XBPACK_V10
+                    the_parent = resolve_parent(this, i);
+#endif
                     if (the_parent == nullptr) {
                         break;
                     }
@@ -372,7 +585,14 @@ bool resource_directory::find_resource(const resource_key &a2,
  
                     if (the_parent->pack_slot->get_partition()->get_type() == RESOURCE_PARTITION_STRIP) {
                         assert(the_parent->parents.size() == 1);
+#ifdef OPENUSM_XBPACK_V10
+                        the_parent = resolve_parent(the_parent, 0);
+#else
                         the_parent = the_parent->parents.at(0);
+#endif
+                        if (the_parent == nullptr) {
+                            break;
+                        }
                     }
  
                     if ( this->pack_slot != nullptr
@@ -538,7 +758,7 @@ uint8_t *resource_directory::get_resource(const resource_key &resource_id,
 {
     TRACE("resource_directory::get_resource");
  
-    if constexpr (0)
+    if constexpr (1)
     {
         assert(resource_id.is_set());
         assert(resource_id.get_type() != RESOURCE_KEY_TYPE_NONE);
@@ -673,7 +893,7 @@ bool resource_directory::find_tlresource(uint32_t a1,
 {
     TRACE("resource_directory::find_tlresource", std::to_string(a1).c_str());
  
-    if constexpr (0)
+    if constexpr (1)
     {
         assert(tlres_type >= TLRESOURCE_TYPE_NONE && tlres_type < TLRESOURCE_TYPE_Z);
  
@@ -741,14 +961,13 @@ bool resource_directory::find_tlresource(uint32_t a1,
             return false;
         }
  
-        assert(array != nullptr);
- 
         auto SHOW_RESOURCE_SPAM = os_developer_options::instance->get_flag(mString {"SHOW_RESOURCE_SPAM"});
  
         bool result = false;
  
         auto idx = 0;
-        if (binary_search_array_cmp(&a1,
+        if (array_size > 0 && array != nullptr &&
+            binary_search_array_cmp(&a1,
                                     array,
                                     0,
                                     array_size,
@@ -781,8 +1000,12 @@ bool resource_directory::find_tlresource(uint32_t a1,
         }
         else
         {
-            for (auto &the_parent : this->parents)
+            for (int i = 0; i < this->parents.size(); ++i)
             {
+                auto *the_parent = this->parents.at(i);
+#ifdef OPENUSM_XBPACK_V10
+                the_parent = resolve_parent(this, i);
+#endif
                 if (the_parent == nullptr) {
                     break;
                 }
@@ -792,8 +1015,15 @@ bool resource_directory::find_tlresource(uint32_t a1,
                 if (the_parent->pack_slot->get_partition()->get_type() == RESOURCE_PARTITION_STRIP)
                 {
                     assert(the_parent->parents.size() == 1);
- 
+
+#ifdef OPENUSM_XBPACK_V10
+                    the_parent = resolve_parent(the_parent, 0);
+#else
                     the_parent = the_parent->parents.at(0);
+#endif
+                    if (the_parent == nullptr) {
+                        break;
+                    }
                 }
  
                 if (SHOW_RESOURCE_SPAM)
@@ -955,10 +1185,12 @@ void resource_directory::release_mem() {
 }
 void resource_directory_patch()
 {
+#if !defined(OPENUSM_XBPACK_MODE) || !defined(OPENUSM_XBPACK_V10) || defined(TARGET_XBOX)
     {
         FUNC_ADDRESS(address, &resource_directory::add_parent);
         REDIRECT(0x005D1FB3, address);
     }
+#endif
 
     {
         FUNC_ADDRESS(address, &resource_directory::find_resource);
@@ -984,7 +1216,11 @@ void resource_directory_patch()
 	    {
         FUNC_ADDRESS(address, &resource_directory::un_mash_start);
         REDIRECT(0x0053E21C, address);
-		REDIRECT(0x00563F9E, address);
+#ifndef OPENUSM_XBPACK_MODE
+        // The Xbox-pack installer replaces the generic-object mash entry point
+        // at 0x00563F40 and must not retain this PC-only interior redirect.
+        REDIRECT(0x00563F9E, address);
+#endif
 
     }
     return;
@@ -1006,3 +1242,80 @@ void resource_directory_patch()
 
     REDIRECT(0x0053E204, parse_generic_mash_init);
 }
+
+void resource_directory_xbpack_patch()
+{
+#ifdef OPENUSM_XBPACK_MODE
+    {
+        FUNC_ADDRESS(address, &base_engine_resource_handler::_handle);
+        SET_JUMP(0x00562DF0, address);
+    }
+
+    auto *directory_object_size = reinterpret_cast<uint32_t *>(0x0053E1E5);
+    assert(*directory_object_size == sizeof(resource_directory) ||
+           *directory_object_size == xbpack::directory_size);
+    *directory_object_size = xbpack::directory_size;
+
+    {
+        FUNC_ADDRESS(address, &resource_directory::un_mash_start);
+        REDIRECT(0x0053E21C, address);
+    }
+
+    using parse_directory_fn = bool (*)(resource_directory *&,
+                                        void *,
+                                        void *,
+                                        uint32_t *,
+                                        uint32_t *,
+                                        uint32_t,
+                                        uint32_t,
+                                        void *);
+    parse_directory_fn parse_directory = &parse_generic_object_mash<resource_directory>;
+    SET_JUMP(0x00563F40, parse_directory);
+
+    {
+        FUNC_ADDRESS(address, &resource_directory::find_resource);
+        SET_JUMP(0x0051F550, address);
+    }
+
+#ifdef OPENUSM_XBPACK_V10
+    // v10 directories can be unmarshalled before their prerequisite pack
+    // directory is available, leaving a null parent placeholder.  Stock
+    // find_tlresource stops at that null and returns default/black textures.
+    // The replacement resolves those parent keys lazily before recursing.
+    {
+        FUNC_ADDRESS(address, &resource_directory::find_tlresource);
+        SET_JUMP(0x0051F350, address);
+    }
+#endif
+#endif
+}
+
+#if defined(OPENUSM_XBPACK_MODE) && defined(OPENUSM_XBPACK_V10) && !defined(TARGET_XBOX)
+bool xbpack_v10_directory_parents_patch()
+{
+    const std::uintptr_t replacements[] = {
+        reinterpret_cast<std::uintptr_t>(&mission_remove_parent),
+        reinterpret_cast<std::uintptr_t>(&mission_remove_parent),
+        reinterpret_cast<std::uintptr_t>(&mission_add_parent),
+    };
+    // Validate the whole remapping transaction before changing any call site.
+    for (std::size_t i = 0; i < xbpack::v10_directory_parents::hooks.size(); ++i) {
+        const auto &hook = xbpack::v10_directory_parents::hooks[i];
+        const auto *call = reinterpret_cast<const std::uint8_t *>(hook.call);
+        std::int32_t displacement = 0;
+        std::memcpy(&displacement, call + 1, sizeof(displacement));
+        const auto target = hook.call + 5u + displacement;
+        if (call[0] != 0xE8 ||
+            (target != hook.native_target && target != replacements[i])) {
+            sp_log("[xbpack] V10 mission parent patch rejected: CALL 0x%08X changed",
+                   static_cast<unsigned>(hook.call));
+            return false;
+        }
+    }
+    REDIRECT(0x005D1FA2, mission_remove_parent);
+    REDIRECT(0x005D1FEE, mission_remove_parent);
+    REDIRECT(0x005D1FB3, mission_add_parent);
+    sp_log("[xbpack] V10 mission parent removal and late binding enabled");
+    return true;
+}
+#endif

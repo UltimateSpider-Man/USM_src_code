@@ -1,12 +1,13 @@
 #include "slc_manager.h"
 
 #include "debugutil.h"
-#include "entity_tracker_manager.h"
-#include "femanager.h"
-#include "func_wrapper.h"
-#include "igofrontend.h"
-#include "memory.h"
+#include "debug_render.h"
 #include "mini_map_dot_type.h"
+#include "igofrontend.h"
+#include "femanager.h"
+#include "entity_tracker_manager.h"
+#include "func_wrapper.h"
+#include "memory.h"
 #include "mission_manager.h"
 #include "mission_stack_manager.h"
 #include "open_city_neighborhoods.h"
@@ -14,6 +15,7 @@
 #include "resource_key.h"
 #include "resource_manager.h"
 #include "resource_pack_group.h"
+#include "resource_pack_location.h"
 
 #include "script_lib.h"
 #include "script_lib_anim.h"
@@ -28,9 +30,15 @@
 #include "vm_stack.h"
 #include "vm_thread.h"
 #include "wds.h"
+#include "xbpack.h"
+#include "xbpack_v10_fade.h"
 
-#include <cstring>
+#include <cstddef>
+#include <algorithm>
 #include <type_traits>
+#include <cstring>
+#include <cstdlib>
+#include <new>
 
 #if !STANDALONE_SYSTEM
 _std::vector<script_library_class *> *& slc_manager_class_array = var<_std::vector<script_library_class *> *>(0x00965EC8);
@@ -41,6 +49,148 @@ std::vector<script_library_class *> *&
     slc_manager_class_array {g_slc_manager_class_array};
 
 #endif
+
+namespace {
+
+bool g_using_xbox_v14 = false;
+
+#ifdef OPENUSM_ULTIMATE_RELEASE
+std::uint8_t script_debug_color_channel(float value)
+{
+    return static_cast<std::uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f);
+}
+
+color32 script_debug_color(const vector3d &rgb, float alpha = 1.0f)
+{
+    return color32{script_debug_color_channel(rgb[0]),
+                   script_debug_color_channel(rgb[1]),
+                   script_debug_color_channel(rgb[2]),
+                   script_debug_color_channel(alpha)};
+}
+#endif
+
+constexpr int xbox_v10_function_counts[] = {
+        441, 0, 0, 16, 11, 7, 22, 280, 2, 18, 8, 5, 8, 4, 3,
+        22, 11, 2, 4, 3, 8, 5, 0, 63, 13, 2, 22, 8, 5, 6, 4, 3,
+        13, 4, 12, 14, 2, 11, 9, 5, 5, 17,
+};
+
+constexpr int xbox_v14_function_counts[] = {
+        452, 0, 0, 16, 11, 7, 22, 287, 2, 18, 8, 5, 8, 4, 3,
+        22, 11, 2, 4, 3, 8, 5, 0, 64, 13, 2, 22, 8, 5, 6, 4, 3,
+        13, 4, 12, 14, 2, 11, 9, 5, 5, 1, 17,
+};
+
+template<std::size_t N>
+bool has_layout(const char *image, const int (&function_counts)[N])
+{
+    if (bit_cast<const int *>(image)[0] != N) {
+        return false;
+    }
+
+    auto *cursor = image + sizeof(int);
+    for (auto expected_count : function_counts) {
+        const auto actual_count = bit_cast<const int *>(cursor)[0];
+        if (actual_count != expected_count) {
+            return false;
+        }
+
+        cursor += sizeof(int) + sizeof(std::uint32_t) * actual_count;
+    }
+
+    return true;
+}
+
+void set_slf_call(script_library_class::function *slf, void *call)
+{
+    auto *vtbl = CAST(slf->m_vtbl, mem_alloc(sizeof(*slf->m_vtbl)));
+    *vtbl = *slf->m_vtbl;
+    vtbl->__cl = CAST(vtbl->__cl, call);
+    slf->m_vtbl = vtbl;
+}
+
+// The float duration is one native stack word. The generic variadic THISCALL
+// adapter would promote it to a double and violate the native ret-4 contract.
+using v10_native_fade_off_fn = void (__fastcall *)(mission_manager *, void *, float);
+using v10_native_release_hero_fn = void (__fastcall *)(mission_manager *, void *);
+
+struct slf__v10_fade_off__t : script_library_class::function {
+    explicit slf__v10_fade_off__t(const char *name) : function(name)
+    {
+        FUNC_ADDRESS(call, &slf__v10_fade_off__t::operator());
+        set_slf_call(this, call);
+    }
+
+    bool operator()(vm_stack &, entry_t) const
+    {
+        auto *manager = mission_manager::s_inst;
+        assert(manager != nullptr);
+        xbpack::v10_fade::release_script_fade(
+            *manager, false,
+            [manager](float duration) {
+                reinterpret_cast<v10_native_fade_off_fn>(0x005BAD80)(manager, nullptr, duration);
+            },
+            [manager]() {
+                reinterpret_cast<v10_native_release_hero_fn>(0x005BAC00)(manager, nullptr);
+            });
+
+        return true;
+    }
+};
+
+struct slf__v10_fade_clear__t : script_library_class::function {
+    explicit slf__v10_fade_clear__t(const char *name) : function(name)
+    {
+        FUNC_ADDRESS(call, &slf__v10_fade_clear__t::operator());
+        set_slf_call(this, call);
+    }
+
+    bool operator()(vm_stack &, entry_t) const
+    {
+        auto *manager = mission_manager::s_inst;
+        assert(manager != nullptr);
+        xbpack::v10_fade::release_script_fade(
+            *manager, true,
+            [manager](float duration) {
+                reinterpret_cast<v10_native_fade_off_fn>(0x005BAD80)(manager, nullptr, duration);
+            },
+            [manager]() {
+                reinterpret_cast<v10_native_release_hero_fn>(0x005BAC00)(manager, nullptr);
+            });
+
+        return true;
+    }
+};
+
+struct slf__get_num_sounds__t : script_library_class::function {
+    explicit slf__get_num_sounds__t(const char *name) : function(name)
+    {
+        FUNC_ADDRESS(call, &slf__get_num_sounds__t::operator());
+        set_slf_call(this, call);
+    }
+
+    bool operator()(vm_stack &stack, entry_t) const
+    {
+        stack.push(static_cast<float>(CDECL_CALL(0x00532CA0)));
+        return true;
+    }
+};
+
+struct slf__set_max_sounds__num__t : script_library_class::function {
+    explicit slf__set_max_sounds__num__t(const char *name) : function(name)
+    {
+        FUNC_ADDRESS(call, &slf__set_max_sounds__num__t::operator());
+        set_slf_call(this, call);
+    }
+
+    bool operator()(vm_stack &stack, entry_t) const
+    {
+        CDECL_CALL(0x00538420, static_cast<int>(stack.pop_num()));
+        return true;
+    }
+};
+
+} // namespace
 
 void register_standard_script_libs()
 {
@@ -108,8 +258,25 @@ struct slf__add_debug_cyl__vector3d__vector3d__num__t : script_library_class::fu
     {
         TRACE("slf__add_debug_cyl__vector3d__vector3d__num__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        struct params_t {
+            vector3d start;
+            vector3d end;
+            float radius;
+        };
+        static_assert(sizeof(params_t) == 28);
+
+        stack.pop(sizeof(params_t));
+        const auto *params = reinterpret_cast<const params_t *>(stack.get_SP());
+        add_debug_cylinder(params->start,
+                           params->end,
+                           params->radius,
+                           color32{255, 255, 255, 255});
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x00663390);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -127,8 +294,27 @@ struct slf__add_debug_cyl__vector3d__vector3d__num__vector3d__num__t : script_li
     {
         TRACE("slf__add_debug_cyl__vector3d__vector3d__num__vector3d__num__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        struct params_t {
+            vector3d start;
+            vector3d end;
+            float radius;
+            vector3d color;
+            float alpha;
+        };
+        static_assert(sizeof(params_t) == 44);
+
+        stack.pop(sizeof(params_t));
+        const auto *params = reinterpret_cast<const params_t *>(stack.get_SP());
+        add_debug_cylinder(params->start,
+                           params->end,
+                           params->radius,
+                           script_debug_color(params->color, params->alpha));
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x006633A0);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -146,8 +332,24 @@ struct slf__add_debug_line__vector3d__vector3d__t : script_library_class::functi
     {
         TRACE("slf__add_debug_line__vector3d__vector3d__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        struct params_t {
+            vector3d start;
+            vector3d end;
+        };
+        static_assert(sizeof(params_t) == 24);
+
+        stack.pop(sizeof(params_t));
+        const auto *params = reinterpret_cast<const params_t *>(stack.get_SP());
+        add_debug_line(params->start,
+                       params->end,
+                       color32{255, 255, 255, 255},
+                       0.02f);
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x00663370);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -165,8 +367,26 @@ struct slf__add_debug_line__vector3d__vector3d__vector3d__num__t : script_librar
     {
         TRACE("slf__add_debug_line__vector3d__vector3d__vector3d__num__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        struct params_t {
+            vector3d start;
+            vector3d end;
+            vector3d color;
+            float width;
+        };
+        static_assert(sizeof(params_t) == 40);
+
+        stack.pop(sizeof(params_t));
+        const auto *params = reinterpret_cast<const params_t *>(stack.get_SP());
+        add_debug_line(params->start,
+                       params->end,
+                       script_debug_color(params->color),
+                       params->width);
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x00663380);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -184,8 +404,23 @@ struct slf__add_debug_sphere__vector3d__num__t : script_library_class::function 
     {
         TRACE("slf__add_debug_sphere__vector3d__num__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        struct params_t {
+            vector3d center;
+            float radius;
+        };
+        static_assert(sizeof(params_t) == 16);
+
+        stack.pop(sizeof(params_t));
+        const auto *params = reinterpret_cast<const params_t *>(stack.get_SP());
+        add_debug_sphere(params->center,
+                         params->radius,
+                         color32{255, 255, 255, 255});
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x00677930);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -203,8 +438,25 @@ struct slf__add_debug_sphere__vector3d__num__vector3d__num__t : script_library_c
     {
         TRACE("slf__add_debug_sphere__vector3d__num__vector3d__num__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        struct params_t {
+            vector3d center;
+            float radius;
+            vector3d color;
+            float alpha;
+        };
+        static_assert(sizeof(params_t) == 32);
+
+        stack.pop(sizeof(params_t));
+        const auto *params = reinterpret_cast<const params_t *>(stack.get_SP());
+        add_debug_sphere(params->center,
+                         params->radius,
+                         script_debug_color(params->color, params->alpha));
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x00663360);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -735,8 +987,13 @@ struct slf__clear_debug_cyls__t : script_library_class::function {
     {
         TRACE("slf__clear_debug_cyls__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        clear_debug_cylinders();
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x006794B0);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -754,8 +1011,13 @@ struct slf__clear_debug_lines__t : script_library_class::function {
     {
         TRACE("slf__clear_debug_lines__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        clear_debug_lines();
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x006794B0);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -773,8 +1035,13 @@ struct slf__clear_debug_spheres__t : script_library_class::function {
     {
         TRACE("slf__clear_debug_spheres__t::operator()");
 
+#ifdef OPENUSM_ULTIMATE_RELEASE
+        clear_debug_spheres();
+        return true;
+#else
         bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x006794B0);
         return func(this, nullptr, &stack, entry);
+#endif
     }
 };
 
@@ -956,24 +1223,32 @@ slf__create_cut_scene__str__t::slf__create_cut_scene__str__t(const char *a3) : f
     m_vtbl->__cl = CAST(m_vtbl->__cl, address);
 }
 
-struct slf__create_debug_menu_entry__str__t : script_library_class::function {
-    slf__create_debug_menu_entry__str__t(const char *a3);
-
-    bool operator()(vm_stack &stack, [[maybe_unused]]script_library_class::function::entry_t entry) const
+struct slf__create_cut_scene__string_hash__t : script_library_class::function {
+    explicit slf__create_cut_scene__string_hash__t(const char *name) : function(name)
     {
-        TRACE("slf__create_debug_menu_entry__str__t::operator()");
+        auto local_vtbl = CAST(m_vtbl, mem_alloc(sizeof(*m_vtbl)));
+        *local_vtbl = *m_vtbl;
+        FUNC_ADDRESS(address, &slf__create_cut_scene__string_hash__t::operator());
+        local_vtbl->__cl = CAST(local_vtbl->__cl, address);
+        m_vtbl = local_vtbl;
+    }
 
-        bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x0067C1E0);
+    struct parms_t {
+        string_hash value;
+    };
+
+    bool operator()(vm_stack &stack, entry_t entry) const
+    {
+        SLF_PARMS;
+
+        const auto *name = parms->value.to_string();
+        stack.push(name);
+
+        bool (__fastcall *func)(const void *, void *, vm_stack *, entry_t) =
+                CAST(func, 0x00670AF0);
         return func(this, nullptr, &stack, entry);
     }
 };
-
-slf__create_debug_menu_entry__str__t::slf__create_debug_menu_entry__str__t(const char *a3) : function(a3)
-{
-    m_vtbl = CAST(m_vtbl, 0x0089C704);
-    FUNC_ADDRESS(address, &slf__create_debug_menu_entry__str__t::operator());
-    m_vtbl->__cl = CAST(m_vtbl->__cl, address);
-}
 
 struct slf__create_decal__str__vector3d__num__vector3d__t : script_library_class::function {
     slf__create_decal__str__vector3d__num__vector3d__t(const char *a3);
@@ -1238,25 +1513,6 @@ slf__create_polytube__str__t::slf__create_polytube__str__t(const char *a3) : fun
 {
     m_vtbl = CAST(m_vtbl, 0x0089C230);
     FUNC_ADDRESS(address, &slf__create_polytube__str__t::operator());
-    m_vtbl->__cl = CAST(m_vtbl->__cl, address);
-}
-
-struct slf__create_progression_menu_entry__str__str__t : script_library_class::function {
-    slf__create_progression_menu_entry__str__str__t(const char *a3);
-
-    bool operator()(vm_stack &stack, [[maybe_unused]]script_library_class::function::entry_t entry) const
-    {
-        TRACE("slf__create_progression_menu_entry__str__str__t::operator()");
-
-        bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x00678210);
-        return func(this, nullptr, &stack, entry);
-    }
-};
-
-slf__create_progression_menu_entry__str__str__t::slf__create_progression_menu_entry__str__str__t(const char *a3) : function(a3)
-{
-    m_vtbl = CAST(m_vtbl, 0x0089C714);
-    FUNC_ADDRESS(address, &slf__create_progression_menu_entry__str__str__t::operator());
     m_vtbl->__cl = CAST(m_vtbl->__cl, address);
 }
 
@@ -2076,8 +2332,6 @@ slf__disable_zoom_map__num__t::slf__disable_zoom_map__num__t(const char *a3) : f
     FUNC_ADDRESS(address, &slf__disable_zoom_map__num__t::operator());
     m_vtbl->__cl = CAST(m_vtbl->__cl, address);
 }
-
-
 
 struct slf__distance3d__vector3d__vector3d__t : script_library_class::function {
     slf__distance3d__vector3d__vector3d__t(const char *a3);
@@ -3264,8 +3518,80 @@ struct slf__get_character_packname_list__t : script_library_class::function {
     {
         TRACE("slf__get_character_packname_list__t::operator()");
 
-        bool (__fastcall *func)(const void *, void *edx, vm_stack *, entry_t) = CAST(func, 0x00676270);
-        return func(this, nullptr, &stack, entry);
+        auto *mission_stack = mission_stack_manager::s_inst;
+        if (mission_stack != nullptr
+            && mission_stack->waiting_for_push_or_pop()) {
+            return false;
+        }
+
+#ifndef OPENUSM_XBPACK_MODE
+        // Retail normally publishes this cache before CHARACTER_LINEUP runs.
+        // Standalone PCPACK indexes do not take that initialization path, so
+        // preserve the stock cache when it exists and synthesize it only when
+        // the stock producer left it null.
+        using character_packname_list = _std::vector<mString>;
+        auto *stock_character_packnames =
+            *bit_cast<character_packname_list **>(0x0096BD80);
+        if (stock_character_packnames != nullptr) {
+            stack.push(reinterpret_cast<const char *>(&stock_character_packnames),
+                       sizeof(stock_character_packnames));
+            return true;
+        }
+#endif
+
+        // Build the list from the selected amalgapak index. Both platforms'
+        // CHARACTER_LINEUP scripts reconstruct the pack as "ch_" + item, so
+        // strip exactly CH_ here. PC CH_VWR_* entries intentionally retain
+        // VWR_; the native spawner removes that part only for entity lookup.
+        // Keep the host PC mString/vector ABI because the str_list handlers
+        // that consume the result are still the PC implementations.
+        using character_packname_list = _std::vector<mString>;
+        static character_packname_list *character_packnames = nullptr;
+
+        if (character_packnames == nullptr) {
+            if (resource_manager::amalgapak_pack_location_table == nullptr
+                || resource_manager::amalgapak_base_offset == -1) {
+                return false;
+            }
+
+            auto *storage = mem_alloc(sizeof(character_packname_list));
+            character_packnames = new (storage) character_packname_list {};
+
+            const int pack_count = resource_manager::get_pack_location_count();
+            for (int pack_index = 0; pack_index < pack_count; ++pack_index) {
+                resource_pack_location location {};
+                if (!resource_manager::get_pack_location(pack_index, &location)) {
+                    continue;
+                }
+
+                mString pack_name {location.m_name};
+                pack_name.to_lower();
+                mString actor_name;
+                if (pack_name.find("ch_", 0) == 0) {
+                    actor_name = pack_name.substr(3, -1);
+                }
+
+                if (!actor_name.empty()
+                    && std::find(character_packnames->begin(),
+                                 character_packnames->end(),
+                                 actor_name) == character_packnames->end()) {
+                    character_packnames->push_back(actor_name);
+                }
+            }
+
+            std::sort(character_packnames->begin(), character_packnames->end());
+            sp_log("Character packname list restored from %s index: %u entries",
+#ifdef OPENUSM_XBPACK_MODE
+                   "Xbox",
+#else
+                   "PC",
+#endif
+                   static_cast<unsigned>(character_packnames->size()));
+        }
+
+        auto *result = character_packnames;
+        stack.push(reinterpret_cast<const char *>(&result), sizeof(result));
+        return true;
     }
 };
 
@@ -3274,6 +3600,17 @@ slf__get_character_packname_list__t::slf__get_character_packname_list__t(const c
     m_vtbl = CAST(m_vtbl, 0x0089C354);
     FUNC_ADDRESS(address, &slf__get_character_packname_list__t::operator());
     m_vtbl->__cl = CAST(m_vtbl->__cl, address);
+}
+
+void character_packname_list_patch()
+{
+#ifndef OPENUSM_XBPACK_MODE
+    // Only the standalone PC path retains the retail SLF objects. Replace the
+    // single producer call slot instead of enabling the broad slc_manager
+    // reimplementation that is intentionally below the loader's early return.
+    FUNC_ADDRESS(address, &slf__get_character_packname_list__t::operator());
+    set_vfunc(0x0089C358, address);
+#endif
 }
 
 struct slf__get_closest_point_on_lane_with_facing__num__vector3d__vector3d_list__t : script_library_class::function {
@@ -5859,6 +6196,28 @@ slf__set_mission_text_debug__str__t::slf__set_mission_text_debug__str__t(const c
     FUNC_ADDRESS(address, &slf__set_mission_text_debug__str__t::operator());
     m_vtbl->__cl = CAST(m_vtbl->__cl, address);
 }
+
+struct slf__set_pack_state__str__t : script_library_class::function {
+    explicit slf__set_pack_state__str__t(const char *name) : function(name)
+    {
+        auto local_vtbl = CAST(m_vtbl, mem_alloc(sizeof(*m_vtbl)));
+        *local_vtbl = *m_vtbl;
+        FUNC_ADDRESS(address, &slf__set_pack_state__str__t::operator());
+        local_vtbl->__cl = CAST(local_vtbl->__cl, address);
+        m_vtbl = local_vtbl;
+    }
+
+    struct parms_t {
+        vm_str_t state;
+    };
+
+    bool operator()(vm_stack &stack, entry_t) const
+    {
+        SLF_PARMS;
+        (void)parms;
+        return true;
+    }
+};
 
 struct slf__set_parking_density__num__t : script_library_class::function {
     slf__set_parking_density__num__t(const char *a3);
@@ -11378,9 +11737,7 @@ void chuck_register_script_libs()
 
     if constexpr (1)
     {
-        // 40 classes are registered below (38 CREATE_SLC + slc_anim +
-        // slc_entity); sized 39u this overflowed on classes[39].
-        std::vector<script_library_class *> classes(40u);
+        std::vector<script_library_class *> classes(xbpack::v10 ? 39u : 40u);
         auto class_idx = 0u;
 
 #define CREATE_SLC(TYPE) \
@@ -11430,7 +11787,9 @@ void chuck_register_script_libs()
         CREATE_SLC(slc_vector3d_list_t);
         CREATE_SLC(slc_vector3d_list_iterator_t);
         CREATE_SLC(slc_string_hash_t);
-        CREATE_SLC(slc_critical_section_t);
+        if constexpr (!xbpack::v10) {
+            CREATE_SLC(slc_critical_section_t);
+        }
         CREATE_SLC(slc_district_t);
 
         if (!g_is_the_packer() && !script_manager::using_chuck_old_fashioned()) {
@@ -11465,14 +11824,18 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(add_debug_sphere__vector3d__num, "add_debug_sphere(vector3d,num)");
             CREATE_GLOBAL_SLF(add_debug_sphere__vector3d__num__vector3d__num, "add_debug_sphere(vector3d,num,vector3d,num)");
             CREATE_GLOBAL_SLF(add_glass_house__str, "add_glass_house(str)");
-            CREATE_GLOBAL_SLF(add_glass_house__str__num, "add_glass_house(str,num)");
-            CREATE_GLOBAL_SLF(add_glass_house__str__num__vector3d, "add_glass_house(str,num,vector3d)");
-            CREATE_GLOBAL_SLF(add_glass_house__str__vector3d, "add_glass_house(str,vector3d)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(add_glass_house__str__num, "add_glass_house(str,num)");
+                CREATE_GLOBAL_SLF(add_glass_house__str__num__vector3d, "add_glass_house(str,num,vector3d)");
+                CREATE_GLOBAL_SLF(add_glass_house__str__vector3d, "add_glass_house(str,vector3d)");
+            }
             CREATE_GLOBAL_SLF(add_to_console__str, "add_to_console(str)");
             CREATE_GLOBAL_SLF(add_traffic_model__num__str, "add_traffic_model(num,str)");
             CREATE_GLOBAL_SLF(allow_suspend_thread__num, "allow_suspend_thread(num)");
             CREATE_GLOBAL_SLF(angle_between__vector3d__vector3d, "angle_between(vector3d,vector3d)");
-            CREATE_GLOBAL_SLF(apply_donut_damage__vector3d__num__num__num__num__num, "apply_donut_damage(vector3d,num,num,num,num,num)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(apply_donut_damage__vector3d__num__num__num__num__num, "apply_donut_damage(vector3d,num,num,num,num,num)");
+            }
             CREATE_GLOBAL_SLF(apply_radius_damage__vector3d__num__num__num__num, "apply_radius_damage(vector3d,num,num,num,num)");
             CREATE_GLOBAL_SLF(apply_radius_subdue__vector3d__num__num__num__num, "apply_radius_subdue(vector3d,num,num,num,num)");
             CREATE_GLOBAL_SLF(assert__num__str, "assert(num,str)");
@@ -11486,7 +11849,9 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(bring_up_medal_award_box__num, "bring_up_medal_award_box(num)");
             CREATE_GLOBAL_SLF(bring_up_race_announcer, "bring_up_race_announcer()");
             CREATE_GLOBAL_SLF(calc_launch_vector__vector3d__vector3d__num__entity, "calc_launch_vector(vector3d,vector3d,num,entity)");
-            CREATE_GLOBAL_SLF(can_load_pack__str, "can_load_pack(str)");
+            if (!slc_manager::using_xbox_v14()) {
+                CREATE_GLOBAL_SLF(can_load_pack__str, "can_load_pack(str)");
+            }
             CREATE_GLOBAL_SLF(chase_cam, "chase_cam()");
             CREATE_GLOBAL_SLF(clear_all_grenades, "clear_all_grenades()");
             CREATE_GLOBAL_SLF(clear_civilians_within_radius__vector3d__num, "clear_civilians_within_radius(vector3d,num)");
@@ -11504,6 +11869,9 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(create_beam, "create_beam()");
             CREATE_GLOBAL_SLF(create_credits, "create_credits()");
             CREATE_GLOBAL_SLF(create_cut_scene__str, "create_cut_scene(str)");
+            if (slc_manager::using_xbox_v14()) {
+                CREATE_GLOBAL_SLF(create_cut_scene__string_hash, "create_cut_scene(string_hash)");
+            }
             CREATE_GLOBAL_SLF(create_debug_menu_entry__str, "create_debug_menu_entry(str)");
             CREATE_GLOBAL_SLF(create_debug_menu_entry__str__str, "create_debug_menu_entry(str,str)");
             CREATE_GLOBAL_SLF(create_decal__str__vector3d__num__vector3d, "create_decal(str,vector3d,num,vector3d)");
@@ -11559,7 +11927,9 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(destroy_vector3d_list__vector3d_list, "destroy_vector3d_list(vector3d_list)");
             CREATE_GLOBAL_SLF(dilated_delay__num, "dilated_delay(num)");
             CREATE_GLOBAL_SLF(disable_marky_cam__num, "disable_marky_cam(num)");
-            CREATE_GLOBAL_SLF(disable_nearby_occlusion_only_obb__vector3d, "disable_nearby_occlusion_only_obb(vector3d)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(disable_nearby_occlusion_only_obb__vector3d, "disable_nearby_occlusion_only_obb(vector3d)");
+            }
             CREATE_GLOBAL_SLF(disable_player_shadows, "disable_player_shadows()");
             CREATE_GLOBAL_SLF(disable_subtitles, "disable_subtitles()");
             CREATE_GLOBAL_SLF(disable_vibrator, "disable_vibrator()");
@@ -11584,7 +11954,9 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(enable_interface__num, "enable_interface(num)");
             CREATE_GLOBAL_SLF(enable_marky_cam__num, "enable_marky_cam(num)");
             CREATE_GLOBAL_SLF(enable_mini_map__num, "enable_mini_map(num)");
-            CREATE_GLOBAL_SLF(enable_nearby_occlusion_only_obb__vector3d, "enable_nearby_occlusion_only_obb(vector3d)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(enable_nearby_occlusion_only_obb__vector3d, "enable_nearby_occlusion_only_obb(vector3d)");
+            }
             CREATE_GLOBAL_SLF(enable_obb__vector3d__num, "enable_obb(vector3d,num)");
             CREATE_GLOBAL_SLF(enable_pause__num, "enable_pause(num)");
             CREATE_GLOBAL_SLF(enable_physics__num, "enable_physics(num)");
@@ -11603,6 +11975,10 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(entity_exists__str, "entity_exists(str)");
             CREATE_GLOBAL_SLF(entity_get_entity_tracker__entity, "entity_get_entity_tracker(entity)");
             CREATE_GLOBAL_SLF(entity_has_entity_tracker__entity, "entity_has_entity_tracker(entity)");
+            if constexpr (xbpack::v10) {
+                CREATE_GLOBAL_SLF(v10_fade_off, "");
+                CREATE_GLOBAL_SLF(v10_fade_clear, "");
+            }
             CREATE_GLOBAL_SLF(exit_water__entity, "exit_water(entity)");
             CREATE_GLOBAL_SLF(find_closest_point_on_a_path_to_point__vector3d, "find_closest_point_on_a_path_to_point(vector3d)");
             CREATE_GLOBAL_SLF(find_district_for_point__vector3d, "find_district_for_point(vector3d)");
@@ -11662,15 +12038,24 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(get_missions_nums_by_index__district__str__num__num_list, "get_missions_nums_by_index(district,str,num,num_list)");
             CREATE_GLOBAL_SLF(get_missions_patrol_waypoint_by_index__district__str__num, "get_missions_patrol_waypoint_by_index(district,str,num)");
             CREATE_GLOBAL_SLF(get_neighborhood_name__num, "get_neighborhood_name(num)");
-            CREATE_GLOBAL_SLF(get_num_free_slots__str, "get_num_free_slots(str)");
+            if (!slc_manager::using_xbox_v14()) {
+                CREATE_GLOBAL_SLF(get_num_free_slots__str, "get_num_free_slots(str)");
+            }
             CREATE_GLOBAL_SLF(get_num_mission_transform_marker, "get_num_mission_transform_marker()");
-            CREATE_GLOBAL_SLF(get_pack_group__str, "get_pack_group(str)");
+            if constexpr (xbpack::v10) {
+                CREATE_GLOBAL_SLF(get_num_sounds, "get_num_sounds()");
+            }
+            if (!slc_manager::using_xbox_v14()) {
+                CREATE_GLOBAL_SLF(get_pack_group__str, "get_pack_group(str)");
+            }
             CREATE_GLOBAL_SLF(get_pack_size__str, "get_pack_size(str)");
             CREATE_GLOBAL_SLF(get_patrol_difficulty__str, "get_patrol_difficulty(str)");
             CREATE_GLOBAL_SLF(get_patrol_node_position_by_index__str__num, "get_patrol_node_position_by_index(str,num)");
             CREATE_GLOBAL_SLF(get_patrol_start_position__str, "get_patrol_start_position(str)");
             CREATE_GLOBAL_SLF(get_patrol_unlock_threshold__str, "get_patrol_unlock_threshold(str)");
-            CREATE_GLOBAL_SLF(get_platform, "get_platform()");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(get_platform, "get_platform()");
+            }
             CREATE_GLOBAL_SLF(get_render_opt_num__str, "get_render_opt_num(str)");
             CREATE_GLOBAL_SLF(get_spider_reflexes_spiderman_time_dilation, "get_spider_reflexes_spiderman_time_dilation()");
             CREATE_GLOBAL_SLF(get_spider_reflexes_world_time_dilation, "get_spider_reflexes_world_time_dilation()");
@@ -11679,7 +12064,9 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(get_time_of_day_rate, "get_time_of_day_rate()");
             CREATE_GLOBAL_SLF(get_token_index_from_id__num__num, "get_token_index_from_id(num,num)");
             CREATE_GLOBAL_SLF(get_traffic_spawn_point_near_camera__vector3d_list, "get_traffic_spawn_point_near_camera(vector3d_list)");
-            CREATE_GLOBAL_SLF(greater_than_or_equal_rounded__num__num, "greater_than_or_equal_rounded(num,num)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(greater_than_or_equal_rounded__num__num, "greater_than_or_equal_rounded(num,num)");
+            }
             CREATE_GLOBAL_SLF(hard_break, "hard_break()");
             CREATE_GLOBAL_SLF(has_substring__str__str, "has_substring(str,str)");
             CREATE_GLOBAL_SLF(hero, "hero()");
@@ -11688,34 +12075,48 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(hide_controller_gauge, "hide_controller_gauge()");
             CREATE_GLOBAL_SLF(initialize_encounter_object, "initialize_encounter_object()");
             CREATE_GLOBAL_SLF(initialize_encounter_objects, "initialize_encounter_objects()");
-            CREATE_GLOBAL_SLF(insert_pack__str, "insert_pack(str)");
-            CREATE_GLOBAL_SLF(invoke_pause_menu_unlockables, "invoke_pause_menu_unlockables()");
-            CREATE_GLOBAL_SLF(is_ai_enabled, "is_ai_enabled()");
-            CREATE_GLOBAL_SLF(is_cut_scene_playing, "is_cut_scene_playing()");
+            if (!slc_manager::using_xbox_v14()) {
+                CREATE_GLOBAL_SLF(insert_pack__str, "insert_pack(str)");
+            }
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(invoke_pause_menu_unlockables, "invoke_pause_menu_unlockables()");
+                CREATE_GLOBAL_SLF(is_ai_enabled, "is_ai_enabled()");
+                CREATE_GLOBAL_SLF(is_cut_scene_playing, "is_cut_scene_playing()");
+            }
             CREATE_GLOBAL_SLF(is_district_loaded__num, "is_district_loaded(num)");
             CREATE_GLOBAL_SLF(is_hero_frozen, "is_hero_frozen()");
             CREATE_GLOBAL_SLF(is_hero_peter_parker, "is_hero_peter_parker()");
             CREATE_GLOBAL_SLF(is_hero_spidey, "is_hero_spidey()");
             CREATE_GLOBAL_SLF(is_hero_venom, "is_hero_venom()");
-            CREATE_GLOBAL_SLF(is_marky_cam_enabled, "is_marky_cam_enabled()");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(is_marky_cam_enabled, "is_marky_cam_enabled()");
+            }
             CREATE_GLOBAL_SLF(is_mission_active, "is_mission_active()");
             CREATE_GLOBAL_SLF(is_mission_loading, "is_mission_loading()");
-            CREATE_GLOBAL_SLF(is_pack_available__str, "is_pack_available(str)");
-            CREATE_GLOBAL_SLF(is_pack_loaded__str, "is_pack_loaded(str)");
+            if (!slc_manager::using_xbox_v14()) {
+                CREATE_GLOBAL_SLF(is_pack_available__str, "is_pack_available(str)");
+                CREATE_GLOBAL_SLF(is_pack_loaded__str, "is_pack_loaded(str)");
+            }
             CREATE_GLOBAL_SLF(is_pack_pushed__str, "is_pack_pushed(str)");
             CREATE_GLOBAL_SLF(is_path_graph_inside_glass_house__str, "is_path_graph_inside_glass_house(str)");
             CREATE_GLOBAL_SLF(is_patrol_active, "is_patrol_active()");
             CREATE_GLOBAL_SLF(is_patrol_node_empty__num, "is_patrol_node_empty(num)");
-            CREATE_GLOBAL_SLF(is_paused, "is_paused()");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(is_paused, "is_paused()");
+            }
             CREATE_GLOBAL_SLF(is_physics_enabled, "is_physics_enabled()");
-            CREATE_GLOBAL_SLF(is_point_inside_glass_house__vector3d, "is_point_inside_glass_house(vector3d)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(is_point_inside_glass_house__vector3d, "is_point_inside_glass_house(vector3d)");
+            }
             CREATE_GLOBAL_SLF(is_point_under_water__vector3d, "is_point_under_water(vector3d)");
             CREATE_GLOBAL_SLF(is_user_camera_enabled, "is_user_camera_enabled()");
             CREATE_GLOBAL_SLF(load_anim__str, "load_anim(str)");
             CREATE_GLOBAL_SLF(load_level__str__vector3d, "load_level(str,vector3d)");
             CREATE_GLOBAL_SLF(lock_all_districts, "lock_all_districts()");
             CREATE_GLOBAL_SLF(lock_district__num, "lock_district(num)");
-            CREATE_GLOBAL_SLF(lock_mission_manager__num, "lock_mission_manager(num)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(lock_mission_manager__num, "lock_mission_manager(num)");
+            }
             CREATE_GLOBAL_SLF(los_check__vector3d__vector3d, "los_check(vector3d,vector3d)");
             CREATE_GLOBAL_SLF(lower_hotpursuit_indicator_level, "lower_hotpursuit_indicator_level()");
             CREATE_GLOBAL_SLF(malor__vector3d__num, "malor(vector3d,num)");
@@ -11737,9 +12138,13 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(remove_civilian_info_entity__entity__num, "remove_civilian_info_entity(entity,num)");
             CREATE_GLOBAL_SLF(remove_glass_house__str, "remove_glass_house(str)");
             CREATE_GLOBAL_SLF(remove_item_entity_from_world__entity, "remove_item_entity_from_world(entity)");
-            CREATE_GLOBAL_SLF(remove_pack__str, "remove_pack(str)");
+            if (!slc_manager::using_xbox_v14()) {
+                CREATE_GLOBAL_SLF(remove_pack__str, "remove_pack(str)");
+            }
             CREATE_GLOBAL_SLF(remove_traffic_model__num, "remove_traffic_model(num)");
-            CREATE_GLOBAL_SLF(reset_externed_alses, "reset_externed_alses()");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(reset_externed_alses, "reset_externed_alses()");
+            }
             CREATE_GLOBAL_SLF(set_all_anchors_activated__num, "set_all_anchors_activated(num)");
             CREATE_GLOBAL_SLF(set_blur__num, "set_blur(num)");
             CREATE_GLOBAL_SLF(set_blur_blend_mode__num, "set_blur_blend_mode(num)");
@@ -11758,12 +12163,18 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(set_game_info_str__str__str, "set_game_info_str(str,str)");
             CREATE_GLOBAL_SLF(set_global_time_dilation__num, "set_global_time_dilation(num)");
             CREATE_GLOBAL_SLF(set_marky_cam_lookat__vector3d, "set_marky_cam_lookat(vector3d)");
+            if constexpr (xbpack::v10) {
+                CREATE_GLOBAL_SLF(set_max_sounds__num, "set_max_sounds(num)");
+            }
             CREATE_GLOBAL_SLF(set_max_streaming_distance__num, "set_max_streaming_distance(num)");
             CREATE_GLOBAL_SLF(set_mission_key_pos_facing__vector3d__vector3d, "set_mission_key_pos_facing(vector3d,vector3d)");
             CREATE_GLOBAL_SLF(set_mission_key_position__vector3d, "set_mission_key_position(vector3d)");
             CREATE_GLOBAL_SLF(set_mission_text__num, "set_mission_text(num,...)");
             CREATE_GLOBAL_SLF(set_mission_text_box_flavor__num, "set_mission_text_box_flavor(num)");
             CREATE_GLOBAL_SLF(set_mission_text_debug__str, "set_mission_text_debug(str)");
+            if (slc_manager::using_xbox_v14()) {
+                CREATE_GLOBAL_SLF(set_pack_state__str, "set_pack_state(str)");
+            }
             CREATE_GLOBAL_SLF(set_parking_density__num, "set_parking_density(num)");
             CREATE_GLOBAL_SLF(set_pedestrian_density__num, "set_pedestrian_density(num)");
             CREATE_GLOBAL_SLF(set_render_opt_num__str__num, "set_render_opt_num(str,num)");
@@ -11792,7 +12203,9 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(show_controller_gauge, "show_controller_gauge()");
             CREATE_GLOBAL_SLF(show_hotpursuit_indicator__num, "show_hotpursuit_indicator(num)");
             CREATE_GLOBAL_SLF(show_score_widget__num, "show_score_widget(num)");
-            CREATE_GLOBAL_SLF(shut_up_all_ai_voice_boxes, "shut_up_all_ai_voice_boxes()");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(shut_up_all_ai_voice_boxes, "shut_up_all_ai_voice_boxes()");
+            }
             CREATE_GLOBAL_SLF(sin__num, "sin(num)");
             CREATE_GLOBAL_SLF(sin_cos__num, "sin_cos(num)");
             CREATE_GLOBAL_SLF(soft_load__num, "soft_load(num)");
@@ -11803,10 +12216,14 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(spiderman_camera_add_shake__num__num__num, "spiderman_camera_add_shake(num,num,num)");
             CREATE_GLOBAL_SLF(spiderman_camera_autocorrect__num, "spiderman_camera_autocorrect(num)");
             CREATE_GLOBAL_SLF(spiderman_camera_clear_fixedstatic, "spiderman_camera_clear_fixedstatic()");
-            CREATE_GLOBAL_SLF(spiderman_camera_enable_combat__num, "spiderman_camera_enable_combat(num)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(spiderman_camera_enable_combat__num, "spiderman_camera_enable_combat(num)");
+            }
             CREATE_GLOBAL_SLF(spiderman_camera_enable_lookaround__num, "spiderman_camera_enable_lookaround(num)");
             CREATE_GLOBAL_SLF(spiderman_camera_set_fixedstatic__vector3d__vector3d, "spiderman_camera_set_fixedstatic(vector3d,vector3d)");
-            CREATE_GLOBAL_SLF(spiderman_camera_set_follow__entity, "spiderman_camera_set_follow(entity)");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(spiderman_camera_set_follow__entity, "spiderman_camera_set_follow(entity)");
+            }
             CREATE_GLOBAL_SLF(spiderman_camera_set_hero_underwater__num, "spiderman_camera_set_hero_underwater(num)");
             CREATE_GLOBAL_SLF(spiderman_camera_set_interpolation_time__num, "spiderman_camera_set_interpolation_time(num)");
             CREATE_GLOBAL_SLF(spiderman_camera_set_lockon_min_distance__num, "spiderman_camera_set_lockon_min_distance(num)");
@@ -11862,7 +12279,9 @@ void chuck_register_script_libs()
             CREATE_GLOBAL_SLF(spidey_can_see__vector3d, "spidey_can_see(vector3d)");
             CREATE_GLOBAL_SLF(sqrt__num, "sqrt(num)");
             CREATE_GLOBAL_SLF(start_patrol__str, "start_patrol(str)");
-            CREATE_GLOBAL_SLF(stop_all_sounds, "stop_all_sounds()");
+            if constexpr (!xbpack::v10) {
+                CREATE_GLOBAL_SLF(stop_all_sounds, "stop_all_sounds()");
+            }
             CREATE_GLOBAL_SLF(stop_credits, "stop_credits()");
             CREATE_GLOBAL_SLF(stop_vibration, "stop_vibration()");
             CREATE_GLOBAL_SLF(subtitle__num__num__num__num__num__num, "subtitle(num,num,num,num,num,num)");
@@ -11941,8 +12360,10 @@ void chuck_register_script_libs()
             CREATE_SLF(beam, set_tiles_per_meter__num, "set_tiles_per_meter(num)");
             CREATE_SLF(beam, set_uv_anim__num__num, "set_uv_anim(num,num)");
 
-            slc = classes[38];
-            CREATE_SLF(critical_section, critical_section__num, "critical_section(num)");
+            if constexpr (!xbpack::v10) {
+                slc = classes[38];
+                CREATE_SLF(critical_section, critical_section__num, "critical_section(num)");
+            }
 
             slc = classes[5];
             CREATE_SLF(cut_scene, wait_play, "wait_play()");
@@ -11968,7 +12389,7 @@ void chuck_register_script_libs()
             CREATE_SLF(debug_menu_entry, set_value__num, "set_value(num)");
             CREATE_SLF(debug_menu_entry, set_value_type__num, "set_value_type(num)");
 
-            slc = classes[39];
+            slc = classes[xbpack::v10 ? 38u : 39u];
             CREATE_SLF(district, contains_point__vector3d, "contains_point(vector3d)");
             CREATE_SLF(district, district__num, "district(num)");
             CREATE_SLF(district, district__str, "district(str)");
@@ -12008,20 +12429,14 @@ void chuck_register_script_libs()
 
             slc = classes[9];
 
-            // openusm: grow the mashed function table before registering --
-            // all_slc_functions_mac carries exactly the 8 stock entity_tracker
-            // slots, and neither the stock appender (0x0058EDE0) nor
-            // add_function() bounds-checks the final store. The extra slot
-            // goes LAST so the stock functions keep their mashed indices
-            // (compiled SLBs resolve by index); set_enemy_icon lands in
-            // slot 8. Skipped outside mash mode, where the sorted-order
-            // packer path applies and the feature is debug-only anyway.
+            // Preserve the custom OpenUSM enemy/boss minimap SLF. Keep all
+            // stock/v10 slots stable and append the new function at the end.
             if (slc->are_funcs_from_mash()) {
                 const int stock_funcs = slc->total_funcs;
                 auto **grown = bit_cast<script_library_class::function **>(
                     mem_alloc(sizeof(void *) * (stock_funcs + 1)));
                 memcpy(grown, slc->funcs, sizeof(void *) * stock_funcs);
-                grown[stock_funcs] = grown[stock_funcs - 1];  // non-null sentinel; replaced below
+                grown[stock_funcs] = grown[stock_funcs - 1];
                 slc->funcs = grown;
                 slc->total_funcs = stock_funcs + 1;
             }
@@ -12035,7 +12450,6 @@ void chuck_register_script_libs()
             CREATE_SLF(entity_tracker, set_poi_active__num, "set_poi_active(num)");
             CREATE_SLF(entity_tracker, set_poi_icon__num, "set_poi_icon(num)");
             if (slc->are_funcs_from_mash()) {
-                // openusm: new SLF, registered last -> mash slot 8.
                 CREATE_SLF(entity_tracker, set_enemy_icon__num, "set_enemy_icon(num)");
             }
 
@@ -12173,7 +12587,9 @@ void chuck_register_script_libs()
             CREATE_SLF(polytube, reserve_control_pts__num, "reserve_control_pts(num)");
             CREATE_SLF(polytube, set_additive__num, "set_additive(num)");
             CREATE_SLF(polytube, set_begin_material__str__num, "set_begin_material(str,num)");
-            CREATE_SLF(polytube, set_begin_material_ifl__str__num, "set_begin_material_ifl(str,num)");
+            if constexpr (!xbpack::v10) {
+                CREATE_SLF(polytube, set_begin_material_ifl__str__num, "set_begin_material_ifl(str,num)");
+            }
             CREATE_SLF(polytube, set_blend_mode__num, "set_blend_mode(num)");
             CREATE_SLF(polytube, set_control_pt__num__vector3d, "set_control_pt(num,vector3d)");
             CREATE_SLF(polytube, set_end_material__str__num, "set_end_material(str,num)");
@@ -12433,12 +12849,16 @@ void slc_manager::init()
         if (slc_manager_class_array == nullptr) {
             using array_t = std::decay_t<decltype(*slc_manager_class_array)>;
             slc_manager_class_array = new array_t {};
+#ifdef OPENUSM_XBPACK_V10
+            slc_manager_class_array->reserve(
+                sizeof(xbox_v10_function_counts) / sizeof(*xbox_v10_function_counts));
+#endif
         }
 
         register_standard_script_libs();
         chuck_register_script_libs();
 
-        if constexpr (1)
+        if constexpr (0)
         {
             printf("[");
 
@@ -12476,14 +12896,16 @@ void slc_manager::add(script_library_class *slc)
     if constexpr (1)
     {
 
-#if STANDALONE_SYSTEM
+#if STANDALONE_SYSTEM || defined(OPENUSM_XBPACK_V10)
         assert(slc_manager_classes != nullptr);
+#if STANDALONE_SYSTEM
         auto ret = slc_manager_classes->insert(slc);
         if ( !ret.second ) {
             auto name = slc->get_name();
             sp_log("slc already exists %s", name);
             assert(0);
         }
+#endif
 
         slc_manager_class_array->push_back(slc);
 
@@ -12526,7 +12948,11 @@ void slc_manager::kill()
         {
             for ( auto &slc : (*slc_manager_class_array) ) {
                 if ( slc != nullptr ) {
+#ifdef OPENUSM_XBPACK_V10
+                    mem_dealloc(slc, sizeof(*slc));
+#else
                     delete slc;
+#endif
                 }
             }
 
@@ -12584,6 +13010,19 @@ void slc_manager::un_mash_all_funcs()
         auto *image = bit_cast<char *>(resource_manager::get_resource(a1, nullptr, nullptr));
         assert(image != nullptr);
 
+        if constexpr (xbpack::v10) {
+            if (!has_layout(image, xbox_v10_function_counts)) {
+                assert(false && "v10 slc doesnt match list");
+                std::abort();
+            }
+            g_using_xbox_v14 = false;
+        } else {
+            g_using_xbox_v14 = has_layout(image, xbox_v14_function_counts);
+            if (g_using_xbox_v14) {
+                sp_log("Using v14 layout");
+            }
+        }
+
         assert(slc_manager_class_array != nullptr);
 
         auto total_classes = bit_cast<int *>(image)[0];
@@ -12607,6 +13046,11 @@ void slc_manager::un_mash_all_funcs()
     {
         CDECL_CALL(0x0059EC00);
     }
+}
+
+bool slc_manager::using_xbox_v14()
+{
+    return g_using_xbox_v14;
 }
 
 void slc_manager_patch()

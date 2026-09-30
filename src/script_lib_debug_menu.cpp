@@ -1,11 +1,17 @@
 #include "script_lib_debug_menu.h"
+#include "multiplayer_mode.h"
 
 #include "collide.h"
 #include "damage_interface.h"
 #include "debug_menu.h"
+#include "func_wrapper.h"
+#include "game.h"
+#include "game_process.h"
 #include "entity.h"
 #include "entity_base_vhandle.h"
 #include "entity_handle_manager.h"
+#include "event.h"
+#include "event_manager.h"
 #include "filespec.h"
 #include "local_collision.h"
 #include "mission_stack_manager.h"
@@ -30,6 +36,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -41,6 +48,122 @@ extern debug_menu *progression_menu;
 
 int vm_debug_menu_entry_garbage_collection_id = -1;
 
+void invalidate_v14_script_debug_menu_entries(script_instance *instance)
+{
+    // Also used by V10: its script-cleanup callback never removed rows, so
+    // every mission reload cloned the Script menu entries and the stale
+    // copies dispatched into the destroyed instance (abort on selection).
+#if defined(OPENUSM_XBPACK_MODE)
+    if (instance == nullptr) {
+        return;
+    }
+
+    unsigned int removed = 0;
+    const auto remove_owned_entries =
+        [instance, &removed](debug_menu *menu, bool owns_render_name) {
+        if (menu == nullptr || menu->entries == nullptr) {
+            return;
+        }
+
+        const DWORD old_used_slots = menu->used_slots;
+        const DWORD old_selected_index = old_used_slots == 0
+            ? 0
+            : std::min(menu->window_start + menu->cur_index,
+                       old_used_slots - 1);
+        DWORD mapped_selected_index = 0;
+        bool mapped_selected = false;
+        DWORD write_index = 0;
+        for (DWORD read_index = 0; read_index < old_used_slots; ++read_index)
+        {
+            auto &entry = menu->entries[read_index];
+            if (entry.field_14 == instance)
+            {
+                // Script-menu SLFs placement-construct the persistent name
+                // after the flat-array copy. Progression entries only retain
+                // their fixed text and therefore have no independently
+                // constructed destination mString to destroy.
+                if (owns_render_name) {
+                    entry.m_name.~mString();
+                }
+                std::memset(&entry, 0, sizeof(entry));
+                ++removed;
+                continue;
+            }
+
+            if (!mapped_selected && read_index >= old_selected_index) {
+                mapped_selected_index = write_index;
+                mapped_selected = true;
+            }
+
+            if (write_index != read_index)
+            {
+                // Relocate the surviving flat entry as bytes. Copying or
+                // destroying its mString here would duplicate ownership of
+                // the backing buffer.
+                std::memmove(&menu->entries[write_index],
+                             &entry,
+                             sizeof(entry));
+                std::memset(&entry, 0, sizeof(entry));
+            }
+            ++write_index;
+        }
+
+        if (write_index == old_used_slots) {
+            return;
+        }
+
+        menu->used_slots = write_index;
+        menu->highlighted = nullptr;
+        if (menu->used_slots == 0)
+        {
+            menu->window_start = 0;
+            menu->cur_index = 0;
+            if (current_menu == menu)
+            {
+                auto *fallback = menu->m_parent != nullptr
+                    ? menu->m_parent
+                    : debug_menu::root_menu;
+                if (fallback != nullptr && fallback != menu) {
+                    current_menu = fallback;
+                } else {
+                    debug_menu::hide();
+                }
+            }
+            return;
+        }
+
+        // Preserve the selected survivor. If it was removed, select the next
+        // survivor, or the final row when there is no row after it.
+        if (!mapped_selected) {
+            mapped_selected_index = menu->used_slots - 1;
+        }
+        constexpr DWORD kMenuPageSize = 18;
+        const DWORD max_window = menu->used_slots > kMenuPageSize
+            ? menu->used_slots - kMenuPageSize
+            : 0;
+        DWORD new_window = std::min(menu->window_start, max_window);
+        if (mapped_selected_index < new_window) {
+            new_window = mapped_selected_index;
+        } else if (mapped_selected_index >= new_window + kMenuPageSize) {
+            new_window = mapped_selected_index - kMenuPageSize + 1;
+        }
+        menu->window_start = new_window;
+        menu->cur_index = mapped_selected_index - new_window;
+    };
+
+    remove_owned_entries(script_menu, true);
+    remove_owned_entries(progression_menu, false);
+
+    if (removed != 0) {
+        sp_log("Xbox V14 debug menu removed %u expired script entr%s",
+               removed,
+               removed == 1 ? "y" : "ies");
+    }
+#else
+    (void) instance;
+#endif
+}
+
 // ----------------------------------------------------------------------
 //   Native handlers + XBSX-driven population of the Script debug menu.
 //
@@ -50,16 +173,16 @@ int vm_debug_menu_entry_garbage_collection_id = -1;
 //
 //       create_debug_menu_entry("Pop Character",      "pop_character(debug_menu_entry)");
 //       create_debug_menu_entry("Pop All Characters", "pop_all_characters(debug_menu_entry)");
-//       for ent_class in entities_with_prefix("ch_"):
-//           create_debug_menu_entry(strip_prefix(ent_class), "spawn_character(debug_menu_entry)");
+//       for pack_name in get_character_packname_list():
+//           create_debug_menu_entry(pack_name, "spawn_character(debug_menu_entry)");
 //
 //   We let the script run normally — that's how the per-character
-//   list stays accurate to whatever ch_* entity classes the build
-//   actually contains — but we intercept the three handler names it
-//   binds and reroute them to native C++ in
+//   list stays accurate to whatever CH_* packs the build actually
+//   contains — but we intercept handlers that need native
+//   behavior and reroute them to C++ in
 //   slf__create_debug_menu_entry below. That keeps the spawn /
 //   teardown path in C++ where we already track entities, without
-//   depending on the script bytecode for those three handlers being
+//   depending on the corresponding script bytecode being
 //   functional on this platform.
 // ----------------------------------------------------------------------
 
@@ -97,8 +220,11 @@ struct character_asset_candidate {
     std::string entity_name;
 };
 
-// Viewer packs occasionally use a class name different from the debug-menu
-// label.  City civilians also live in CITY_* packs rather than CH_VWR_*.
+// Some retail PC viewer packs use a class name different from the debug-menu
+// label. City civilians also live in CITY_* packs rather than CH_* packs.
+// OPENUSM_XBPACK_MODE filters the CH_VWR_* rows below: the Xbox archive has
+// gameplay CH_* packs and those contain the complete actor/AI data expected by
+// the Xbox character lineup.
 constexpr character_asset_alias kCharacterAssetAliases[] {
     {"alex_ohirn_prison",       "ch_vwr_alex_ohirn",                 "alex_ohirn"},
     {"beetle",                  "ch_vwr_beetle_viewer",              "beetle_viewer"},
@@ -124,16 +250,26 @@ constexpr character_asset_alias kCharacterAssetAliases[] {
     {"ped_male",                "city_arena",                        "ped_male"},
     {"peter_hooded",            "ch_vwr_peter_hooded_viewer",        "peter_hooded_viewer"},
     {"peter_hooded",            "peter_hooded",                      "peter_hooded"},
-    {"peter_parker",            "ch_vwr_peter_parker_viewer",        "peter_parker_viewer"},
+    // Prefer the gameplay actor so Parker has his combat state graph and can
+    // enter hit-react after taking damage.  Keep the viewer actor as a visual
+    // fallback for builds that do not contain the gameplay pack.
     {"peter_parker",            "peter_parker",                      "peter_parker"},
+    {"peter_parker",            "ch_vwr_peter_parker_viewer",        "peter_parker_viewer"},
     {"peter_shirtless",         "ch_vwr_peter_parker_viewer",        "peter_parker_viewer"},
     {"rhino_igc",               "s04_rhino_igc3",                   "rhino_igc"},
     {"rhino_igc",               "ch_vwr_rhino",                      "rhino"},
     {"shield_agent_jetpack",    "hot_pursuit_sable_pack",           "shield_agent_jetpack"},
     {"shield_agent_jetpack",    "ch_vwr_shield_agent",               "shield_agent"},
     {"shield_agent_test",       "ch_vwr_shield_agent",               "shield_agent"},
-    {"usm_peterhead",           "ch_vwr_ultimate_spiderman_vwr",     "ultimate_spiderman_vwr"},
-    {"usm_venomhand",           "ch_vwr_venom_viewer",               "venom_viewer"},
+    // These Xbox CH_* rows are model attachments, not complete actors. Route
+    // them to verified gameplay CH_* packs with compatible skeleton,
+    // animation, and AI data so every visible row creates a complete actor.
+    {"usm_peterhead",           "ch_peter_parker",                    "peter_parker"},
+    {"usm_venomhand",           "ch_venom_spider",                    "venom_spider"},
+    // Retail PC stores the same complete actors in non-CH packs. Keep these
+    // after the Xbox candidates so each platform retains its native layout.
+    {"usm_peterhead",           "peter_parker",                       "peter_parker"},
+    {"usm_venomhand",           "venom_spider",                       "venom_spider"},
     {"venom_eddie",             "pk_s13_ending_igc",                 "venom_eddie_lite"},
     {"venom_eddie",             "ch_vwr_venom_viewer",               "venom_viewer"},
     {"venom_spider",            "venom_spider",                      "venom_spider"},
@@ -170,6 +306,34 @@ bool &debug_character_pop_requested()
     return requested;
 }
 
+bool &debug_kill_hero_requested()
+{
+    static bool requested = false;
+    return requested;
+}
+
+void kill_current_hero()
+{
+    if ( g_world_ptr == nullptr ) {
+        return;
+    }
+
+    auto *hero = g_world_ptr->get_hero_ptr(0);
+    if ( hero == nullptr || !hero->has_damage_ifc() ) {
+        return;
+    }
+
+    auto *damage = hero->damage_ifc();
+    if ( damage == nullptr ) {
+        return;
+    }
+
+    // Match HealthVariable::setValue("0"): zero the current hit points and
+    // raise DESTROYED so the normal hero-death/failure flow runs as well.
+    damage->field_1FC.sub_48BFB0(0.0f);
+    event_manager::raise_event(event::DESTROYED, hero->get_my_handle());
+}
+
 void append_unique(std::vector<std::string> &values, const std::string &value)
 {
     if ( !value.empty()
@@ -202,9 +366,33 @@ std::string normalize_character_name(const char *name)
     return result;
 }
 
+bool is_xbox_attachment_row(const std::string &name)
+{
+#if defined(OPENUSM_XBPACK_MODE)
+    return name == "usm_peterhead" || name == "usm_venomhand";
+#else
+    (void) name;
+    return false;
+#endif
+}
+
 std::vector<std::string> get_entity_candidates(const std::string &name)
 {
     std::vector<std::string> result;
+
+    if ( is_xbox_attachment_row(name) )
+    {
+        for ( const auto &alias : kCharacterAssetAliases )
+        {
+            if ( name == alias.menu_name
+                 && std::strncmp(alias.pack_name, "ch_vwr_", 7u) != 0 )
+            {
+                append_unique(result, alias.entity_name);
+            }
+        }
+        return result;
+    }
+
     append_unique(result, name);
 
     if ( name.rfind("ch_", 0u) == 0u ) {
@@ -212,6 +400,16 @@ std::vector<std::string> get_entity_candidates(const std::string &name)
     } else {
         append_unique(result, std::string {"ch_"} + name);
     }
+
+#if !defined(OPENUSM_XBPACK_MODE)
+    // PC CHARACTER_LINEUP preserves VWR_ after removing CH_ so it can rebuild
+    // CH_VWR_* pack names. The actor inside those packs omits VWR_.
+    const std::string pack_suffix =
+        name.rfind("ch_", 0u) == 0u ? name.substr(3u) : name;
+    if ( pack_suffix.rfind("vwr_", 0u) == 0u ) {
+        append_unique(result, pack_suffix.substr(4u));
+    }
+#endif
 
     // Alias entities are deliberately not pooled here.  If (for example)
     // VENOM_VIEWER is already loaded, it must not steal a venom_spider request
@@ -243,11 +441,34 @@ std::vector<character_asset_candidate> get_asset_candidates(
 {
     std::vector<character_asset_candidate> result;
 
+    if ( is_xbox_attachment_row(name) )
+    {
+        for ( const auto &alias : kCharacterAssetAliases )
+        {
+            if ( name == alias.menu_name
+                 && std::strncmp(alias.pack_name, "ch_vwr_", 7u) != 0 )
+            {
+                append_asset_unique(
+                    result, alias.pack_name, alias.entity_name);
+            }
+        }
+        return result;
+    }
+
+    const std::string pack_suffix =
+        name.rfind("ch_", 0u) == 0u ? name.substr(3u) : name;
+    std::string entity_name = pack_suffix;
+#if !defined(OPENUSM_XBPACK_MODE)
+    if ( entity_name.rfind("vwr_", 0u) == 0u ) {
+        entity_name.erase(0u, 4u);
+    }
+#endif
+
     if ( name.rfind("ch_", 0u) == 0u ) {
-        append_asset_unique(result, name, name.substr(3u));
+        append_asset_unique(result, name, entity_name);
     } else {
         // This is the exact convention used by CHARACTER_LINEUP.XBSX.
-        append_asset_unique(result, std::string {"ch_"} + name, name);
+        append_asset_unique(result, std::string {"ch_"} + name, entity_name);
     }
 
     // Verified gameplay/city mappings and explicit viewer fallbacks are kept
@@ -255,15 +476,21 @@ std::vector<character_asset_candidate> get_asset_candidates(
     // a different candidate pack.
     for ( const auto &alias : kCharacterAssetAliases ) {
         if ( name == alias.menu_name ) {
+#if defined(OPENUSM_XBPACK_MODE)
+            if ( std::strncmp(alias.pack_name, "ch_vwr_", 7u) == 0 ) {
+                continue;
+            }
+#endif
             append_asset_unique(
                 result, alias.pack_name, alias.entity_name);
         }
     }
 
-    const std::string bare_name =
-        name.rfind("ch_", 0u) == 0u ? name.substr(3u) : name;
+    const std::string bare_name = entity_name;
+#if !defined(OPENUSM_XBPACK_MODE)
     append_asset_unique(
         result, std::string {"ch_vwr_"} + bare_name, bare_name);
+#endif
 
     if ( bare_name.rfind("gmu_", 0u) == 0u ) {
         append_asset_unique(
@@ -275,7 +502,8 @@ std::vector<character_asset_candidate> get_asset_candidates(
 
 bool find_entity_in_context(resource_pack_slot *context,
                             const std::vector<std::string> &candidates,
-                            std::string *resolved_name)
+                            std::string *resolved_name,
+                            const resource_key *required_owner = nullptr)
 {
     if ( context == nullptr || !context->is_pack_ready() ) {
         return false;
@@ -287,7 +515,10 @@ bool find_entity_in_context(resource_pack_slot *context,
             string_hash {candidate.c_str()}, RESOURCE_KEY_TYPE_ENTITY};
         int mash_size = 0;
         resource_pack_slot *owner = nullptr;
-        if ( context->get_resource(entity_key, &mash_size, &owner) != nullptr )
+        if ( context->get_resource(entity_key, &mash_size, &owner) != nullptr
+             && (required_owner == nullptr
+                 || (owner != nullptr
+                     && owner->get_name_key() == *required_owner)) )
         {
             if ( resolved_name != nullptr ) {
                 *resolved_name = candidate;
@@ -347,7 +578,68 @@ void destroy_debug_character(const debug_character_record &record)
     }
 }
 
-void release_debug_character_assets(bool clear_queue)
+bool debug_character_pack_is_used(const std::string &pack)
+{
+    const auto &entities = debug_character_entities();
+    return std::any_of(
+        entities.begin(), entities.end(),
+        [&pack](const debug_character_record &record) {
+            return record.owned_pack == pack;
+        });
+}
+
+void release_unused_debug_character_packs()
+{
+    auto &packs = debug_character_owned_packs();
+    if ( packs.empty() || resource_manager::partitions == nullptr ) {
+        return;
+    }
+
+    auto *stack = mission_stack_manager::s_inst;
+    auto *mission_partition =
+        resource_manager::get_partition_pointer(RESOURCE_PARTITION_MISSION);
+    if ( stack == nullptr || mission_partition == nullptr
+         || stack->waiting_for_push_or_pop() )
+    {
+        return;
+    }
+
+    auto &slots = mission_partition->get_pack_slots();
+    while ( !packs.empty() && !slots.empty() )
+    {
+        auto *top = slots.back();
+        if ( top == nullptr || !top->is_pack_ready() ) {
+            return;
+        }
+
+        const auto top_key = top->get_name_key();
+        const auto owned = std::find_if(
+            packs.begin(), packs.end(),
+            [&top_key](const std::string &pack) {
+                const resource_key pack_key {
+                    string_hash {pack.c_str()}, RESOURCE_KEY_TYPE_PACK};
+                return pack_key == top_key;
+            });
+        if ( owned == packs.end() || debug_character_pack_is_used(*owned) ) {
+            return;
+        }
+
+        mString pack_name {owned->c_str()};
+        if ( !stack->is_pack_pushed(pack_name) ) {
+            packs.erase(owned);
+            continue;
+        }
+
+        // Mission parents are a strict LIFO stack. Only pop an unused debug
+        // pack when it is the actual top slot; a mission pack pushed later
+        // must never be removed on its behalf.
+        stack->pop_mission_pack_immediate(pack_name, pack_name);
+        packs.erase(owned);
+    }
+}
+
+void release_debug_character_assets(bool clear_queue,
+                                    bool forget_blocked_packs = false)
 {
     auto &entities = debug_character_entities();
     if ( g_world_ptr != nullptr )
@@ -359,19 +651,13 @@ void release_debug_character_assets(bool clear_queue)
     }
     entities.clear();
 
-    auto *stack = mission_stack_manager::s_inst;
     auto &packs = debug_character_owned_packs();
-    if ( stack != nullptr && !stack->waiting_for_push_or_pop() )
-    {
-        for ( auto it = packs.rbegin(); it != packs.rend(); ++it )
-        {
-            mString pack_name {it->c_str()};
-            if ( stack->is_pack_pushed(pack_name) ) {
-                stack->pop_mission_pack_immediate(pack_name, pack_name);
-            }
-        }
+    release_unused_debug_character_packs();
+    if ( forget_blocked_packs ) {
+        // World teardown owns every remaining mission slot. Do not retain
+        // names whose slots are about to be destroyed by the stock unload.
+        packs.clear();
     }
-    packs.clear();
 
     if ( clear_queue ) {
         debug_character_spawn_queue().clear();
@@ -393,26 +679,7 @@ void release_one_debug_character()
         return;
     }
 
-    const bool still_used = std::any_of(
-        entities.begin(), entities.end(),
-        [&record](const debug_character_record &other) {
-            return other.owned_pack == record.owned_pack;
-        });
-    if ( still_used ) {
-        return;
-    }
-
-    auto *stack = mission_stack_manager::s_inst;
-    mString pack_name {record.owned_pack.c_str()};
-    if ( stack != nullptr && !stack->waiting_for_push_or_pop()
-         && stack->is_pack_pushed(pack_name) )
-    {
-        stack->pop_mission_pack_immediate(pack_name, pack_name);
-    }
-
-    auto &packs = debug_character_owned_packs();
-    packs.erase(std::remove(packs.begin(), packs.end(), record.owned_pack),
-                packs.end());
+    release_unused_debug_character_packs();
 }
 
 bool pack_is_available(const std::string &pack_name,
@@ -442,6 +709,9 @@ resource_pack_slot *load_character_context(
         return nullptr;
     }
 
+    // Preserve the verified gameplay/alias order. A pushed gameplay pack must
+    // not lose to a later viewer fallback merely because the viewer would be
+    // owned independently by this menu.
     for ( const auto &asset : asset_candidates )
     {
         const auto &pack = asset.pack_name;
@@ -451,13 +721,15 @@ resource_pack_slot *load_character_context(
         }
 
         mString pack_name {pack.c_str()};
+        const resource_key pack_key {
+            string_hash {pack.c_str()}, RESOURCE_KEY_TYPE_PACK};
         const bool already_pushed = stack->is_pack_pushed(pack_name);
         if ( !already_pushed )
         {
             if ( !mission_partition->has_room_for_slot(location.loc.m_size) )
             {
-                // Debug-owned character packs are disposable.  Releasing the
-                // existing lineup is safer than overflowing the mission stack.
+                // Debug-owned character packs are disposable. Releasing the
+                // existing lineup is safer than overflowing the stack.
                 if ( !debug_character_owned_packs().empty() ) {
                     release_debug_character_assets(false);
                 }
@@ -479,10 +751,21 @@ resource_pack_slot *load_character_context(
             continue;
         }
 
-        auto *context =
-            resource_manager::get_best_context(RESOURCE_PARTITION_MISSION);
+        // Resolve through the exact slot so a same-named entity from a
+        // different viewer or mission pack cannot win the lookup.
+        resource_pack_slot *context = nullptr;
+        for ( auto *slot : mission_partition->get_pack_slots() )
+        {
+            if ( slot != nullptr && slot->is_pack_ready()
+                 && slot->get_name_key() == pack_key )
+            {
+                context = slot;
+                break;
+            }
+        }
         const std::vector<std::string> exact_entity {asset.entity_name};
-        if ( find_entity_in_context(context, exact_entity, resolved_entity) )
+        if ( find_entity_in_context(
+                context, exact_entity, resolved_entity, &pack_key) )
         {
             if ( !already_pushed && newly_owned_pack != nullptr ) {
                 *newly_owned_pack = pack;
@@ -529,26 +812,36 @@ bool spawn_debug_character(const debug_character_spawn_request &request)
         return false;
     }
 
+#if !defined(OPENUSM_XBPACK_MODE)
+    const auto entity_candidates = get_entity_candidates(display_name);
+#endif
+    const auto asset_candidates = get_asset_candidates(display_name);
+
+    // Pack parents are a strict LIFO stack.  Make room before loading a new
+    // character so the previous newest debug pack is still the top parent
+    // when it is removed.  Evicting after a replacement push would attempt a
+    // non-LIFO parent removal and corrupt the mission directory.
     if ( debug_character_entities().size() >= kMaxLiveDebugCharacters )
     {
         printf("[CharList] lineup limit reached; replacing the newest character\n");
         release_one_debug_character();
     }
 
-    const auto entity_candidates = get_entity_candidates(display_name);
-    const auto asset_candidates = get_asset_candidates(display_name);
     std::string resolved_entity;
     std::string newly_owned_pack;
-    resource_pack_slot *context =
-        find_loaded_character_context(entity_candidates, &resolved_entity);
-
-    if ( context == nullptr )
-    {
-        context = load_character_context(
-            asset_candidates,
-            &resolved_entity,
-            &newly_owned_pack);
+    // Prefer an exact installable pack so the actor has a pack lifetime owned
+    // by this menu. PC falls back to an existing context only for resources
+    // (such as base city actors) that have no independent candidate pack.
+    resource_pack_slot *context = load_character_context(
+        asset_candidates,
+        &resolved_entity,
+        &newly_owned_pack);
+#if !defined(OPENUSM_XBPACK_MODE)
+    if ( context == nullptr ) {
+        context = find_loaded_character_context(
+            entity_candidates, &resolved_entity);
     }
+#endif
 
     if ( context == nullptr )
     {
@@ -633,6 +926,7 @@ bool spawn_debug_character(const debug_character_spawn_request &request)
     if ( associated_pack.empty() ) {
         associated_pack = find_owned_pack_for_assets(asset_candidates);
     }
+
     debug_character_entities().push_back(debug_character_record {
         new_ent->get_my_vhandle(), associated_pack});
     if ( !newly_owned_pack.empty() ) {
@@ -679,7 +973,14 @@ void queue_debug_character_pop()
 
 void process_debug_character_spawn_queue()
 {
+    if ( debug_kill_hero_requested() )
+    {
+        debug_kill_hero_requested() = false;
+        kill_current_hero();
+    }
+
     auto *stack = mission_stack_manager::s_inst;
+    release_unused_debug_character_packs();
     if ( debug_character_cleanup_requested() )
     {
         if ( stack != nullptr && stack->waiting_for_push_or_pop() ) {
@@ -717,10 +1018,50 @@ void process_debug_character_spawn_queue()
 
 void clear_debug_character_spawns()
 {
+    multiplayer_mode_world_shutdown();
+    debug_kill_hero_requested() = false;
     debug_character_cleanup_requested() = false;
     debug_character_pop_requested() = false;
-    release_debug_character_assets(true);
+    release_debug_character_assets(true, true);
 }
+
+namespace {
+
+// Drain deferred resource work at the stock game-tick boundary. The arena owns
+// its simulation while a loaded story world stays intact underneath it.
+void __fastcall debug_character_spawner_frame_advance(
+    void *self,
+    void *,
+    Float time_inc)
+{
+    // Defer debug resource mutations until the isolated versus session ends.
+    if (!multiplayer_mode_active()) process_debug_character_spawn_queue();
+    multiplayer_mode_tick_before(static_cast<float>(time_inc));
+
+    using stock_frame_advance_t = void (__fastcall *)(
+        void *, void *, Float);
+    auto stock_frame_advance =
+        bit_cast<stock_frame_advance_t>(0x0055D780);
+    bool hold_story_world = false;
+    if (multiplayer_mode_blocks_world() && g_game_ptr != nullptr
+        && self == g_game_ptr && g_world_ptr != nullptr
+        && g_game_ptr->the_world == g_world_ptr
+        && g_game_ptr->flag.level_is_loaded
+        && g_world_ptr->the_terrain != nullptr
+        && g_game_ptr->process_stack.size() != 0)
+    {
+        const auto state = g_game_ptr->get_cur_state();
+        hold_story_world = state == game_state::RUNNING || state == game_state::PAUSED;
+    }
+    // The retail function derives simulation time internally, so dt=0 would
+    // still advance missions/AI. Input and resource streaming run before this
+    // call; rendering runs in the app's separate render branch. Keep native
+    // loading/frontend transitions live and preserve existing pause ownership.
+    if (!hold_story_world) stock_frame_advance(self, nullptr, time_inc);
+    multiplayer_mode_tick_after(static_cast<float>(time_inc));
+}
+
+} // namespace
 
 // Remove the most recently spawned character and then release its pack if no
 // remaining debug character uses it.
@@ -748,6 +1089,15 @@ static void native_character_select_handler(debug_menu_entry *entry)
     debug_menu::hide();
 }
 
+// The Xbox v10 debug scripts create this entry, but its script handler does
+// not execute correctly through the PC VM bridge.  Defer the death action out
+// of the menu/resource callback, just like character pack work is deferred.
+static void native_kill_hero_handler(debug_menu_entry *)
+{
+    debug_kill_hero_requested() = true;
+    debug_menu::hide();
+}
+
 // ----------------------------------------------------------------------
 // Native dispatch table. When the XBSX's construct method asks the
 // engine to bind a script handler to a menu entry, slf__create_debug_menu_entry
@@ -768,6 +1118,7 @@ constexpr native_script_handler_t kNativeScriptHandlers[] {
     { "pop_character(debug_menu_entry)",      native_pop_character_handler      },
     { "pop_all_characters(debug_menu_entry)", native_pop_all_characters_handler },
     { "spawn_character(debug_menu_entry)",    native_character_select_handler   },
+    { "kill_hero(debug_menu_entry)",          native_kill_hero_handler           },
 };
 
 bool try_install_native_handler(debug_menu_entry *entry, const char *name)
@@ -777,6 +1128,11 @@ bool try_install_native_handler(debug_menu_entry *entry, const char *name)
     }
     for ( const auto &h : kNativeScriptHandlers ) {
         if ( std::strcmp(name, h.handler_name) == 0 ) {
+            // Replace only dispatch. V14's one-argument create SLF already
+            // records the producing instance in field_14; retaining that
+            // lifecycle owner lets runlevel teardown remove native lineup
+            // rows before the script is loaded again, just like Xbox.
+            entry->field_18 = -1;
             entry->m_game_flags_handler = h.fn;
             return true;
         }
@@ -785,6 +1141,12 @@ bool try_install_native_handler(debug_menu_entry *entry, const char *name)
 }
 
 } // namespace
+
+bool install_native_debug_menu_handler(debug_menu_entry *entry,
+                                       const char *handler_name)
+{
+    return try_install_native_handler(entry, handler_name);
+}
 
 // ----------------------------------------------------------------------
 // Load pk_character_lineup.{xbsx,pcsx}.
@@ -805,9 +1167,8 @@ bool try_install_native_handler(debug_menu_entry *entry, const char *name)
 //     there.
 //
 // During construct, the XBSX calls slf__create_debug_menu_entry once
-// per entry. Our hook in that SLF reroutes the three known handler
-// names (pop_character / pop_all_characters / spawn_character) to
-// native code via try_install_native_handler.
+// per entry. Our hook in that SLF reroutes known handlers to native
+// code via try_install_native_handler.
 // ----------------------------------------------------------------------
 static bool load_pk_character_lineup_script()
 {
@@ -855,9 +1216,10 @@ void init_script_debug_menu()
 {
     if ( script_menu == nullptr )
     {
-        script_menu = new debug_menu {"Script", (DWORD)debug_menu::sort_mode_t::undefined};
-
-        progression_menu = new debug_menu {"Progression", (DWORD)debug_menu::sort_mode_t::undefined};
+        script_menu = create_menu(
+            "Script", debug_menu::sort_mode_t::undefined);
+        progression_menu = create_menu(
+            "Progression", debug_menu::sort_mode_t::undefined);
 
         debug_menu::root_menu->add_entry(script_menu);
         debug_menu::root_menu->add_entry(progression_menu);
@@ -891,8 +1253,94 @@ void vm_debug_menu_entry_garbage_collection_callback(script_executable *,
 void construct_debug_menu_lib()
 {
     if ( vm_debug_menu_entry_garbage_collection_id == -1 ) {
-        vm_debug_menu_entry_garbage_collection_id = script_manager::register_allocated_stuff_callback(vm_debug_menu_entry_garbage_collection_callback);
+#ifdef OPENUSM_XBPACK_V10
+        vm_debug_menu_entry_garbage_collection_id = CDECL_CALL(
+            0x005AFE40,
+            vm_debug_menu_entry_garbage_collection_callback);
+#elif !defined(OPENUSM_XBPACK_MODE)
+        vm_debug_menu_entry_garbage_collection_id = script_manager::register_allocated_stuff_callback(
+            vm_debug_menu_entry_garbage_collection_callback);
+#endif
     }
+}
+
+slf__create_debug_menu_entry__str__t::slf__create_debug_menu_entry__str__t(const char *a3) : function(a3)
+{
+    m_vtbl = CAST(m_vtbl, 0x0089C704);
+    FUNC_ADDRESS(address, &slf__create_debug_menu_entry__str__t::operator());
+    m_vtbl->__cl = CAST(m_vtbl->__cl, address);
+}
+
+bool slf__create_debug_menu_entry__str__t::operator()(vm_stack &stack, [[maybe_unused]]script_library_class::function::entry_t entry) const
+{
+    TRACE("slf__create_debug_menu_entry__str__t::operator()");
+
+#ifdef OPENUSM_XBPACK_MODE
+    SLF_PARMS;
+
+    init_script_debug_menu();
+    assert(script_menu != nullptr);
+
+    debug_menu_entry menu_entry {};
+    menu_entry.entry_type = debug_menu_entry_type::dUNDEFINED;
+    std::strncpy(menu_entry.text, parms->str0, MAX_CHARS_SAFE);
+    menu_entry.text[MAX_CHARS_SAFE] = '\0';
+
+    auto *thread = stack.get_thread();
+    // The one-argument form is used by transient tools such as
+    // CHARACTER_VIEWER. Tag its flat entry with the creating instance so the
+    // destructor hook can remove it instead of leaving inert *_face_morph
+    // rows mixed into the Xbox character lineup.
+    menu_entry.field_14 = thread->get_instance();
+    menu_entry.field_18 = -1;
+    auto *result = static_cast<debug_menu_entry *>(
+        add_debug_menu_entry(script_menu, &menu_entry));
+
+    auto *script = thread->get_executable()->get_owner()->get_parent();
+    mString source {};
+    if (result == nullptr) {
+        sp_log("Failed to add Xbox script debug-menu entry: %s",
+               parms->str0 != nullptr ? parms->str0 : "<null>");
+    } else {
+        // The PC menu stores entries in a flat array. Set the render name on
+        // that persistent copy, not on the temporary whose mString is
+        // destroyed when this SLF returns.
+        new (&result->m_name) mString {parms->str0};
+
+#ifdef OPENUSM_XBPACK_V10
+        if (vm_debug_menu_entry_garbage_collection_id < 0) {
+            sp_log("Xbox debug-menu allocation type was not registered; "
+                   "keeping entry without script cleanup: %s",
+                   parms->str0 != nullptr ? parms->str0 : "<null>");
+        } else {
+            THISCALL(
+                0x005A34B0,
+                script,
+                vm_debug_menu_entry_garbage_collection_id,
+                int(result),
+                &source);
+        }
+#else
+        // V14 entries live in the PC menu's flat storage. Registering those
+        // addresses in the stock script cleanup list crosses the injected
+        // MinGW allocator with the game's MSVC 7.1 deallocator at runlevel
+        // teardown, so keep the persistent menu copies out of that list.
+        static bool logged_persistent_entries = false;
+        if (!logged_persistent_entries) {
+            sp_log("Xbox V14 debug-menu entries use persistent PC menu storage");
+            logged_persistent_entries = true;
+        }
+        (void) script;
+        (void) source;
+#endif
+    }
+
+    SLF_RETURN;
+    SLF_DONE;
+#else
+    bool (__fastcall *func)(const void *, void *, vm_stack *, entry_t) = CAST(func, 0x0067C1E0);
+    return func(this, nullptr, &stack, entry);
+#endif
 }
 
 slf__create_debug_menu_entry__str__str__t::slf__create_debug_menu_entry__str__str__t(const char *a3) : function(a3)
@@ -913,8 +1361,10 @@ bool slf__create_debug_menu_entry__str__str__t::operator()(vm_stack &stack, [[ma
         init_script_debug_menu();
         assert(script_menu != nullptr);
 
-        mString v14 {parms->str0};
-        auto *result = new debug_menu_entry {v14};
+        debug_menu_entry menu_entry {};
+        menu_entry.entry_type = debug_menu_entry_type::dUNDEFINED;
+        std::strncpy(menu_entry.text, parms->str0, MAX_CHARS_SAFE);
+        menu_entry.text[MAX_CHARS_SAFE] = '\0';
 
         auto *nt = stack.get_thread();
 
@@ -925,12 +1375,21 @@ bool slf__create_debug_menu_entry__str__str__t::operator()(vm_stack &stack, [[ma
         // hit the native path here, so the spawn / pop logic stays
         // in C++ regardless of whether the script bytecode for those
         // handlers is functional on this platform.
-        if ( !try_install_native_handler(result, parms->str1) )
+        if ( try_install_native_handler(&menu_entry, parms->str1) )
+        {
+            // Native dispatch (field_18 == -1) ignores field_14; keep the
+            // producing instance as the row's owner so teardown removes it.
+            menu_entry.field_14 = nt->get_instance();
+        }
+        else
         {
             mString v15 {parms->str1};
             auto *v4 = nt->get_instance();
-            result->set_script_handler(v4, v15);
+            menu_entry.set_script_handler(v4, v15);
         }
+
+        auto *result = static_cast<debug_menu_entry *>(
+            add_debug_menu_entry(script_menu, &menu_entry));
 
         // Garbage-collection bookkeeping is unchanged: register the
         // entry against the owning script_object so reload / teardown
@@ -942,8 +1401,28 @@ bool slf__create_debug_menu_entry__str__str__t::operator()(vm_stack &stack, [[ma
         auto *so = v6->get_owner();
         auto *v8 = so->get_parent();
 
-        v8->add_allocated_stuff(v10, v11, v16);
-        script_menu->add_entry(result);
+        if (result == nullptr) {
+            sp_log("Failed to add Xbox script debug-menu entry: %s",
+                   parms->str0 != nullptr ? parms->str0 : "<null>");
+        } else {
+            new (&result->m_name) mString {parms->str0};
+
+#if defined(OPENUSM_XBPACK_MODE) && !defined(OPENUSM_XBPACK_V10)
+            static bool logged_persistent_entries = false;
+            if (!logged_persistent_entries) {
+                sp_log("Xbox V14 debug-menu entries use persistent PC menu storage");
+                logged_persistent_entries = true;
+            }
+#else
+            if (v10 < 0) {
+                sp_log("Xbox debug-menu allocation type was not registered; "
+                       "keeping entry without script cleanup: %s",
+                       parms->str0 != nullptr ? parms->str0 : "<null>");
+            } else {
+                v8->add_allocated_stuff(v10, v11, v16);
+            }
+#endif
+        }
 
         SLF_RETURN;
         SLF_DONE;
@@ -955,7 +1434,75 @@ bool slf__create_debug_menu_entry__str__str__t::operator()(vm_stack &stack, [[ma
     }
 }
 
+slf__create_progression_menu_entry__str__str__t::slf__create_progression_menu_entry__str__str__t(const char *a3) : function(a3)
+{
+    m_vtbl = CAST(m_vtbl, 0x0089C714);
+    FUNC_ADDRESS(address, &slf__create_progression_menu_entry__str__str__t::operator());
+    m_vtbl->__cl = CAST(m_vtbl->__cl, address);
+}
+
+bool slf__create_progression_menu_entry__str__str__t::operator()(vm_stack &stack, [[maybe_unused]]script_library_class::function::entry_t entry) const
+{
+    TRACE("slf__create_progression_menu_entry__str__str__t::operator()");
+
+    SLF_PARMS;
+
+    init_script_debug_menu();
+    assert(progression_menu != nullptr);
+
+    debug_menu_entry menu_entry {parms->str0};
+    menu_entry.set_script_handler(stack.get_thread()->get_instance(), mString {parms->str1});
+    progression_menu->add_entry(&menu_entry);
+
+    int result = 0;
+    SLF_RETURN;
+    SLF_DONE;
+}
+
+#if defined(OPENUSM_XBPACK_MODE)
+namespace {
+
+// The prerelease executable still destroys some instances through its stock
+// destructor at 0x005AD7A0. Intercept its first callback call while `this` is
+// intact, invalidate persistent PC menu bindings, then preserve the original
+// callback behavior unchanged.
+void __fastcall v14_script_instance_destructor_callbacks(
+    script_instance *instance,
+    void *,
+    script_instance_callback_reason_t reason,
+    vm_thread *thread)
+{
+    using stock_run_callbacks_t = void (__fastcall *)(
+        script_instance *,
+        void *,
+        script_instance_callback_reason_t,
+        vm_thread *);
+    auto stock_run_callbacks = bit_cast<stock_run_callbacks_t>(0x0059EC70);
+    stock_run_callbacks(instance, nullptr, reason, thread);
+    // Destruction callbacks may still inspect their menu entries. Compact the
+    // persistent flat arrays only after those callbacks have completed.
+    invalidate_v14_script_debug_menu_entries(instance);
+}
+
+} // namespace
+#endif
+
 void script_lib_debug_menu_patch()
 {
-    REDIRECT(0x0089C710, construct_debug_menu_lib);
+    // 0x0089C710 is a four-byte vtable slot, not a CALL site. A five-byte
+    // REDIRECT here corrupts the next function's destructor at 0x0089C714.
+    // Retail initializes through the client-library CALL at 0x005AD77D;
+    // XBPACK calls construct_debug_menu_lib directly during setup.
+
+    // CALL game::frame_advance from the stock application tick.  Character
+    // menu callbacks only enqueue work; this post-callback seam performs pack
+    // pushes, entity creation, and Pop actions outside resource-manager input.
+    REDIRECT(0x005D70B8, debug_character_spawner_frame_advance);
+
+#if defined(OPENUSM_XBPACK_MODE)
+    // CALL script_instance::run_callbacks inside the stock instance dtor.
+    // A call-site hook avoids replacing or reimplementing the surrounding
+    // stock teardown and its exception-unwind bookkeeping.
+    REDIRECT(0x005AD7CE, v14_script_instance_destructor_callbacks);
+#endif
 }

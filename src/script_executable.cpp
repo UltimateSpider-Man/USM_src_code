@@ -18,6 +18,9 @@
 #include "utility.h"
 #include "variables.h"
 #include "vm_executable.h"
+#ifdef OPENUSM_XBPACK_V10
+#include "xbpack_v10_s07_web.h"
+#endif
 
 #include <cassert>
 
@@ -219,7 +222,11 @@ void script_executable::info_t::un_mash(
         rebase(a5->field_0, 4u);
 
         this->field_8 = bit_cast<vm_executable *>(a5->field_0);
+#ifdef OPENUSM_XBPACK_V10
+        a5->field_0 += sizeof(vm_executable) + sizeof(uint32_t);
+#else
         a5->field_0 += sizeof(vm_executable);
+#endif
 
         assert(((int)header) % 4 == 0);
 
@@ -239,57 +246,57 @@ void script_executable::un_mash(generic_mash_header *header, void *a3, generic_m
         }
         else 
         {
+#ifndef OPENUSM_XBPACK_V10
             assert(script_object_dummy_list == nullptr);
-            
+#endif
+
             rebase(a4->field_0, 4u);
 
-            auto *const start_debug = a4->field_0;
-            const int serializedImageSize = this->sx_exe_image_size;
-            const bool convertedPS2SX = modPS2SXIsRuntimeImage(header);
+#ifndef OPENUSM_XBPACK_V10
+            static auto *start_debug = a4->field_0;
+#endif
 
-            [this, &a4, convertedPS2SX]() {
-                // A converted PS2SX image already contains translated beta
-                // bytecode.  A coincidental scripts/<name>.pcsxl beside the
-                // game must not replace it with a different ABI image.
+            [this, &a4]() {
+#ifndef OPENUSM_XBPACK_V10
                 if constexpr (1)
                 {
-                    if (!convertedPS2SX)
+                    filespec v98 {mString {this->field_0.to_string()}};
+                    v98.m_dir = mString {"scripts\\"};
+                    v98.m_ext = mString {".pc"} + "sxl";
+
+                    os_file v85 {};
+                    v85.open(v98.fullname(), os_file::FILE_READ);
+                    if ( v85.is_open() )
                     {
-                        filespec v98 {mString {this->field_0.to_string()}};
-                        v98.m_dir = mString {"scripts\\"};
-                        v98.m_ext = mString {".pc"} + "sxl";
+                        sp_log("found pcsxl file %s", v98.fullname().c_str());
+                        this->sx_exe_image_size = v85.get_size();
+                        this->sx_exe_image = new uint16_t[this->sx_exe_image_size / 2];
+                        assert(sx_exe_image != nullptr);
 
-                        os_file v85 {};
-                        v85.open(v98.fullname(), os_file::FILE_READ);
-                        if ( v85.is_open() )
-                        {
-                            sp_log("found pcsxl file %s", v98.fullname().c_str());
-                            this->sx_exe_image_size = v85.get_size();
-                            this->sx_exe_image = new uint16_t[this->sx_exe_image_size / 2];
-                            assert(sx_exe_image != nullptr);
-
-                            v85.read(this->sx_exe_image, this->sx_exe_image_size);
-                            return;
-                        }
+                        v85.read(this->sx_exe_image, this->sx_exe_image_size);
+                        return;
                     }
                 }
+#endif
 
                 this->sx_exe_image = CAST(this->sx_exe_image, a4->field_0);
             }();
 
-            // The cursor belongs to the serialized mash, even when the
-            // optional .pcsxl branch above changes the runtime image size.
-            assert(serializedImageSize >= 0);
-            a4->field_0 += serializedImageSize;
+            a4->field_0 += this->sx_exe_image_size;
 
             rebase(a4->field_0, 4u);
 
+#ifndef OPENUSM_XBPACK_V10
             sp_log("0x%08X", sx_exe_image_size);
             sp_log("offset = 0x%08X", a4->field_0 - start_debug);
+#endif
 
             this->script_objects = a4->get<script_object *>(this->total_script_objects);
 
+#ifndef OPENUSM_XBPACK_V10
             sp_log("offset = 0x%08X", a4->field_0 - start_debug);
+#endif
+
             for ( auto i = 0; i < this->total_script_objects; ++i )
             {
                 rebase(a4->field_0, 8u);
@@ -367,6 +374,9 @@ void script_executable::un_mash(generic_mash_header *header, void *a3, generic_m
             this->constructor_common();
             this->flags |= SCRIPT_EXECUTABLE_FLAG_UN_MASHED;
         }
+#ifdef OPENUSM_XBPACK_V10
+        xbpack_v10_s07_web_unmash(this);
+#endif
     }
     else
     {

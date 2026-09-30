@@ -153,17 +153,57 @@ void pause_menu_root::_Load()
         this->field_A8->SetText(static_cast<global_text_enum>(255));
         this->field_A8->SetNoFlash(color32 {0xFFC87238});
 
-		// Labels in menu order (must match OnCross field_B0 dispatch).
+        // Labels in menu order (must match OnCross field_B0 dispatch).
+#ifdef OPENUSM_XBPACK_V10
+        // Use the requested English captions for this layout, not guessed
+        // indices into the converted v10 global-text table.
+        static constexpr const char *v10_labels[] = {
+            "EXIT MISSION",  // 1
+            "CITY GOALS",    // 2
+            "AWARDS",        // 3
+            "GAME STATS",    // 4
+            "SAVE GAME",     // 5
+            "LOAD GAME",     // 6
+            "OPTIONS",       // 7
+            "MESSAGE LOG",   // 8
+            "UNLOCKABLES"    // 9
+        };
+        static_assert(sizeof(v10_labels) / sizeof(v10_labels[0]) ==
+                      sizeof(this->field_78) / sizeof(this->field_78[0]),
+                      "V10 pause-menu captions must match the widget count");
+
+        for (unsigned i = 0; i < 9u; ++i)
+        {
+            if (this->field_78[i] != nullptr)
+            {
+                // Copy into the widget-owned mString.  The native
+                // SetTextNoLocalize destroys its by-value mString argument;
+                // passing a shallow FEText::string copy of a local mString
+                // would leave that local owning already-freed storage.
+                this->field_78[i]->field_1C = v10_labels[i];
+            }
+        }
+#else
+#ifdef OPENUSM_XBPACK_MODE
+        // Xbox v14 has 478 global-text entries. 506 is script text and
+        // SetText(global_text_enum) therefore resolves it to the error label.
+        this->field_78[0]->SetText(static_cast<global_text_enum>(265));  // 1 EXIT MISSION
+#else
         this->field_78[0]->SetText(static_cast<global_text_enum>(506));  // 1 EXIT MISSION
+#endif
         this->field_78[1]->SetText(static_cast<global_text_enum>(275));  // 2 CITY GOALS
         this->field_78[2]->SetText(static_cast<global_text_enum>(91));   // 3 AWARDS
         this->field_78[3]->SetText(static_cast<global_text_enum>(92));   // 4 GAME STATS
         this->field_78[4]->SetText(static_cast<global_text_enum>(260));  // 5 SAVE GAME
         this->field_78[5]->SetText(static_cast<global_text_enum>(258));  // 6 LOAD GAME
         this->field_78[6]->SetText(static_cast<global_text_enum>(259));  // 7 OPTIONS
+#ifdef OPENUSM_XBPACK_MODE
+        this->field_78[7]->SetText(static_cast<global_text_enum>(273));  // 8 MESSAGE LOG
+#else
         this->field_78[7]->SetText(static_cast<global_text_enum>(265));  // 8 MESSAGE LOG
+#endif
         this->field_78[8]->SetText(static_cast<global_text_enum>(263));  // 9 UNLOCKABLES
-
+#endif
 
         auto v8 = this->field_78[0]->GetX();
         auto v9 = this->field_78[0]->GetY();
@@ -1228,10 +1268,46 @@ void pause_menu_root::sub_61C520()
 	 THISCALL(0x0061C520,this);
 }
 
+// pause_menu_root::Draw reads g_world->hero->controller while Continue/debug
+// loads are still switching worlds.  The stock code has no null checks in
+// either resource format.  Preserve its venom test when the chain exists and
+// select the normal backplate during the short loading gap otherwise.
+extern "C" __attribute__((naked, used)) void pause_menu_backplate_hook()
+{
+    __asm__ volatile(
+        "mov eax, [0x0095C770]\n\t"
+        "test eax, eax\n\t"
+        "jz 1f\n\t"
+        "mov ecx, [eax + 0x230]\n\t"
+        "test ecx, ecx\n\t"
+        "jz 1f\n\t"
+        "mov edx, [ecx + 0x8C]\n\t"
+        "test edx, edx\n\t"
+        "jz 1f\n\t"
+        "cmp dword ptr [edx + 0x420], 2\n\t"
+        "push 0x0061C402\n\t"
+        "ret\n\t"
+        "1:\n\t"
+        "or eax, 1\n\t"
+        "push 0x0061C402\n\t"
+        "ret\n\t");
+}
+
 
 
 
 void pause_menu_root_patch() {
+    SET_JUMP(0x0061C3EA, pause_menu_backplate_hook);
+
+#ifdef OPENUSM_XBPACK_V10
+    // The active renderer is still the native Draw at 0x0061BF80, not the
+    // unhooked C++ replacement.  Its legacy EXIT label occupies field_78[7] (+0x94),
+    // so it overwrites our MESSAGE LOG every frame with text 265 or 266.
+    // Skip just that label-selection block; keep the native renderer,
+    // backplate safety hook, highlighting, dialogs and visibility rules.
+    // _Load now owns the nine captions, with EXIT MISSION at field_78[0].
+    SET_JUMP(0x0061C142, 0x0061C197);
+#endif
 
     {
         FUNC_ADDRESS(address, &pause_menu_root::_Load);

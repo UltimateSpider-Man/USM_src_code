@@ -25,6 +25,8 @@
 
 #include <cassert>
 #include <cfloat>
+#include <chrono>
+#include <cstring>
 
 VALIDATE_SIZE(mission_manager, 0x100u);
 
@@ -372,6 +374,50 @@ void mission_manager::sub_5BAC00() {
     THISCALL(0x005BAC00, this);
 }
 
+#ifdef OPENUSM_XBPACK_V10
+namespace {
+
+// V10 mission scripts end holding the screen black (script blackscreen_on)
+// and leave the fade-in to what follows.  On PC nothing follows once the
+// script has unloaded, so the "PLEASE WAIT..." black screen stayed up (about
+// a minute after v01_feeding_time).  Fade back in once the screen has been
+// held black for a moment with no mission script loaded, loading or unloading.
+// Wall-clock: the held black screen freezes the hero and game time, so the
+// frame's time_inc is zero for as long as the screen stays black.
+constexpr auto ORPHANED_BLACK_GRACE = std::chrono::seconds{1};
+constexpr float ORPHANED_BLACK_FADE_IN = 0.5f;
+std::chrono::steady_clock::time_point orphaned_black_since {};
+bool orphaned_black = false;
+
+void release_orphaned_blackscreen(mission_manager *self)
+{
+    const bool held_black = self->field_FC == 3 || self->field_FC == 4;
+    const bool no_mission = self->m_script == nullptr && self->m_script_to_load == nullptr
+        && !self->m_unload_script && !self->field_80;
+    if (!held_black || !no_mission || g_game_ptr == nullptr
+        || !g_game_ptr->level.load_completed || !g_game_ptr->flag.level_is_loaded
+        || !resource_manager::is_idle()) {
+        orphaned_black = false;
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!orphaned_black) {
+        orphaned_black = true;
+        orphaned_black_since = now;
+        return;
+    }
+
+    if (now - orphaned_black_since >= ORPHANED_BLACK_GRACE) {
+        orphaned_black = false;
+        sp_log("[xbpack] no mission script holds the black screen; fading back in");
+        self->blackscreen_off(ORPHANED_BLACK_FADE_IN);
+    }
+}
+
+} // namespace
+#endif
+
 void mission_manager::frame_advance(Float a2)
 {
     TRACE("mission_manager::frame_advance");
@@ -544,6 +590,9 @@ void mission_manager::frame_advance(Float a2)
     else
     {
         THISCALL(0x005E16B0, this, a2);
+#ifdef OPENUSM_XBPACK_V10
+        release_orphaned_blackscreen(this);
+#endif
     }
 }
 
@@ -831,18 +880,6 @@ void mission_manager_patch2()
 
 
     {
-
-        FUNC_ADDRESS(address, &mission_manager::blackscreen_on);
-        REDIRECT(0x05DA4F2, address);
-        REDIRECT(0x0634CD5, address);
-        REDIRECT(0x0635E99, address);
-        REDIRECT(0x067382B, address);
-        REDIRECT(0x067383D, address);
-        REDIRECT(0x0742177, address);
-
-    }
-
-    {
         // Call sites of the retail blackscreen_off (0x005BAD80), recovered by
         // scanning .text for E8 rel32 targets. The same scan reproduces the
         // blackscreen_on list above exactly.
@@ -853,3 +890,87 @@ void mission_manager_patch2()
 
 
 }
+
+#ifdef OPENUSM_XBPACK_V10
+namespace {
+
+// Mission launch (0x005DEE40) passes the mission's transition name to
+// 0x005DA4B0: "fade" fades to black over a second, anything else pushes the
+// "ts_<mission>" pack, draws its "title_<mission>" panel and holds the screen
+// black until the mission script calls blackscreen_off.  The V10 title panels
+// are placeholders reading "PLEASE WAIT...", so after every completed mission
+// the next one opened on that black screen.  Keep the plain fade and skip the
+// title card; the script's later blackscreen_off is then a no-op.
+constexpr uintptr_t MISSION_TRANSITION = 0x005DA4B0;
+constexpr uintptr_t LAUNCH_TRANSITION_CALL = 0x005DEF4C;
+
+bool is_fade_transition(const char *name)
+{
+    constexpr char fade[] = "fade";
+    for (int i = 0; i < 5; ++i) {
+        const char c = name[i];
+        const char lower = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+        if (lower != fade[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void __fastcall launch_transition(mission_manager *self, void *, mString *transition)
+{
+    if (transition != nullptr && is_fade_transition(transition->c_str())) {
+        THISCALL(MISSION_TRANSITION, self, transition);
+    }
+}
+
+// Missions from the PC mission table that the V10 amalga_xb.pak lacks: the
+// native loader (0x005DEE40) silently returns when "pk_<mission>" is missing,
+// so whoever blacked the screen out for the mission start waited forever on
+// the "PLEASE WAIT..." screen.  Drop the request and give the screen back.
+constexpr uintptr_t LOAD_SCRIPT = 0x005DEE40;
+constexpr uintptr_t LOAD_SCRIPT_CALL = 0x005E1B1F;
+
+void __fastcall load_script(mission_manager *self, void *, const mission_manager_script_data *data)
+{
+    const mString pack_name = mString{"pk_"} + data->field_0;
+    const resource_key pack{string_hash{pack_name.c_str()}, RESOURCE_KEY_TYPE_PACK};
+    if (!resource_manager::get_pack_file_stats(pack, nullptr, nullptr, nullptr)) {
+        sp_log("[xbpack] mission %s is not in amalga_xb.pak (%s missing); not loading it",
+               data->field_0.c_str(),
+               pack_name.c_str());
+        self->blackscreen_off(0.0f);
+        return;
+    }
+
+    THISCALL(LOAD_SCRIPT, self, data);
+}
+
+} // namespace
+
+bool mission_manager_v10_patch()
+{
+    // The general mission_manager_patch installer is not reached by the
+    // V10 startup path. Its frame wrapper contains the orphaned black-screen
+    // recovery above, so install that wrapper explicitly for V10 as well.
+    constexpr uintptr_t frame_call = 0x0055D75B;
+    constexpr uint8_t native_frame[] = {0xE8, 0x50, 0x3F, 0x08, 0x00};
+    FUNC_ADDRESS(frame_address, &mission_manager::frame_advance);
+    uint8_t wrapped_frame[] = {0xE8, 0, 0, 0, 0};
+    const auto displacement = static_cast<uint32_t>(
+        reinterpret_cast<uintptr_t>(frame_address) - frame_call - 5);
+    std::memcpy(wrapped_frame + 1, &displacement, sizeof(displacement));
+    auto *code = reinterpret_cast<void *>(frame_call);
+    if (std::memcmp(code, native_frame, sizeof(native_frame)) != 0
+        && std::memcmp(code, wrapped_frame, sizeof(wrapped_frame)) != 0) {
+        sp_log("[xbpack] V10 mission frame instruction signature mismatch");
+        return false;
+    }
+
+    REDIRECT(LAUNCH_TRANSITION_CALL, launch_transition);
+    REDIRECT(LOAD_SCRIPT_CALL, load_script);
+    std::memcpy(code, wrapped_frame, sizeof(wrapped_frame));
+    return true;
+}
+#endif

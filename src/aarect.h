@@ -15,10 +15,12 @@ struct aarect {
     {
         this->field_0[0] += a1;
         this->field_0[1] += a1;
+        return *this;
     }
 
     bool operator==(const aarect<T0, T1> &a2) const
     {
-        return (this->field_0 == a2.field_0 && this->field_8 == a2->field_8);
+        return this->field_0[0] == a2.field_0[0] &&
+               this->field_0[1] == a2.field_0[1];
     }
 };

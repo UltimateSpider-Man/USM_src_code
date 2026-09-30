@@ -1,5 +1,9 @@
 #include "actor.h"
 
+#ifdef OPENUSM_XBPACK_MODE
+#include "actor_xbpack.h"
+#endif
+
 #include "advanced_entity_ptrs.h"
 #include "ai_player_controller.h"
 #include "als_animation_logic_system.h"
@@ -17,6 +21,7 @@
 #include "custom_math.h"
 #include "damage_interface.h"
 #include "entity_mash.h"
+#include "exe_allocator.h"
 #include "facial_expression_interface.h"
 #include "func_wrapper.h"
 #include "generic_anim_controller.h"
@@ -943,13 +948,17 @@ void actor::_un_mash(generic_mash_header *a3, void *a4, generic_mash_data_ptrs *
 #endif
     } else {
         THISCALL(0x004FBD40, this, a3, a4, a5);
+#ifdef OPENUSM_XBPACK_MODE
+        actor_xbpack_finish(a5);
+#endif
     }
 }
 
 void actor::create_player_controller(int a2) {
     assert(this->m_player_controller == nullptr);
 
-    this->m_player_controller = new ai_player_controller{this};
+    auto *mem = exe_allocator<ai_player_controller> {}.allocate(1);
+    this->m_player_controller = new (mem) ai_player_controller{this};
 
     this->m_player_controller->set_player_num(a2);
 }

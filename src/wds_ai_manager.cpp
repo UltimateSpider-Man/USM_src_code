@@ -45,7 +45,14 @@ void wds_ai_manager::add_path_graph(path_graph *pg)
         for ( auto it = this->path_graph_list.begin(); it != this->path_graph_list.end(); )
         {
             if ( (*it) != nullptr && (*it) == pg ) {
+#ifdef OPENUSM_XBPACK_V10
+                // The legacy single-element erase uses unchecked_copy, whose
+                // scalar memmove is stubbed out. Use the range overload's
+                // std::copy so unloading one path preserves the other paths.
+                it = this->path_graph_list.erase(it, it + 1);
+#else
                 it = this->path_graph_list.erase(it);
+#endif
             } else {
                 ++it;
             }

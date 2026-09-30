@@ -60,15 +60,15 @@ void __cdecl sub_60B960_hook(sound_instance_id *result, string_hash a2, Float a3
     // WAV mod override: a wav dropped in extra/ keyed to this sound or
     // alias hash — by stem, literal-hash stem, or *hashes*.txt sidecar
     // (mod.h) — plays through DirectSound instead of the engine's bank
-    // sample. Returns the invalid instance id (slot lookups yield nullptr,
-    // stop() is never reached), so callers stay well-behaved.
+    // sample. Suppress the bank sample only after playback succeeds; a
+    // missing device or failed DirectSound buffer must retain native audio.
     if (auto *snd = getWavMod(a2.source_hash_code)) {
-        if (const char *name = modWavHashName(a2.source_hash_code))
-            printf("wav mod: override 0x%08X (%s)\n", a2.source_hash_code, name);
-        modWavPlay(*snd, a3);
-
-        result->field_0 = 0;
-        return;
+        if (modWavPlay(*snd, a3)) {
+            if (const char *name = modWavHashName(a2.source_hash_code))
+                printf("wav mod: override 0x%08X (%s)\n", a2.source_hash_code, name);
+            result->field_0 = 0;
+            return;
+        }
     }
 
     if (g_original_sub_60B960)
@@ -81,6 +81,17 @@ void __cdecl sub_60B960_hook(sound_instance_id *result, string_hash a2, Float a3
 sound_instance_id sub_60B960(string_hash a2, Float a3, Float a4) {
     sound_instance_id result;
     sub_60B960_hook(&result, a2, a3, a4);
+    return result;
+}
+
+sound_instance_id sub_60B960_native(string_hash hash, Float volume, Float pitch) {
+    sound_instance_id result{0};
+    // Never call the patched entry directly once its trampoline is present.
+    // This retains the native UI-ready gate, volume/type and source flags.
+    if (g_original_sub_60B960)
+        g_original_sub_60B960(&result, hash, volume, pitch);
+    else
+        CDECL_CALL(0x0060B960, &result, hash, volume, pitch);
     return result;
 }
 
