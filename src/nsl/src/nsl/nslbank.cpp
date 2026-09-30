@@ -110,17 +110,12 @@ nslBank *nslGetBank(nslBankID a1)
 int nslGetBankState(nslBankID a2)
 {
     TRACE("nslGetBankState");
-    //TRACE(std::to_string((int) a2).c_str());
-    if constexpr (1)
-    {
-        auto *nsl_bank = nslGetBank(a2);
-        int v2 = ( nsl_bank != nullptr ? (nsl_bank->field_4 != 3) : -1 );
-        return v2;
-    }
-    else
-    {
-        return CDECL_CALL(0x007984D0, a2);
-    }
+    // The native PC bank table uses a 0x1C-byte stride (32 entries), while
+    // the reconstructed nslBank declaration below the source API is 0x34.
+    // Indexing that declaration reads a different bank's state for every
+    // slot after zero, making readiness/failure decisions incorrect.
+    // Keep the verified native accessor until the full ABI is reconstructed.
+    return CDECL_CALL(0x007984D0, a2);
 }
 
 int nslBank_WaveCompare(const void *a1, const void *a2)
