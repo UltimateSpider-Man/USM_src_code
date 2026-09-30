@@ -75,3 +75,7 @@ extern void RenderLoadMeter();
 extern FEManager & g_femanager;
 
 extern void FEManager_patch();
+
+#ifdef OPENUSM_XBPACK_MODE
+void __fastcall xbpack_load_frontend(FEManager *self, void *);
+#endif

@@ -4,6 +4,7 @@
 #include "fetextflashinfo.h"
 #include "func_wrapper.h"
 #include "mash_info_struct.h"
+#include "mash_config.h"
 #include "game.h"
 #include "localized_string_table.h"
 #include "ngl.h"
@@ -50,7 +51,7 @@ void FEText::_unmash(mash_info_struct *a1, void *a3)
 
 int FEText::_get_mash_sizeof()
 {
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
     return 0x60;
 #else
     return 0x68;

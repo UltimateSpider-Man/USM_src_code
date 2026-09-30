@@ -53,6 +53,8 @@
 #include "message_board.h"
 #include "mic.h"
 #include "mission_stack_manager.h"
+#include "mod_hero_pack.h"
+#include "multiplayer_mode.h"
 #include "mouselook_controller.h"
 #include "ngl.h"
 #include "ngl_font.h"
@@ -62,6 +64,7 @@
 #include "oldmath_po.h"
 #include "osassert.h"
 #include "os_developer_options.h"
+#include "optional_venom_patches.h"
 #include "parse_generic_mash.h"
 #include "pausemenusystem.h"
 #include "proximity_map_stack.h"
@@ -2999,10 +3002,18 @@ void game::advance_state_running(Float a2)
                 static bool console_exec_completed = false;
 
                 if (!console_exec_completed) {
-                    console_exec_completed = true;
-
-                    [[maybe_unused]] auto a3 = os_developer_options::instance
+                    auto command = os_developer_options::instance
                         ->get_string(os_developer_options::strings_t::CONSOLE_EXEC);
+
+                    if (!command || command->empty()) {
+                        console_exec_completed = true;
+                    } else {
+                        auto *player = g_cut_scene_player();
+                        if (g_console != nullptr && player != nullptr && !player->is_playing()) {
+                            g_console->processCommand(command->c_str(), false);
+                            console_exec_completed = true;
+                        }
+                    }
                 }
 
                 this->field_64->frame_advance(Float{a2});
@@ -3046,7 +3057,13 @@ void game::load_hero_packfile(const char *str, bool a3)
             //streamer->dump();
 
             //sp_log("\npreload");
-            streamer->load(str, 0, nullptr, nullptr);
+            const char *pack_name = mod_hero_pack::resolve(str, [](const char *name) {
+                const resource_key key {
+                    string_hash {name}, RESOURCE_KEY_TYPE_PACK};
+                return resource_manager::get_pack_file_stats(
+                    key, nullptr, nullptr, nullptr);
+            });
+            streamer->load(pack_name, 0, nullptr, nullptr);
             //sp_log("postload\n");
 
             //streamer->dump();
@@ -3354,6 +3371,7 @@ void terrain::unload_all_districts_immediate()
 
 void game::unload_hero_packfile()
 {
+    multiplayer_mode_hero_pack_unloading();
     resource_partition *partition = resource_manager::get_partition_pointer(RESOURCE_PARTITION_HERO);
     assert(partition != nullptr);
     assert(partition->get_streamer());
@@ -3628,6 +3646,8 @@ void game__setup_input_registrations(game *a1)
 
 void game_patch()
 {
+	
+    install_optional_venom_patches();
     REDIRECT(0x0052B4BA, sub_5BC870);
 
     {
@@ -3795,22 +3815,15 @@ void game_patch()
         {
             FUNC_ADDRESS(address, &game::enable_marky_cam);
             REDIRECT(0x0057EB54, address);
-                }
+        }
+    }
 
-        {
-		        FUNC_ADDRESS(address, &game::message_board_init);
-        REDIRECT(0x00552E7C, address);
-    }
-	        {
-			FUNC_ADDRESS(address, &game::game::pause);
-	        REDIRECT(0x0060BEB4, address);
-			REDIRECT(0x0061940A, address);
-			REDIRECT(0x00622867, address);
-			REDIRECT(0x00622AD5, address);
-	        REDIRECT(0x0062A0B1, address);
-			REDIRECT(0x00662F0D, address);
-			REDIRECT(0x006737C6, address);
-    }
-    }
 }
 
+#ifdef OPENUSM_XBPACK_V10
+void game_v10_patch()
+{
+    FUNC_ADDRESS(address, &game::level_load_stuff::destroy_loading_widgets);
+    REDIRECT(0x0055D43C, address);
+}
+#endif

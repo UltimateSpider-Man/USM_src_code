@@ -29,7 +29,7 @@ void fe_dialog_text::set_text(string a1) {
 void fe_dialog_text::_Load() {
     TRACE("fe_dialog_text::Load");
 
-    if constexpr (0)
+#ifdef OPENUSM_XBPACK_V10
     {
         assert(panel == nullptr && "Dialog text widget already loaded.");
 
@@ -62,17 +62,13 @@ void fe_dialog_text::_Load() {
         this->field_88 = v2->GetTextPointer("tb_text_link_right_BLANK");
         this->field_8C = v2->GetTextPointer("tb_text_link_center_BLANK");
 
-        {
-            mString v69 {""};
-            FEText::string text;
-            std::memcpy(&text, &v69, sizeof(v69));
-
-            this->field_78->SetTextNoLocalize(text);
-
-            this->field_7C->SetTextNoLocalize(text);
-
-            this->field_80->SetTextNoLocalize(text);
-        }
+        // Stock SetTextNoLocalize consumes and destroys its by-value mString.
+        // Reusing a shallow memcpy view three times decremented mString_count
+        // four times for one construction.  The native body otherwise performs
+        // this same deep assignment before destroying its argument.
+        this->field_78->field_1C = "";
+        this->field_7C->field_1C = "";
+        this->field_80->field_1C = "";
         
         bit_cast<FEMultiLineText *>(this->field_80)->SetNumLines(15);
         this->field_84->SetText(static_cast<global_text_enum>(148));
@@ -109,10 +105,9 @@ void fe_dialog_text::_Load() {
         this->field_F4[0] = v72[0];
         this->field_F4[1] = v72[3];
     }
-    else
-    {
+#else
         THISCALL(0x00643C90, this);
-    }
+#endif
 }
 
 void fe_dialog_text::set_title(string a2) {
@@ -132,6 +127,9 @@ void fe_dialog_text_patch() {
     {
         FUNC_ADDRESS(address, &fe_dialog_text::_Load);
         set_vfunc(0x00893E88, address);
+#ifdef OPENUSM_XBPACK_V10
+        SET_JUMP(0x00643C90, address);
+#endif
     }
 
     return;

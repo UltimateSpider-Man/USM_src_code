@@ -216,6 +216,19 @@ void FEManager::LoadFrontEnd() {
     }
 }
 
+#ifdef OPENUSM_XBPACK_MODE
+void __fastcall xbpack_load_frontend(FEManager *self, void *)
+{
+    if (self->m_fe_menu_system != nullptr) {
+        return;
+    }
+
+    static Var<bool> first_time_through{0x00937B78};
+    first_time_through() = true;
+    THISCALL(0x00648AB0, self);
+}
+#endif
+
 void FEManager::RenderLoadMeter(bool a2) {
     if (this->m_fe_menu_system != nullptr) {
         this->m_fe_menu_system->RenderLoadMeter(a2);

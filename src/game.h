@@ -408,3 +408,16 @@ extern void system_idle();
 extern void game_packs_modified_callback(_std::vector<resource_key> &a1);
 
 extern void game_patch();
+
+extern void venom_animation_lookup_patch();
+
+extern void black_suit_tentacle_patch();
+extern void venom_als_remap_patch();
+
+
+#ifdef OPENUSM_XBPACK_V10
+extern void game_v10_patch();
+#endif
+
+
+

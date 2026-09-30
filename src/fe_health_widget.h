@@ -7,8 +7,8 @@ struct PanelQuad;
 struct PanelFile;
 
 struct fe_health_widget {
-    PanelFile *field_0[5];
-    int field_14[7];
+    PanelFile *field_0[6];
+    int field_18[6];
     int field_30;
     int field_34;
     int field_38;
@@ -37,6 +37,9 @@ struct fe_health_widget {
 
     void DeInit(int a2);
 
+    // Carnage owns a panel, but shares Venom's native six-slot HUD layout.
+    bool SelectCarnagePanel(bool selected);
+
 
     void SetType(int the_type, int a3)
     {
@@ -45,3 +48,6 @@ struct fe_health_widget {
         func(this, nullptr, the_type, a3);
     }
 };
+
+// Drop cached pointers before the owning pack's panel data is released.
+void carnage_hud_resource_changed(fe_health_widget *widget, bool carnage, bool unloading);

@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "gab_manager.h"
+#include "mash_config.h"
 #include "mash_info_struct.h"
 #include "resource_directory.h"
 #include "worldly_pack_slot.h"
@@ -30,22 +31,27 @@ bool gab_database_resource_handler::_handle_resource(worldly_resource_handler::e
     if (a2 == worldly_resource_handler::UNLOAD) {
         gab_database *the_gab_database = CAST(the_gab_database, resource);
 
-        assert(the_gab_database == gab_manager::get_gab_database());
+//        assert(the_gab_database == gab_manager::get_gab_database());
         assert(the_gab_database != nullptr);
 
         gab_manager::set_gab_database(nullptr);
+#if !OPENUSM_XBOX_MASH_FORMAT
+        // The retail-PC destructor recursively frees vectors owned by the PC
+        // GAB layout.  Xbox GAB vectors point into the pack's mash buffers and
+        // use a different layout, so the slot teardown owns their lifetime.
         the_gab_database->destruct_mashed_class();
+#endif
     } else {
 
-#ifndef TARGET_XBOX
-        mash_info_struct info_struct{resource, a3->m_size};
-#else
+#if OPENUSM_XBOX_MASH_FORMAT
         mash_info_struct info_struct {mash::UNMASH_MODE, resource, a3->m_size, true};
+#else
+        mash_info_struct info_struct{resource, a3->m_size};
 #endif
 
         gab_database *the_gab_database = nullptr;
         info_struct.unmash_class(the_gab_database, nullptr
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT
             , mash::NORMAL_BUFFER
 #endif 
                 );

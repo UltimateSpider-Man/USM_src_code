@@ -4,6 +4,7 @@
 #include "utility.h"
 #include "vtbl.h"
 #include "func_wrapper.h"
+#include "mash_config.h"
 
 VALIDATE_SIZE(FEFloatingText, 0x84);
 
@@ -19,7 +20,7 @@ void FEFloatingText::_unmash(mash_info_struct *a1, void *)
 
 int FEFloatingText::_get_mash_sizeof()
 {
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
     return 0x7C;
 #else
     return 0x84;

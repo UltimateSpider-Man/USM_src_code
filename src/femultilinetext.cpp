@@ -6,12 +6,11 @@
 #include "game.h"
 #include "gamepadinput.h"
 #include "localized_string_table.h"
+#include "mash_config.h"
 #include "multilinestring.h"
 #include "trace.h"
 #include "utility.h"
 #include "variables.h"
-
-#include "movie_manager.h"
 
 
 VALIDATE_OFFSET(FEMultiLineText, lines, 0x88);
@@ -51,7 +50,7 @@ void FEMultiLineText::_unmash(mash_info_struct *a1, void *a3)
 
 int FEMultiLineText::_get_mash_sizeof()
 {
-#ifdef TARGET_XBOX
+#if OPENUSM_XBOX_MASH_FORMAT && !defined(OPENUSM_XBPACK_V10)
     return 0x98;
 #else
     return 0xA0;
@@ -378,14 +377,6 @@ void FEMultiLineText::SetTextBoxAllocNoLocalize(mString a2, int a6, Float a7) {
     THISCALL(0x00633C00, this, a2, a6, a7);
 }
 
-void FEMultiLineText::ReadFileBoxFormat(FEMultiLineText* self, const char* path, int width, bool replace_newlines) {
-
-movie_manager::load_and_play_movie("credits", nullptr, false);
-
-THISCALL(0x00633DB0, this, self,  path,  width,  replace_newlines);
-
-}
-
 void FEMultiLineText::SetNumLines(int n) {
     TRACE("FEMultiLineText::SetNumLines", std::to_string(n).c_str());
 
@@ -410,8 +401,6 @@ void FEMultiLineText_patch() {
         FUNC_ADDRESS(address, &FEMultiLineText::_unmash);
         set_vfunc(0x0087AE5C, address);
     }
-	
-
 
     {
         FUNC_ADDRESS(address, &FEMultiLineText::_SetTextNoLocalize);
@@ -469,15 +458,6 @@ void FEMultiLineText_patch() {
         {
             FUNC_ADDRESS(address, &FEMultiLineText::SetTextBoxAllocNoLocalize);
             set_vfunc(addr, address);
-        }
-		
-		addr += 0x4;
-		
-		addr += 0x4;
-		
-        {
-           FUNC_ADDRESS(address, &FEMultiLineText::ReadFileBoxFormat);
-           set_vfunc(addr, address);
         }
 
         {
