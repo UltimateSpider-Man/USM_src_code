@@ -26,6 +26,9 @@ cg_mesh::cg_mesh()
 
 collision_geometry *cg_mesh::make_instance(actor *a2)
 {
+#ifdef OPENUSM_XBPACK_V10
+    return reinterpret_cast<collision_geometry *>(THISCALL(0x005267F0, this, a2));
+#else
     auto *mem = mem_alloc(sizeof(cg_mesh));
     auto *result = new (mem) cg_mesh {};
     result->owner = a2;
@@ -35,6 +38,7 @@ collision_geometry *cg_mesh::make_instance(actor *a2)
 
     result->data = this->data;
     return result;
+#endif
 }
 
 vector3d cg_mesh::get_local_space_bounding_sphere_center() {
@@ -53,7 +57,7 @@ void cg_mesh::_un_mash(generic_mash_header *a2, void *a3, generic_mash_data_ptrs
 {
     TRACE("cg_mesh::un_mash");
 
-    if constexpr (0)
+#ifdef OPENUSM_XBPACK_V10
     {
         collision_geometry::un_mash(a2, a3, a4);
 
@@ -63,6 +67,7 @@ void cg_mesh::_un_mash(generic_mash_header *a2, void *a3, generic_mash_data_ptrs
 
         std::memcpy(&col_mesh_name, a4->field_4, sizeof(resource_key));
         a4->field_4 += sizeof(resource_key);
+        col_mesh_name.set_type(RESOURCE_KEY_TYPE_COLLISION_MESH);
 
         int size = 0;
         auto *resource = resource_manager::get_resource(col_mesh_name, &size, nullptr);
@@ -91,10 +96,10 @@ void cg_mesh::_un_mash(generic_mash_header *a2, void *a3, generic_mash_data_ptrs
 
             this->data->field_0[3] = 'Z';
         }
-
-    } else {
-        THISCALL(0x0053B100, this, a2, a3, a4);
     }
+#else
+    THISCALL(0x0053B100, this, a2, a3, a4);
+#endif
 }
 
 void cg_mesh_patch()

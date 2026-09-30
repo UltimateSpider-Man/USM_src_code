@@ -6,6 +6,9 @@
 #include "als_res_data.h"
 #include "core_ai_resource.h"
 #include "cut_scene.h"
+#if defined(OPENUSM_XBPACK_MODE) && !defined(OPENUSM_XBPACK_V10) && !defined(TARGET_XBOX)
+#include "entity_mash.h"
+#endif
 #include "gab_manager.h"
 #include "path_graph.h"
 #include "token_def_list.h"
@@ -160,11 +163,24 @@ void mash_info_struct::construct_class(skeleton_interface *&a1)
 {
     if ( a1 != nullptr )
     {
+#if defined(OPENUSM_XBPACK_MODE) && !defined(OPENUSM_XBPACK_V10) && !defined(TARGET_XBOX)
+        // Xbox V14 stores the type hash in the serialized vtable slot.  The
+        // stock PC conglomerate teardown later invokes a virtual teardown slot
+        // through this value.  Relink it, but mark it non-owning: the object is
+        // embedded in the nested mash image and must not be passed to the PC
+        // heap's deleting destructor.
+        a1->m_vtbl = ifc_v_table_lookup()[6];
+#endif
+
         auto func = [](skeleton_interface *self, int a2, int a3) {
             self->field_4 = CAST(self->field_4, a3);
             self->field_8 = ( a2 == 1 );
         };
 
+#if defined(OPENUSM_XBPACK_MODE) && !defined(OPENUSM_XBPACK_V10) && !defined(TARGET_XBOX)
+        func(a1, 0, 0);
+#else
         func(a1, 1, 0);
+#endif
     }
 }

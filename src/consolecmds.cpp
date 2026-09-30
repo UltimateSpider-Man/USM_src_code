@@ -5,6 +5,8 @@
 #include "collide.h"
 #include "console.h"
 #include "consolevars.h"
+#include "cut_scene.h"
+#include "cut_scene_player.h"
 #include "damage_interface.h"
 #include "debug_render.h"
 #include "dvar.h"
@@ -669,6 +671,48 @@ bool ForceMissionCommand::process_cmd(const std::vector<std::string> &a1)
         v12->force_mission(0, v18, 0, nullptr);
     }
 
+    return true;
+}
+
+static PanelTestCommand g_PanelTestCommand{};
+
+PanelTestCommand::PanelTestCommand()
+{
+    setName("panel_test");
+}
+
+bool PanelTestCommand::process_cmd(const std::vector<std::string> &args)
+{
+    if (args.size() != 1 || (args[0] != "left" && args[0] != "right"))
+    {
+        g_console->addToLog(helpText());
+        return false;
+    }
+
+    constexpr uint32_t leftHash = 0x70EADB23u;
+    constexpr uint32_t rightHash = 0x8EB50736u;
+    resource_key key {};
+    key.m_hash.source_hash_code = args[0] == "left" ? leftHash : rightHash;
+    key.m_type = RESOURCE_KEY_TYPE_CUT_SCENE;
+
+    auto *scene = reinterpret_cast<cut_scene *>(
+        resource_manager::get_resource(key, nullptr, nullptr));
+    if (scene == nullptr)
+    {
+        g_console->addToLog("panel_test: CUT resource is unavailable");
+        return false;
+    }
+
+    cut_scene_player *player = g_cut_scene_player();
+    if (player == nullptr || player->is_playing())
+    {
+        g_console->addToLog("panel_test: cut-scene player is unavailable or busy");
+        return false;
+    }
+
+    player->play(scene);
+    g_console->addToLog("panel_test: playing %s panel (0x%08X)",
+                        args[0].c_str(), key.m_hash.source_hash_code);
     return true;
 }
 

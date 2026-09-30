@@ -1,6 +1,9 @@
 #pragma once
 
 #include "actor.h"
+#ifdef OPENUSM_XBPACK_V10
+#include "exe_allocator.h"
+#endif
 #include "mashable_vector.h"
 #include "variable.h"
 
@@ -19,6 +22,14 @@ struct animation_logic_system;
 }
 
 struct conglomerate : actor {
+#ifdef OPENUSM_XBPACK_V10
+    using actor_list_t = _std::list<actor *, exe_allocator<actor *>>;
+    using light_list_t = _std::list<light_source *, exe_allocator<light_source *>>;
+#else
+    using actor_list_t = _std::list<actor *>;
+    using light_list_t = _std::list<light_source *>;
+#endif
+
     mashable_vector<entity_base *> members;
     mashable_vector<entity_base *> skin_bones;
     mashable_vector<po> member_abs_po;
@@ -27,8 +38,8 @@ struct conglomerate : actor {
     mashable_vector<int8_t> field_E8;
     mashable_vector<int8_t> field_F0;
     light_manager *field_F8;
-    _std::list<actor *> *field_FC;
-    _std::list<light_source *> *field_100;
+    actor_list_t *field_FC;
+    light_list_t *field_100;
     int field_104;
     float field_108;
     float field_10C;
@@ -114,3 +125,4 @@ struct conglomerate : actor {
 inline Var<actor *> global_transfer_variable_the_conglom {0x00959570};
 
 extern void conglomerate_patch();
+extern void conglomerate_xbpack_patch();

@@ -148,6 +148,19 @@ struct ForceMissionCommand : ConsoleCommand {
     }
 };
 
+// Developer-only playback seam for the loose CITY_CAR_COMBAT comic panels.
+// It exercises the same resource lookup and stock cut-scene player used by
+// gameplay scripts without changing mission state or save data.
+struct PanelTestCommand : ConsoleCommand {
+    PanelTestCommand();
+
+    bool process_cmd(const std::vector<std::string> &args) override;
+
+    const char *helpText() const override {
+        return "panel_test <left|right> -> plays the validated gun comic panel";
+    }
+};
+
 struct ListDebugVariablesCommand : ConsoleCommand
 {
     ListDebugVariablesCommand();

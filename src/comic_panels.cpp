@@ -169,10 +169,10 @@ void panel::init_anim(nalPanel::nalPanelAnim *a2)
 }
 
 void panel::add_camera_component(const char *a2, bool a3, int a4) {
-    if constexpr (1) {
-    } else {
-        THISCALL(0x007360B0, this, a2, a3, a4);
-    }
+    // Keep the stock camera component creation.  The previous empty
+    // replacement left camera-backed comic panels with no component to
+    // capture or render (most visibly in the alternate-costume viewer).
+    THISCALL(0x007360B0, this, a2, a3, a4);
 }
 
 void panel::capture()

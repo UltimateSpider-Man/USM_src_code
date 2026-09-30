@@ -52,6 +52,10 @@ struct camera_mode {
 
 struct camera_mode_shake : camera_mode
 {
+    uint8_t field_C[0x18];
+    vector3d frame_fwd;
+    vector3d frame_eye;
+
     void _frame_advance(
             Float a2,
             camera_frame &a3,
@@ -131,4 +135,3 @@ struct camera_mode_combat : camera_mode {
 };
 
 extern void camera_mode_patch();
-
