@@ -69,6 +69,11 @@ void vm_executable::un_mash(
 {
     TRACE("vm_executable::un_mash");
 
+#ifdef OPENUSM_XBPACK_V10
+    this->flags = static_cast<uint32_t>(this->field_20);
+    this->field_20 = 0;
+#endif
+
     assert(!this->is_un_mashed());
 
     this->owner = CAST(owner, a3);
@@ -82,7 +87,9 @@ void vm_executable::un_mash(
 
     assert(this->debug_info == nullptr);
 
+#ifndef OPENUSM_XBPACK_V10
     sp_log("buffer_len = %d", this->buffer_len);
+#endif
 }
 
 void vm_executable::link(const script_executable *a2)
