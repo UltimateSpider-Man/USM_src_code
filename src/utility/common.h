@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <type_traits>
 
+extern std::multimap<uint32_t, Mod> Mods;
+
 #ifdef CHECK_STRUCT_SIZES
 
 #define VALIDATE_SIZE(struc, size) \

@@ -4,6 +4,8 @@
 
 #include <cstring>
 
+#define PROGRESS_LOG
+
 #ifndef __has_feature
 #define __has_feature(x) 0 // Compatibility with non-clang compilers.
 #endif

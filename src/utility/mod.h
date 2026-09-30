@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 
 #include <map>
@@ -29,15 +30,51 @@ struct Mod {
     std::vector<uint8_t> Data;
 };
 
+// Mod::Type value for .ENT entity-template mash images (entity_base.cpp).
+// tlresource_type occupies 0..12 and resource_key_type reuses the same small
+// integers (ENTITY == 4 collides with TLRESOURCE_TYPE_MORPH_FILE), so .ent
+// mods key their registry entries with a constant safely outside both enums.
+inline constexpr int MOD_TYPE_ENT_FILE = 0x100;
+
+// Mod::Type value for .PCSX script-executable mash images (script_object.cpp).
+// Same reasoning as MOD_TYPE_ENT_FILE: kept safely clear of the small
+// tlresource_type / resource_key_type integer ranges.
+inline constexpr int MOD_TYPE_PCSX_FILE = 0x101;
+
+// Mod::Type value for .PCSX files in the CHUNK (text) format the CHUCK
+// compiler emits -- the form an actual file on disk has, as opposed to the
+// mash image a pack serves. These carry no Data: the engine's own
+// script_executable::load() reads them, plus their .pcsst/.pcpst/.pcsxl
+// siblings, straight from Mod::Path's directory.
+inline constexpr int MOD_TYPE_PCSX_CHUNK = 0x102;
+
+// Mod::Type value for PlayStation 2 beta script-executable images (.PS2SX).
+// These use a wider serialized VM record and beta script-library indices, so
+// registration translates them to a validated PC mash image before the
+// normal script loader is allowed to see the bytes.
+inline constexpr int MOD_TYPE_PS2SX_FILE = 0x103;
+
+// Mod::Type value for loose .ALS animation-logic-system mash streams.
+// ALS resources are not generic-mash images and are unmashed in place before
+// entity instances consume them, so they need their own typed registry entry.
+inline constexpr int MOD_TYPE_ALS_FILE = 0x104;
+
 // ---------------------------------------------------------------------------
 // Skeletal-animation carriers
 //
-// Assimp gives us animation channels keyed by *bone name*. The engine, on the
-// other hand, addresses bones by *slot index* into nglMeshParams::field_8[].
-// We therefore keep the name on every keyframe track and resolve it to an
-// engine slot at bind time (see modResolveSkeletonRemap in ngl.cpp). This is
-// also what lets us reorder an arbitrary FBX joint order onto the retail
-// skeleton layout instead of trusting the exporter to emit them in order.
+// The native FBX importer (mod_mesh_import.h) bakes every take in the file
+// into channels keyed by *bone name*. The engine, on the other hand,
+// addresses bones by *slot index* into the mesh bone array, so each channel
+// also carries skelIndex: modmesh::buildSectionsForMesh resolves it against
+// the TARGET mesh with the same bind-pose cluster table the skinning path
+// trusts (Bone_N name digits as fallback), which is what lets an arbitrary
+// FBX joint order land on the retail skeleton layout. skelIndex -1 means the
+// bone does not exist on this mesh - do not play that channel.
+//
+// Clips converted by modCollectFbxAnimations (ngl.cpp) use SECONDS
+// (ticksPerSecond = 1.0), positions in game units, and quaternions with the
+// FBX RotationOrder + Pre/PostRotation already folded in: a channel is the
+// bone's complete local transform in parent space, composed T*R*S.
 // ---------------------------------------------------------------------------
 struct modVecKey {                 // position / scale key
     double  time = 0.0;            // in ticks
@@ -129,16 +166,114 @@ extern Mod* dbgReplaceMesh;
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Where mods live on disk.
+//
+// enumerate_mods() walks these RECURSIVELY at startup, so users organize
+// drops in subfolders ("extra/anims/HERO.PCANIM"). Every other scanner has
+// to agree on both points or files silently go unseen: the base is resolved
+// against the process working directory once (a bare relative "mods" breaks
+// if the game ever chdir's, and the lazy NAL scan runs long after startup),
+// and traversal is recursive.
+// ---------------------------------------------------------------------------
+[[maybe_unused]] static const std::vector<std::filesystem::path> &modRootDirs()
+{
+    static const std::vector<std::filesystem::path> dirs = [] {
+        std::error_code ec;
+        std::filesystem::path base = std::filesystem::current_path(ec);
+        if (ec)
+            base = std::filesystem::path();
+        return std::vector<std::filesystem::path> { base / "mods", base / "extra" };
+    }();
+    return dirs;
+}
+
+// Resolve a file named in a sidecar ("donor=ULTIMATE_SPIDERMAN.PCANIM") to a
+// real path: an explicit relative/absolute path first, then a recursive
+// filename match under the mod roots (case-insensitively, since the retail
+// naming is upper case and drops rarely are). `hint` is searched first, for
+// files that live next to the one that referenced them.
+[[maybe_unused]] static bool modResolveFile(const std::string &name,
+                                            std::filesystem::path &out,
+                                            const std::filesystem::path &hint = {})
+{
+    if (name.empty())
+        return false;
+
+    std::error_code ec;
+    auto tryPath = [&](const std::filesystem::path &p) {
+        if (p.empty() || !std::filesystem::is_regular_file(p, ec))
+            return false;
+        out = p;
+        return true;
+    };
+
+    if (!hint.empty() && tryPath(hint / name))
+        return true;
+    for (const auto &root : modRootDirs())
+        if (tryPath(root / name))
+            return true;
+    if (tryPath(std::filesystem::path(name)))
+        return true;
+
+    // recursive filename match
+    const std::string want =
+        transformToLower(std::filesystem::path(name).filename().string());
+    for (const auto &root : modRootDirs())
+    {
+        std::filesystem::recursive_directory_iterator it(
+            root, std::filesystem::directory_options::skip_permission_denied, ec);
+        if (ec)
+            continue;
+        for (const auto &e : it)
+        {
+            std::error_code fec;
+            if (!e.is_regular_file(fec))
+                continue;
+            if (transformToLower(e.path().filename().string()) == want)
+            {
+                out = e.path();
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+[[maybe_unused]] static bool readModFile(const Mod* mod, std::vector<uint8_t>& out) {
+    if (mod == nullptr)
+        return false;
+    if (!mod->Data.empty()) {            // eagerly loaded types (meshes, ...)
+        out = mod->Data;
+        return true;
+    }
+    std::ifstream f(mod->Path, std::ios::binary);
+    if (!f)
+        return false;
+    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return !out.empty();
+}
+
 
 // ---------------------------------------------------------------------------
 // WAV sound mods
 //
-// Any *.wav dropped under mods/ is decoded at enumerate_mods() time into an
-// in-memory PCM16 image and keyed by the engine hash of its file stem, i.e.
-// mods/sounds/gang_skin_boss_fem_dead.wav registers under
+// Any *.wav dropped under the mod root (extra/ — see enumerate_mods) is
+// decoded at enumerate_mods() time into an in-memory PCM16 image and keyed
+// by the engine hash of its file stem, i.e.
+// extra/sounds/gang_skin_boss_fem_dead.wav registers under
 // to_hash("gang_skin_boss_fem_dead") — the same hash space the engine uses
 // for sound / alias names, so a wav named after a sound resource is a
 // drop-in override candidate for it.
+//
+// Voice lines are the reason two more bindings exist on top of that: VO is
+// requested by hash only and the original strings never shipped, so a stem
+// that parses as a literal hash ("extra/0x1189AB87.wav", "1189ab87.wav",
+// decimal "294628231.wav") binds under that exact value, and an external
+// hash->name sidecar (extra/*hashes*.txt, see modWavLoadHashNames) lets a
+// wav use a human-readable stem that is routed to the hash the sidecar
+// pairs it with. Together every voice line is overridable — worst case by
+// its raw hash, best case by a community-named sidecar entry.
 //
 // Playback goes through the game's own IDirectSound8 device (0x00987518,
 // created by create_sound_ifc() @ 0x0081E2D0 during startup). Because
@@ -179,6 +314,132 @@ inline std::vector<IDirectSoundBuffer *> ModWavVoices;
         res = (uint32_t)c + 33u * res;
     }
     return res;
+}
+
+// ---------------------------------------------------------------------------
+// External hash -> name sidecars (extra/*hashes*.txt)
+//
+// Loaded by enumerate_mods() BEFORE the wav walk. Any .txt under the mod
+// root whose filename contains "hash" is parsed line by line:
+//
+//     # voice_line_hashes.txt — '#', ';' and '//' start comments
+//     0x1189AB87 = spidey_m01_l001       hex hash = name
+//     294628231  = venom_taunt_03        decimal hash works too
+//     spidey_m01_l001 = 0x1189AB87       either order is accepted
+//     boss_intro_line                    bare name -> modSoundHash(name)
+//
+// With the first mapping loaded, BOTH of these override hash 0x1189AB87:
+//     extra/0x1189AB87.wav               (literal-hash stem, no sidecar needed)
+//     extra/spidey_m01_l001.wav          (friendly stem routed via the sidecar)
+// The hash->name direction also feeds the override log, so a firing voice
+// line prints its name instead of a bare hex value.
+// ---------------------------------------------------------------------------
+inline std::unordered_map<uint32_t, std::string> ModWavHashNames;   // hash -> name
+inline std::unordered_map<std::string, uint32_t> ModWavNameHashes;  // lower(name) -> hash
+inline std::unordered_map<uint32_t, uint32_t>    ModWavHashAliases; // alias hash -> registered hash
+
+// "0x1189AB87" / bare 8-hex-digit "1189ab87" / decimal "294628231" -> value.
+// Same acceptance rules as the mesh literal-hash stems in enumerate_mods().
+[[nodiscard]] inline bool modParseLiteralHash(const std::string &s, uint32_t *out) {
+    if (s.empty())
+        return false;
+    size_t i = 0;
+    bool hexMarked = false;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        i = 2;
+        hexMarked = true;
+    }
+    const size_t n = s.size() - i;
+    if (n == 0 || n > (hexMarked ? 8u : 10u))
+        return false;
+    bool allDec = true, allHex = true;
+    for (size_t k = i; k < s.size(); ++k) {
+        const char c = s[k];
+        if (c < '0' || c > '9') allDec = false;
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+              || (c >= 'A' && c <= 'F')))
+            allHex = false;
+    }
+    uint64_t v = 0;
+    if (hexMarked || (!allDec && allHex && n == 8)) {
+        if (!allHex || n > 8) return false;
+        v = std::strtoull(s.c_str() + i, nullptr, 16);
+    } else if (allDec) {
+        v = std::strtoull(s.c_str() + i, nullptr, 10);
+    } else {
+        return false;
+    }
+    if (v > 0xFFFFFFFFull)
+        return false;
+    *out = (uint32_t)v;
+    return true;
+}
+
+// Name a hash maps to, or nullptr when no sidecar entry covers it.
+[[nodiscard]] inline const char *modWavHashName(uint32_t hash) {
+    auto it = ModWavHashNames.find(hash);
+    return it != ModWavHashNames.end() ? it->second.c_str() : nullptr;
+}
+
+// Parse one sidecar file into the maps above. Returns entries added.
+[[maybe_unused]] static int modWavLoadHashNames(const std::filesystem::path &path) {
+    std::ifstream f(path);
+    if (!f)
+        return 0;
+
+    auto trim = [](std::string &s) {
+        const size_t b = s.find_first_not_of(" \t\r\n");
+        const size_t e = s.find_last_not_of(" \t\r\n");
+        s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+    };
+
+    int added = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (const size_t cut = line.find_first_of("#;"); cut != std::string::npos)
+            line.erase(cut);
+        if (const size_t cut = line.find("//"); cut != std::string::npos)
+            line.erase(cut);
+        trim(line);
+        if (line.empty())
+            continue;
+
+        // "<hash> [= ,\t] <name>", "<name> [= ,\t] <hash>", or "<name>" alone.
+        std::string left = line, right;
+        if (const size_t sep = line.find_first_of("=,\t "); sep != std::string::npos) {
+            left  = line.substr(0, sep);
+            right = line.substr(sep + 1);
+            trim(left);
+            trim(right);
+            if (!right.empty() && (right[0] == '=' || right[0] == ',')) {
+                right.erase(0, 1);              // "name = hash" leaves the '='
+                trim(right);
+            }
+        }
+
+        uint32_t hash = 0;
+        std::string name;
+        if (!right.empty() && modParseLiteralHash(left, &hash)) {
+            name = right;
+        } else if (!right.empty() && modParseLiteralHash(right, &hash)) {
+            name = left;
+        } else if (right.empty()) {
+            name = left;                        // bare name: self-hashing entry
+            hash = modSoundHash(transformToLower(name).c_str());
+        } else {
+            continue;                           // two names, no hash — skip
+        }
+
+        const std::string key = transformToLower(name);
+        ModWavHashNames[hash] = key;
+        ModWavNameHashes[key] = hash;
+        ++added;
+    }
+
+    if (added)
+        printf("mod: hash-name sidecar %s -> %d entr%s\n",
+               path.filename().string().c_str(), added, added == 1 ? "y" : "ies");
+    return added;
 }
 
 // The game's DirectSound8 device. Null until create_sound_ifc() has run.
@@ -314,20 +575,46 @@ inline std::vector<IDirectSoundBuffer *> ModWavVoices;
     }
 
     ModWavSounds.emplace(hash, std::move(snd));
+
+    // Voice-line bindings on top of to_hash(stem): a literal-hash stem
+    // ("0x1189AB87.wav") and a stem named in a *hashes*.txt sidecar both
+    // alias this registration to the hash they designate, so lines known
+    // only by hash stay overridable (see the sidecar block above).
+    if (uint32_t literal = 0;
+        modParseLiteralHash(stem, &literal) && literal != hash) {
+        ModWavHashAliases[literal] = hash;
+        printf("mod: wav %s also bound as literal hash 0x%08X\n",
+               stem.c_str(), literal);
+    }
+    if (auto it = ModWavNameHashes.find(stem);
+        it != ModWavNameHashes.end() && it->second != hash) {
+        ModWavHashAliases[it->second] = hash;
+        printf("mod: wav %s also bound to 0x%08X via hash-name sidecar\n",
+               stem.c_str(), it->second);
+    }
+
     return true;
 }
 
 [[nodiscard]] inline modWavSound *getWavMod(uint32_t hash) {
     auto it = ModWavSounds.find(hash);
+    if (it == ModWavSounds.end()) {
+        if (auto al = ModWavHashAliases.find(hash); al != ModWavHashAliases.end())
+            it = ModWavSounds.find(al->second);
+    }
     return it != ModWavSounds.end() ? &it->second : nullptr;
 }
 
 [[nodiscard]] inline modWavSound *getWavModByName(const char *name) {
+    const std::string key = transformToLower(name);
+    if (auto it = ModWavNameHashes.find(key); it != ModWavNameHashes.end())
+        if (auto *snd = getWavMod(it->second))
+            return snd;
     return getWavMod(modSoundHash(name));
 }
 
 [[maybe_unused]] inline bool hasWavMod(uint32_t hash) {
-    return ModWavSounds.find(hash) != ModWavSounds.end();
+    return getWavMod(hash) != nullptr;
 }
 
 // Upload the decoded PCM into a static DirectSound secondary buffer (once).
@@ -411,13 +698,20 @@ inline IDirectSoundBuffer *modWavPlay(modWavSound &snd,
         FAILED(ds->lpVtbl->DuplicateSoundBuffer(ds, snd.dsBuffer, &voice)) ||
         voice == nullptr) {
         voice = snd.dsBuffer;                   // fall back: restart master
-    } else {
-        ModWavVoices.push_back(voice);
     }
 
-    voice->lpVtbl->SetCurrentPosition(voice, 0);
-    voice->lpVtbl->SetVolume(voice, modWavLinearToDb(volume));
-    voice->lpVtbl->Play(voice, 0, 0, loop ? DSBPLAY_LOOPING : 0);
+    const bool duplicated = voice != snd.dsBuffer;
+    if (FAILED(voice->lpVtbl->SetCurrentPosition(voice, 0)) ||
+        FAILED(voice->lpVtbl->SetVolume(voice, modWavLinearToDb(volume))) ||
+        FAILED(voice->lpVtbl->Play(voice, 0, 0, loop ? DSBPLAY_LOOPING : 0))) {
+        voice->lpVtbl->Stop(voice);
+        if (duplicated)
+            voice->lpVtbl->Release(voice);
+        return nullptr;
+    }
+
+    if (duplicated)
+        ModWavVoices.push_back(voice);
     return voice;
 }
 
